@@ -1,0 +1,349 @@
+// engine.ts — the provider-agnostic core: parse argv, load images, talk to the
+// API (directly or through the warm daemon), stream the answer out.
+//
+// Latency is a feature here. Two rules keep it fast:
+//   · nothing on the hot path touches the network except the one call itself
+//   · the daemon holds the token AND a kept-alive TLS connection, so repeat calls
+//     skip both the credential read and the handshake
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { basename } from "node:path";
+import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, IS_WIN } from "./platform.ts";
+import { models, resolve, type Model } from "./registry.ts";
+import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
+
+export const START = performance.now();
+export const VERSION = "0.2.0";
+
+export function die(msg: string, code = 1): never {
+  process.stderr.write(`apiplan: ${msg}\n`);
+  process.exit(code);
+}
+
+// ───────────────────────────── argv ─────────────────────────────
+export type Opts = CallOpts & {
+  model?: string; images: string[]; prompt: string[];
+  loop: number; stream: boolean; chat: boolean; json: boolean;
+  dryRun: boolean; verbose: boolean; help: boolean; version: boolean;
+  daemon: boolean; daemonStop: boolean; noDaemon: boolean;
+  thinking?: number; systemFile?: string;
+};
+
+/** Flags that consume the next argv item (so it is never mistaken for prompt text). */
+const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
+  "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image"]);
+
+/**
+ * Everything that isn't a recognised flag becomes prompt text, so
+ * `opus explain monads like im five` works with no quotes at all.
+ * `--` ends flag parsing; the rest is literal prompt.
+ */
+export function parseArgs(argv: string[], model0?: string): Opts {
+  const o: Opts = {
+    model: model0, images: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
+    dryRun: false, verbose: false, help: false, version: false,
+    daemon: false, daemonStop: false, noDaemon: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    let a = argv[i];
+    if (a === "--") { o.prompt.push(...argv.slice(i + 1)); break; }
+    let inline: string | undefined;
+    if (a.startsWith("--") && a.includes("=")) { const j = a.indexOf("="); inline = a.slice(j + 1); a = a.slice(0, j); }
+    const val = () => (inline !== undefined ? inline : argv[++i]);
+    switch (a) {
+      case "-h": case "--help": o.help = true; break;
+      case "-V": case "--version": o.version = true; break;
+      case "-m": case "--model": o.model = val(); break;
+      case "-e": case "--effort": o.effort = val(); break;
+      case "-s": case "--system": o.system = val(); break;
+      case "--system-file": o.systemFile = val(); break;
+      case "--max-tokens": o.maxTokens = +val(); break;
+      case "-t": case "--temp": case "--temperature": o.temperature = +val(); break;
+      case "--thinking": { const v = val(); o.thinking = v === "off" ? 0 : +v; if (o.thinking <= 0) o.thinkOff = true; break; }
+      case "--loop": o.loop = Math.max(1, +val() || 1); break;
+      case "-i": case "--image": o.images.push(val()); break;
+      case "--stream": o.stream = true; break;
+      case "--no-stream": o.stream = false; break;
+      case "--chat": o.chat = true; break;
+      case "--json": o.json = true; break;
+      case "--show-thinking": o.showThinking = true; break;
+      case "--fast": o.fast = true; break;
+      case "--1m": o.oneM = true; break;
+      case "--dry-run": o.dryRun = true; break;
+      case "--daemon": o.daemon = true; break;
+      case "--daemon-stop": o.daemonStop = true; break;
+      case "--no-daemon": o.noDaemon = true; break;
+      case "-v": case "--verbose": o.verbose = true; break;
+      default:
+        if (a.startsWith("-") && a.length > 1 && VALUED.has(a)) break; // unreachable, keeps switch honest
+        o.prompt.push(argv[i]);
+    }
+  }
+  return o;
+}
+
+// ───────────────────────────── images ─────────────────────────────
+function sniff(b: Uint8Array): string | null {
+  if (b[0] === 0x89 && b[1] === 0x50) return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "image/gif";
+  if (b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57 && b[9] === 0x45) return "image/webp";
+  return null;
+}
+/** file path · http(s) URL · data: URI · "-" (stdin) · "clipboard"/"paste" */
+export async function loadImage(src: string): Promise<ImageRef> {
+  if (/^https?:\/\//i.test(src)) return { url: src };
+  if (src.startsWith("data:")) {
+    const m = src.match(/^data:([^;]+);base64,(.*)$/s);
+    if (!m) die(`bad data: URI for --image`);
+    return { mediaType: m[1], base64: m[2] };
+  }
+  let bytes: Uint8Array;
+  if (src === "-") bytes = new Uint8Array(await Bun.stdin.arrayBuffer());
+  else if (src === "clipboard" || src === "paste" || src === "clip") {
+    const b = clipboardImageBytes();
+    if (!b) die("no image in the clipboard (macOS: `brew install pngpaste`; Linux: wl-paste/xclip) — or pass a file/URL.");
+    bytes = b;
+  } else {
+    if (!existsSync(src)) die(`image not found: ${src}`);
+    bytes = new Uint8Array(readFileSync(src));
+  }
+  const mediaType = sniff(bytes);
+  if (!mediaType) die(`unrecognised image format (png/jpeg/gif/webp): ${src}`);
+  return { mediaType, base64: Buffer.from(bytes).toString("base64") };
+}
+/** Keep --dry-run readable: never print a full base64 payload. */
+export function redact(o: any): any {
+  return JSON.parse(JSON.stringify(o), (k, v) => {
+    if (typeof v !== "string") return v;
+    if ((k === "data" || k === "base64") && v.length > 64) return `<base64 ${v.length}b>`;
+    if (k === "image_url" && v.length > 80) return `${v.slice(0, 32)}…<${v.length}b>`;
+    if (k === "authorization") return "Bearer <token>";
+    return v;
+  });
+}
+
+// ───────────────────────────── streaming ─────────────────────────────
+export type StreamResult = { text: string; ttft: number; served?: string };
+
+/** Consume an SSE body through the provider's event mapper. */
+export async function consume(p: Provider, body: ReadableStream<Uint8Array> | null, status: number, retryAfter: string | null, o: Opts): Promise<StreamResult> {
+  if (!body) die("empty response body");
+  if (status >= 400) {
+    const raw = await new Response(body).text();
+    let msg = raw.slice(0, 500);
+    try { const j = JSON.parse(raw); msg = j?.error?.message || j?.detail || msg; } catch {}
+    surface(status, msg, retryAfter);
+  }
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", text = "", ttft = 0, served = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() ?? "";
+    for (const part of parts) {
+      for (const line of part.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let ev: any; try { ev = JSON.parse(payload); } catch { continue; }
+        const d = p.delta(ev);
+        if (d.error) die(`stream error: ${d.error}`);
+        if (d.served && !served) served = d.served;
+        if (d.text) { if (!ttft) ttft = performance.now() - START; text += d.text; if (o.stream) process.stdout.write(d.text); }
+        if (d.reasoning && o.showThinking) process.stderr.write(d.reasoning);
+      }
+    }
+  }
+  if (o.stream) process.stdout.write("\n");
+  else if (text) process.stdout.write(text.replace(/\n?$/, "\n"));
+  if (o.verbose) process.stderr.write(`[apiplan] ${served ? `served by ${served} · ` : ""}first token ${(ttft || 0).toFixed(0)}ms · total ${(performance.now() - START).toFixed(0)}ms\n`);
+  return { text, ttft, served };
+}
+function surface(status: number, msg: string, retryAfter?: string | null): never {
+  if (status === 401 || status === 403) die(`auth rejected (${status}): ${msg}\n  → the login may be stale (run \`claude\` / \`codex\`), or the provider contract changed.`, 3);
+  if (status === 429) die(`rate limited (429): ${msg}${retryAfter ? ` — retry after ${retryAfter}s` : ""}`, 4);
+  die(`API error (${status}): ${msg}`);
+}
+
+// ───────────────────────────── the call ─────────────────────────────
+const REFINE = "Review your previous answer, correct any mistakes, and output only the improved final answer.";
+
+export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void> {
+  const p = providerFor(m);
+  const creds = o.dryRun ? { token: "<token>", account: "<account>", source: "dry-run" } : p.creds();
+  const built = p.build(m, turns, o, creds);
+  if (o.dryRun) {
+    process.stdout.write(JSON.stringify(redact({ method: "POST", url: built.url, headers: built.headers, body: built.body }), null, 2) + "\n");
+    return;
+  }
+  let convo = [...turns];
+  for (let pass = 0; pass < o.loop; pass++) {
+    if (pass > 0) convo = [...convo, { role: "user", text: REFINE }];
+    const b = p.build(m, convo, o, creds);
+    const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }) });
+    const last = pass === o.loop - 1;
+    const r = await consume(p, res.body, res.status, res.headers.get("retry-after"), { ...o, stream: o.stream && last, verbose: o.verbose && last });
+    if (!last) convo = [...convo, { role: "assistant", text: r.text }];
+  }
+}
+
+// ───────────────────────────── warm daemon ─────────────────────────────
+const IPC = ipc();
+async function ipcFetch(path: string, init?: RequestInit): Promise<Response | null> {
+  const t = ipcTarget(IPC, path);
+  if (!t) return null;
+  try { return await fetch(t.url, { ...(t.opts as any), ...init, headers: { ...(t.opts as any).headers, ...(init?.headers ?? {}) } }); }
+  catch { return null; }
+}
+export async function daemonAlive(): Promise<boolean> {
+  const r = await ipcFetch("/health");
+  return !!r?.ok;
+}
+export async function daemonStop(): Promise<boolean> {
+  const r = await ipcFetch("/stop");
+  return !!r?.ok;
+}
+
+export async function runDaemon(): Promise<void> {
+  if (await daemonAlive()) { process.stderr.write("apiplan daemon already running\n"); return; }
+  ensureDir(STATE_DIR);
+  if (IPC.kind === "unix" && existsSync(IPC.path)) { try { unlinkSync(IPC.path); } catch {} }
+  const token = crypto.randomUUID();
+
+  // credential cache, refreshed a few minutes before expiry
+  const cache = new Map<string, { c: any; exp: number }>();
+  const creds = (pid: keyof typeof PROVIDERS) => {
+    const hit = cache.get(pid);
+    if (hit && hit.exp - Date.now() > 300_000) return hit.c;
+    const c = PROVIDERS[pid].creds();
+    cache.set(pid, { c, exp: c.expiresAt ?? Date.now() + 3_300_000 });
+    return c;
+  };
+
+  let lastReq = Date.now();
+  const handler = async (req: Request): Promise<Response> => {
+    lastReq = Date.now();
+    const u = new URL(req.url);
+    if (IPC.kind === "tcp" && req.headers.get("x-apiplan-token") !== token && u.pathname !== "/health") {
+      return new Response("forbidden", { status: 403 });
+    }
+    if (u.pathname === "/health") return new Response("ok");
+    if (u.pathname === "/stop") { queueMicrotask(() => process.exit(0)); return new Response("bye"); }
+    if (u.pathname === "/call" && req.method === "POST") {
+      try {
+        const s: any = await req.json();
+        const m: Model = s.model;
+        const p = PROVIDERS[m.provider as keyof typeof PROVIDERS];
+        const b = p.build(m, s.turns, s.opts, creds(m.provider));
+        const up = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }) });
+        return new Response(up.body, {
+          status: up.status,
+          headers: { "content-type": up.headers.get("content-type") || "text/event-stream", "x-retry-after": up.headers.get("retry-after") || "" },
+        });
+      } catch (e: any) {
+        return new Response(JSON.stringify({ error: { message: e?.message || String(e) } }), { status: 500, headers: { "content-type": "application/json" } });
+      }
+    }
+    return new Response("not found", { status: 404 });
+  };
+
+  let server: any;
+  try {
+    server = IPC.kind === "unix"
+      ? Bun.serve({ unix: IPC.path, idleTimeout: 240, fetch: handler })
+      : Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 240, fetch: handler });
+  } catch (e: any) {
+    process.stderr.write(`apiplan daemon: cannot listen (${e?.message || e})\n`);
+    return;
+  }
+  if (IPC.kind === "unix") { try { require("node:fs").chmodSync(IPC.path, 0o600); } catch {} }
+  else writeJson(IPC.portFile, { port: server.port, token, pid: process.pid });
+
+  // Pre-warm + hold the TLS/HTTP-2 pool open to each provider we're logged into,
+  // so a real call never pays a cold handshake. This is the biggest daemon win.
+  const warm = async () => {
+    for (const p of Object.values(PROVIDERS)) {
+      if (!p.probe().connected) continue;
+      const host = p.id === "anthropic" ? "https://api.anthropic.com/v1/models" : "https://chatgpt.com";
+      try { await fetch(host, { method: p.id === "anthropic" ? "GET" : "HEAD" }); } catch {}
+    }
+  };
+  warm();
+  const ka = +(process.env.APIPLAN_KEEPALIVE_MS ?? 45_000);
+  if (ka > 0) setInterval(warm, ka);
+  const idle = +(process.env.APIPLAN_DAEMON_IDLE_MS ?? 30 * 60_000);
+  if (idle > 0) setInterval(() => { if (Date.now() - lastReq > idle) process.exit(0); }, 60_000);
+  const where = IPC.kind === "unix" ? IPC.path : `127.0.0.1:${server.port}`;
+  process.stderr.write(`apiplan daemon listening on ${where} (warm+keepalive ${ka}ms, idle-exit ${Math.round(idle / 60_000)}m)\n`);
+}
+
+async function ensureDaemon(entry: string): Promise<boolean> {
+  if (await daemonAlive()) return true;
+  const p = Bun.spawn([process.execPath, entry, "--daemon"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  p.unref();
+  for (let i = 0; i < 40; i++) { await Bun.sleep(50); if (await daemonAlive()) return true; }
+  return false;
+}
+
+/** Serve the call through the daemon; false means "fall back to in-process". */
+export async function callViaDaemon(m: Model, turns: Turn[], o: Opts, entry: string): Promise<boolean> {
+  const p = providerFor(m);
+  const spec = JSON.stringify({ model: m, turns, opts: o });
+  const post = () => ipcFetch("/call", { method: "POST", headers: { "content-type": "application/json" }, body: spec });
+  let res = await post();
+  if (!res) {
+    if ((process.env.APIPLAN_DAEMON ?? "auto") === "off") return false;
+    if (!(await ensureDaemon(entry))) return false;
+    res = await post();
+    if (!res) return false;
+  }
+  if (res.status === 500) { // daemon-side failure (e.g. bad creds): report it properly
+    const j = await res.json().catch(() => ({} as any));
+    die(j?.error?.message ?? "daemon call failed");
+  }
+  await consume(p, res.body, res.status, res.headers.get("x-retry-after"), o);
+  return true;
+}
+
+// ───────────────────────────── shared entry ─────────────────────────────
+/** Turn parsed options + stdin into the turns array both routes take. */
+export async function buildTurns(o: Opts): Promise<Turn[]> {
+  // `-i -` claims stdin for the image, so it must not also be read as prompt text
+  const stdinIsImage = o.images.includes("-");
+  const piped = !stdinIsImage && !process.stdin.isTTY ? await Bun.stdin.text() : "";
+  const images = await Promise.all(o.images.map(loadImage));
+  if (o.systemFile) o.system = (o.system ? o.system + "\n\n" : "") + readFileSync(o.systemFile, "utf8");
+
+  if (o.chat) {
+    if (!piped.trim()) die("--chat needs a JSON messages array (or {messages:[…]}) on stdin.");
+    let parsed: any;
+    try { parsed = JSON.parse(piped); } catch { die("--chat stdin is not valid JSON."); }
+    const msgs = Array.isArray(parsed) ? parsed : parsed.messages;
+    if (!Array.isArray(msgs)) die("--chat JSON must be an array or {messages:[…]}.");
+    if (!Array.isArray(parsed) && parsed.system) o.system = String(parsed.system);
+    const turns: Turn[] = msgs.map((m: any) => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+    }));
+    if (images.length) {
+      const i = turns.map((t) => t.role).lastIndexOf("user");
+      if (i < 0) die("--chat with --image needs a user message to attach the image to.");
+      turns[i].images = images;
+    }
+    return turns;
+  }
+  const text = [o.prompt.join(" ").trim(), piped.trim()].filter(Boolean).join("\n\n");
+  if (!text && !images.length) return [];
+  return [{ role: "user", text: text || "What is in this image?", images: images.length ? images : undefined }];
+}
+
+export function resolveModelOrDie(name: string | undefined): Model {
+  if (!name) die("no model — use a model command (opus/sonnet/gpt/…) or -m <model>. Try `apiplan models`.");
+  const m = resolve(name);
+  if (m) return m;
+  const near = models().slice(0, 6).map((x) => x.family + x.version.join("")).join(", ");
+  die(`unknown model '${name}'. Try one of: ${near} … or run \`apiplan models\` for the full list.`);
+}
