@@ -316,6 +316,7 @@ USAGE
   apiplan sync [--force]         rebuild every shim from the config
   apiplan prune                  remove commands left over from an earlier install
   apiplan doctor                 diagnose PATH, logins, daemon, shadowed names
+  apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan path                   print the line that puts commands on your PATH
   apiplan shell-init [shell]     shell glue so ? and * in a prompt need no quotes
@@ -393,6 +394,25 @@ switch (sub) {
     if (!r.ok) die(r.why!);
     C.save(cfg);
     process.stdout.write(`${ok("✓")} removed ${bold(name)}\n`);
+    break;
+  }
+  case "update": {
+    // Where this very file lives IS the install — pull it and re-sync, so a new
+    // machine only ever needs one command to get current.
+    const root = join(import.meta.dir, "..");
+    const git = Bun.spawnSync(["git", "-C", root, "pull", "--ff-only"], { stdout: "pipe", stderr: "pipe" });
+    const out = (git.stdout.toString() + git.stderr.toString()).trim();
+    if (git.exitCode !== 0) {
+      process.stdout.write(`${warn("!")} could not update ${root.replace(HOME, "~")}\n    ${dim(out.split("\n")[0] ?? "")}\n`);
+      process.stdout.write(`    ${dim("if you have local changes, commit or stash them first")}\n`);
+    } else {
+      process.stdout.write(`${ok("✓")} ${out.includes("up to date") ? "already current" : "updated"} ${dim(root.replace(HOME, "~"))}\n`);
+    }
+    const cfg = C.load();
+    reportSync(C.sync(cfg));
+    const orph = C.orphans(cfg);
+    if (orph.length) process.stdout.write(`${dim("leftover from an older version:")} ${orph.join(" ")} ${dim("→")} ${key("apiplan prune")}\n`);
+    for (const n of await refreshModels()) process.stdout.write(dim(`  ${n}\n`));
     break;
   }
   case "doctor": await cmdDoctor(); break;
