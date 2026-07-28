@@ -1,9 +1,9 @@
 {
-  "client_overhead": 18.352167,
-  "tool_overhead": 3.8,
-  "e2e_vs_raw": 40.43183399999998,
-  "daemon_saving": 46.231956999999966,
-  "creds_saving": 12.09649999999965,
-  "daemon_rss": 50.984375,
+  "client_overhead": 17.564208,
+  "tool_overhead": 3.3,
+  "e2e_vs_raw": -195.42704099999992,
+  "daemon_saving": 237.90687500000058,
+  "creds_saving": 12.331250000001091,
+  "daemon_rss": 43.65625,
   "providers_live": 2
 }

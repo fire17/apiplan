@@ -7,7 +7,7 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.2.0, honest)
+## Current state (v0.2.1, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
@@ -23,10 +23,16 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
 - Warm call ≈ 1.0 s first token, of which **4 ms is ours** (measured directly, not
   inferred). 25 parallel calls all succeed, p50 1.06 s.
 
-**NOT yet live-verified:** Linux, WSL and Windows. The platform layer is unit-tested for
-all four targets and the Windows loopback-TCP transport is exercised on macOS via
-`APIPLAN_IPC=tcp`, but nobody has run it on those OSes. That is the single biggest open
-item — see the "Cross-platform" section of `README.md`.
+**Also live-verified on Linux** (rounds 6–7): the *published* repo run in a container on
+Linux aarch64 — 80/80 tests, correct platform detection, unix-socket IPC, the
+`~/.claude/.credentials.json` credential fallback that only executes off-macOS, and the
+one-line `curl … | sh` install working on a bare box with only git + curl.
+
+**NOT yet live-verified: WSL and Windows.** `detectWsl()` is tested against real WSL1/WSL2
+kernel strings and the interop env vars, and the Windows `.cmd`/`.ps1` shims plus the
+loopback-TCP daemon (including its 403 without a token) are tested — but no process has
+executed on either OS. **This is the single biggest open item.** The WSL box (`magic-wsl`)
+was reachable in Tailscale but SSH did not answer.
 
 ## Layout
 
@@ -59,10 +65,11 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
 
 ## Next steps
 
-1. **Run it on Linux / WSL / Windows** and record the result. Everything is in place;
-   only observation is missing.
-2. **Publish.** Repo is committed and clean (secret-scanned: only source + docs). The
-   vision asks for `/save_and_ship` + publish.
+1. **Run it on WSL and Windows** and record the result — the last unverified claim.
+   Linux is done (round 6). On Windows the specific things to watch: does the `.cmd` shim
+   forward a bare sentence intact, does the loopback-TCP daemon come up, and does
+   `defaultBinDir()` pick somewhere actually on PATH.
+2. ~~Publish~~ — done: github.com/fire17/apiplan, releases v0.2.0 and v0.2.1.
 3. **Grok and Gemini.** The provider interface is the extension point: add one adapter
    with `probe/creds/build/delta` plus its model list, and every command, image, pipe and
    daemon behaviour comes for free. Grok is OpenAI-shaped (`api.x.ai`); Gemini needs its
@@ -81,3 +88,12 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
   code measured −362 ms and +108 ms on consecutive runs. Measure inside the client.
 - **A daemon that exits immediately looks like a working daemon** and made calls 1.6 s
   slower for a while. `ps` for it before believing it is warm.
+- **`sh install.sh` puts no slash in `$0`.** That made the checkout test fail, so the
+  installer decided it was being piped and cloned a second copy to `~/.apiplan/src` —
+  every command on this machine ran a stale tree for a while. `apiplan doctor` now prints
+  the **install root**; check it first when behaviour doesn't match the code you're editing.
+- **Don't gate a metric you don't own.** The credential-read timing measured how fast the
+  macOS Keychain is, so a *faster* Keychain registered as a regression.
+- **Percentage drift bands are meaningless at small absolute values** (10 % of 18 ms is
+  1.8 ms), and a median of a few samples is the wrong estimator for deterministic work —
+  use the floor. Both made the perf gate fail on ~half of identical runs.

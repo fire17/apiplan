@@ -204,6 +204,28 @@ styles and assert no clone appears.
 **Verified:** all three styles resolve to the checkout; the stray clone removed; commands
 re-wired to the working tree; 87 tests green.
 
+## Round 10b — the gate itself was flaky (a flaky gate is a broken gate)
+
+**Found:** `bun bench/perf.ts` exited non-zero on roughly half of consecutive runs with
+**every row passing its budget**. A gate that cries wolf teaches people to ignore it, so
+this counts as a defect in the harness, not an annoyance.
+
+Three separate causes, each a lesson about measuring the right thing:
+
+1. **Percentage bands are meaningless at small absolute values.** 10 % of an 18 ms
+   process-spawn measurement is 1.8 ms — well inside normal noise. Drift now has to clear
+   both the band *and* an absolute floor (5 ms / 8 MB).
+2. **`creds_saving` measured the operating system, not this code.** It timed how long the
+   macOS Keychain takes to hand over a credential — so a *faster* Keychain scored as a
+   regression. It is now an observation; the gated `tool_overhead` row already proves the
+   client isn't doing that work per call.
+3. **A median of a small sample is the wrong estimator for our own code path.** `dispatch +
+   drain` is deterministic work; anything above its minimum is the OS scheduling around us
+   (observed 2–16 ms, which made a 4 ms baseline fail against itself). Both self-cost rows
+   now report the **floor** of N samples.
+
+**Verified:** four consecutive gate runs, all clean, with the same code.
+
 ## Final state
 
 | metric | before round 1 | after round 5 | budget |

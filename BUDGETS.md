@@ -8,7 +8,7 @@ ticket. Measured on: MacBook (darwin arm64), bun 1.3.14, home network.
 |---|---|---|---|---|
 | B1 | "blazingly fast" | client overhead — process start → request built, no network | **≤ 25 ms** | `bun bench/perf.ts --client` |
 | B2 | "blazingly fast" | overhead the tool adds on a warm call, measured **inside** the client (dispatch + drain) | **≤ 60 ms** (measured 4 ms) | `bun bench/perf.ts --overhead` |
-| B3 | "blazingly fast" | per-call credential read the daemon removes | **≥ 8 ms** (measured 12 ms) | `bun bench/perf.ts --warm` |
+| B3 | "blazingly fast" | per-call credential read the daemon removes | observation only (12 ms) — it measures the OS, not this code | `bun bench/perf.ts --warm` |
 | B4 | "no overhead on the machine" | idle daemon RSS | **≤ 80 MB** | `bun bench/perf.ts --mem` |
 | B5 | "no overhead on the machine" | idle daemon CPU between calls | **≈ 0 %** (self-exits after 30 min idle) | `bun bench/perf.ts --mem` |
 | B6 | "without any degredation" | every test green before any ship | **100 % pass** | `bun test` |
@@ -33,10 +33,17 @@ apiplan doctor           # B7
 number regresses by more than **10 %**.
 
 **Only what we control is gated.** End-to-end comparisons (warm vs cold, warm vs a raw
-`fetch`) are printed as `observe` rows and never fail the build: provider-side jitter is
-±0.7 s, so gating on them means failing when the provider is busy rather than when the
-code got worse. Round 5 of `DARWIN.md` records the moment that distinction was forced —
-the same code measured −362 ms and then +108 ms on consecutive runs.
+`fetch`) and the credential-read timing are printed as `observe` rows and never fail the
+build: the first two are dominated by ±0.7 s provider jitter, and the third measures how
+fast the OS Keychain is — a faster Keychain would otherwise be scored as a regression.
+Round 5 of `DARWIN.md` records the moment that distinction was forced (the same code
+measured −362 ms and then +108 ms on consecutive runs).
+
+**The gate must not be flaky.** Drift has to clear both a percentage band and an absolute
+floor (5 ms / 8 MB), because 10 % of an 18 ms spawn measurement is inside normal noise; and
+the two rows measuring *our own* deterministic work report the **floor** of N samples
+rather than the median, since anything above the minimum is the OS scheduling around us.
+Round 10b has the full reasoning.
 
 ## What is deliberately NOT budgeted
 
