@@ -1,0 +1,14 @@
+# session snapshots / private transcripts — never publish
+conversation/
+.save_and_ship/
+.claude/
+
+# OS / editor noise
+.DS_Store
+*.swp
+
+# build + local state
+node_modules/
+dist/
+*.log
+.apiplan/

@@ -1,0 +1,9 @@
+please commit what we have -  run 5 loops of autoresearch self improvement - without any degredation make sure everythin is as blazingly fast as possible - make sure we make it into a generic system that can create each indevidual one a globally available cli - with good --help flags, piping, easy no "" needed to send a sentence in the shell - and also work crossplatform completely - working on windows, wsl, regular linux, and mac (like we have) - then run /save_and_ship and publish again - note make sure to change opus to opus 5 by default but if using opus4.8 to call it directly (in the future each class of models will have the latest one but also allow to add the explicit version like opus5 and all other options available) - make sure it is a coherent system and works with both claude models and all openai models - have a centralized crossplatform cli tui tool apiplan that can show you to which providers you have connected already, and which models are available and all the globally available commands available (with the ability to edit the naming of each to what the user chooses if he wants a custom name for a given one, or create a new one with special ready made flags or arguments) - does that makes sense ? make sure to use the /highest-bar (activate dont just read it) and also /impeccable and all other usefull skills we have right now
+
+---
+> Prior founding intent for this project (session start, 2026-07-14), preserved because it
+> is still binding: build a fast pipeable CLI that calls frontier models using the
+> already-signed-in Claude Code / Codex credentials instead of a per-token API key —
+> "essentially giving us a fast 1 shot function call (to opus fable sonnet or haiku, in any
+> effort we set, and also custom test-time-compute loop-horizon) and get a response from the
+> frontier model - but without the per-token-pricing the normal api has".
