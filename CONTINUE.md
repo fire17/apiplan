@@ -1,70 +1,83 @@
-# APIPlan — continue here
+# apiplan — continue here
 
-**What it is.** A terminal CLI that calls Anthropic's frontier models
-(Opus/Fable/Sonnet/Haiku) using the **signed-in Claude Code subscription** OAuth
-token from the macOS Keychain — so calls draw on the plan, not a per-token API
-key. One core (`api.ts`, bun); `opus`/`fable`/`sonnet`/`haiku` are thin wrapper
-commands. Pipeable in and out; stateless → massively parallel.
+**What it is.** One CLI per frontier model, powered by the Claude Code and Codex
+**subscriptions already logged in on this machine** — no API key, no per-token bill.
+`opus explain monads` just works, unquoted, piped, with images, in under a second warm.
 
-**Why.** fire17 wanted a fast, one-shot "just like the API" call to the frontier
-models on the subscription, with model aliases, effort/test-time-compute control,
-settable system prompt, and multiple candidate routes to compare.
+**Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
+already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (honest)
+## Current state (v0.2.0, honest)
 
-- **Built + self-verified (in-sandbox):** help, arg parsing, prompt assembly
-  (args + piped stdin), `--system`/`--system-file`, `--chat` message-array parse,
-  `--effort`→thinking-budget mapping, `--loop` marker, temperature-vs-thinking
-  rule, `--route harness` command build, error paths (bad effort, chat-on-harness),
-  the installer, and generated wrappers (model baking + `-m` override + generic `api`).
-  All confirmed via `--dry-run` (prints the exact request without sending).
-- **NOT yet live-verified:** the actual network call. The build sandbox blocks
-  both Keychain reads and `api.anthropic.com`, so no real request was fired here.
-  The credential path + endpoint are **proven** by the FluidVoice dictation tool
-  (`~/Creations/cactuspi/FluidVoice/tools/ccvoice/ccvoice.ts`), which uses the
-  identical `security find-generic-password -s "Claude Code-credentials" -w` →
-  `claudeAiOauth.accessToken` token against `api.anthropic.com`. The API contract
-  (identity line, `anthropic-beta: oauth-2025-04-20`, endpoint, headers) was lifted
-  **verbatim from the `claude` binary strings**, not guessed.
-- **First real test the user must run:** `opus "say pong"` (direct route). If it
-  returns text, the subscription→Messages-API path works end to end.
+**Live-verified on macOS** (every claim below was observed, not assumed):
+
+- Both providers answer through one engine: Anthropic `/v1/messages` (subscription OAuth
+  from the Keychain) and OpenAI's Codex Responses endpoint (`~/.codex/auth.json`).
+- Alias contract holds at the wire level, confirmed by the API's own served-model field:
+  `opus → claude-opus-5`, `opus48 → claude-opus-4-8`, `sonnet → claude-sonnet-5`,
+  `haiku → claude-haiku-4-5-20251001`, `sol → gpt-5.6-sol`, `gpt55 → gpt-5.5`.
+- Pipes both ways, `--chat` multi-turn (remembers across turns), images from file/URL/
+  data:/stdin/clipboard, `--loop`, `--dry-run`, effort per provider-advertised levels.
+- 13 global commands installed in `~/.bun/bin`; `apiplan doctor` reports **all clear**.
+- 80 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
+- Warm call ≈ 1.0 s first token, of which **4 ms is ours** (measured directly, not
+  inferred). 25 parallel calls all succeed, p50 1.06 s.
+
+**NOT yet live-verified:** Linux, WSL and Windows. The platform layer is unit-tested for
+all four targets and the Windows loopback-TCP transport is exercised on macOS via
+`APIPLAN_IPC=tcp`, but nobody has run it on those OSes. That is the single biggest open
+item — see the "Cross-platform" section of `README.md`.
+
+## Layout
+
+```
+bin/ask.ts        the CLI every model command execs (shims pass --model)
+bin/apiplan.ts    status · models · commands · install/add/rename/rm/sync/prune ·
+                  doctor · daemon · path · shell-init · interactive TUI
+src/registry.ts   aliases → model ids, from each provider's own list (family = newest)
+src/providers.ts  per-vendor credential/endpoint/request/stream behind one interface
+src/engine.ts     argv · images · SSE · warm daemon · self-timing
+src/platform.ts   every macOS/Linux/WSL/Windows difference, in one file
+src/commands.ts   ~/.apiplan/commands.json ⇄ the shims on PATH
+test/ bench/      80 tests · the budget harness with regression detection
+```
+
+State lives in `~/.apiplan/`: `commands.json` (your commands — plain JSON, editable),
+`models.*.json` (cached model lists), `daemon.sock` / `daemon.json`.
 
 ## How to resume
 
-- `claude --resume 9d23ea6c-4fa0-4293-a3a7-34a7577c376f` from `~/Creations/APIPlan`
-  (or read `conversation/9d23ea6c-…jsonl`).
-- Files (canonical, in-registry): `api.ts`, `install.sh`, `bench.ts`, `README.md`.
-- Install: `bash install.sh` → `~/.local/bin/{opus,fable,sonnet,haiku,api}`.
+```sh
+cd ~/Creations/APIPlan
+bun test && bun bench/perf.ts && bun bin/apiplan.ts doctor   # the whole gate
+claude --resume 9d23ea6c-4fa0-4293-a3a7-34a7577c376f          # this session
+```
 
-## Added after first save (2026-07-14)
-
-- **`-fast` variants** (`opus-fast` etc.): bake `--effort low --thinking 0 --stream`
-  → thinking off, tokens stream immediately. Lowest latency.
-- **Warm daemon** (`api --daemon` / `--daemon-stop`): unix-socket background process
-  (`~/.apiplan.sock`, 0600) caching the OAuth token + a kept-alive API connection.
-  Auto-starts on first direct call, transparent in-process fallback, 30m idle-exit.
-  Client-side fallback verified in-sandbox; the socket **server** is user-tested
-  (sandbox blocks `listen`, same as it blocks the live API call). New code in
-  `api.ts`: `buildDirect` (shared builder), `consumeSSE` (unified SSE parser),
-  `runDaemon`/`ensureDaemon`/`tryDaemonCall`.
+Read in this order: `VISION.md` (what was asked) → `BUDGETS.md` (what "fast" means as
+numbers) → `DARWIN.md` (five rounds of findings, including the fixes that mattered) →
+`LADDER.md` (why the TUI has the three views it has).
 
 ## Next steps
 
-1. User installs + tests `opus "say pong"` (direct) and `--route harness`.
-2. If direct 403s: the identity/beta contract shifted — adjust `APIPLAN_IDENTITY`
-   / `APIPLAN_OAUTH_BETA` (both env-overridable); re-check binary strings.
-3. Benchmark: `bun bench.ts --model haiku --n 5 [--parallel]` to compare routes.
-4. Only after the user confirms it works: publish via `/shipit` (held now per the
-   "nothing leaves the machine without confirmation" rule + user wants to test first).
+1. **Run it on Linux / WSL / Windows** and record the result. Everything is in place;
+   only observation is missing.
+2. **Publish.** Repo is committed and clean (secret-scanned: only source + docs). The
+   vision asks for `/save_and_ship` + publish.
+3. **Grok and Gemini.** The provider interface is the extension point: add one adapter
+   with `probe/creds/build/delta` plus its model list, and every command, image, pipe and
+   daemon behaviour comes for free. Grok is OpenAI-shaped (`api.x.ai`); Gemini needs its
+   own `inline_data` mapping.
+4. **Optional:** completions (`apiplan completions zsh`), and a real usage log — which
+   would finally justify the "spend" rung deliberately left in `LADDER.md`'s graveyard.
 
-## Key decisions
+## Traps worth knowing (learned the hard way)
 
-- **Two routes, one core.** `direct` (raw `/v1/messages`, fast, parallel, chat) is
-  default; `harness` (`claude -p`, full tools/skills) for agentic depth. Chosen over
-  a single approach because the user asked for candidates to compare.
-- **Test-time compute** = `--effort`→thinking budget (both routes) + `--loop N`
-  self-refine passes (direct). v2.1.209 has no `--max-turns`, so effort/thinking is
-  the real knob.
-- **System prompt / virtual CLAUDE.md** = supported. Direct: appended as a 2nd
-  system block after the mandatory Claude Code identity block. Harness:
-  `--append-system-prompt`.
+- **`gpt` is `/usr/sbin/gpt` on macOS**, a partition-table editor. Installing over it
+  silently shadows a disk tool; the installer refuses by design. Use `sol`, or force it.
+- **The shell eats `?`**, not this tool. zsh needs `eval "$(apiplan shell-init)"`.
+- **A model's self-description is not evidence of routing.** Opus 5 called itself
+  "Sonnet 4.5" once. Trust the API's served-model field (`-v`) instead.
+- **Never gate a perf budget on end-to-end latency.** Provider jitter is ±0.7 s; the same
+  code measured −362 ms and +108 ms on consecutive runs. Measure inside the client.
+- **A daemon that exits immediately looks like a working daemon** and made calls 1.6 s
+  slower for a while. `ps` for it before believing it is warm.
