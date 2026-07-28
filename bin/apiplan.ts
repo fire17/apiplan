@@ -314,6 +314,7 @@ USAGE
   apiplan rename <old> <new>     rename one
   apiplan rm <name>              remove one
   apiplan sync [--force]         rebuild every shim from the config
+  apiplan prune                  remove commands left over from an earlier install
   apiplan doctor                 diagnose PATH, logins, daemon, shadowed names
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan path                   print the line that puts commands on your PATH
@@ -347,7 +348,21 @@ switch (sub) {
     reportSync(C.sync(cfg, { force: has("--force") }));
     break;
   }
-  case "sync": reportSync(C.sync(C.load(), { force: has("--force") })); break;
+  case "sync": {
+    const cfg = C.load();
+    reportSync(C.sync(cfg, { force: has("--force") }));
+    const orph = C.orphans(cfg);
+    if (orph.length) process.stdout.write(`${warn("!")} ${orph.length} leftover command(s) from an earlier install: ${orph.join(" ")}\n    ${dim("remove them:")} ${key("apiplan prune")}\n`);
+    break;
+  }
+  case "prune": {
+    const cfg = C.load();
+    const orph = C.orphans(cfg);
+    if (!orph.length) { process.stdout.write(`${ok("✓")} nothing to prune\n`); break; }
+    const gone = C.prune(cfg);
+    process.stdout.write(`${ok("✓")} removed ${orph.length} leftover command(s): ${orph.join(" ")} ${dim(`(${gone.length} file(s))`)}\n`);
+    break;
+  }
   case "add": {
     const name = argv[1];
     const model = valOf("--model") ?? valOf("-m");

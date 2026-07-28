@@ -9,7 +9,7 @@ const IMAGES = flag("--images", "").split(",").filter(Boolean);
 const N = +flag("--n", "5");
 const MODEL = flag("--model", "opus");
 const PROMPT = flag("--prompt", "Describe what is in this image in one short sentence.");
-const API = new URL(".", import.meta.url).pathname + "api.ts";
+const API = new URL("..", import.meta.url).pathname + "/bin/ask.ts";
 if (!IMAGES.length) { console.error("need --images a.png,b.png,..."); process.exit(1); }
 
 function pngInfo(path: string) {

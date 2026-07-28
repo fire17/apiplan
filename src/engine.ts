@@ -14,6 +14,21 @@ import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, ty
 export const START = performance.now();
 export const VERSION = "0.2.0";
 
+/**
+ * Self-instrumentation for the perf harness. Our own cost is everything before the
+ * request leaves (dispatch) plus everything after the last byte arrives (drain) —
+ * measured directly, because inferring it by subtracting two network-noisy medians
+ * produced a metric that swung ±400ms on identical code (DARWIN.md round 5).
+ */
+export const TIMING = process.env.APIPLAN_TIMING === "1";
+export const marks = { dispatch: 0, firstByte: 0, lastByte: 0 };
+export function markDispatch() { if (TIMING && !marks.dispatch) marks.dispatch = performance.now() - START; }
+export function reportTiming() {
+  if (!TIMING) return;
+  const drain = marks.lastByte ? performance.now() - START - marks.lastByte : 0;
+  process.stderr.write(`[timing] dispatch=${marks.dispatch.toFixed(1)} drain=${drain.toFixed(1)}\n`);
+}
+
 export function die(msg: string, code = 1): never {
   process.stderr.write(`apiplan: ${msg}\n`);
   process.exit(code);
@@ -109,6 +124,15 @@ export async function loadImage(src: string): Promise<ImageRef> {
   }
   const mediaType = sniff(bytes);
   if (!mediaType) die(`unrecognised image format (png/jpeg/gif/webp): ${src}`);
+  // Providers reject images below a few pixels with an opaque "could not process
+  // image" 400. Catch it here where we can say exactly what is wrong.
+  if (mediaType === "image/png") {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes.length > 24) {
+      const w = dv.getUint32(16), h = dv.getUint32(20);
+      if (w < 8 || h < 8) die(`image is ${w}×${h}px — too small for the model to process (needs at least 8×8): ${src}`);
+    }
+  }
   return { mediaType, base64: Buffer.from(bytes).toString("base64") };
 }
 /** Keep --dry-run readable: never print a full base64 payload. */
@@ -140,6 +164,7 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (TIMING) marks.lastByte = performance.now() - START;
     buf += dec.decode(value, { stream: true });
     const parts = buf.split("\n\n");
     buf = parts.pop() ?? "";
@@ -159,6 +184,7 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
   }
   if (o.stream) process.stdout.write("\n");
   else if (text) process.stdout.write(text.replace(/\n?$/, "\n"));
+  reportTiming();
   if (o.verbose) process.stderr.write(`[apiplan] ${served ? `served by ${served} · ` : ""}first token ${(ttft || 0).toFixed(0)}ms · total ${(performance.now() - START).toFixed(0)}ms\n`);
   return { text, ttft, served };
 }
@@ -183,6 +209,7 @@ export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void
   for (let pass = 0; pass < o.loop; pass++) {
     if (pass > 0) convo = [...convo, { role: "user", text: REFINE }];
     const b = p.build(m, convo, o, creds);
+    markDispatch();
     const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }) });
     const last = pass === o.loop - 1;
     const r = await consume(p, res.body, res.status, res.headers.get("retry-after"), { ...o, stream: o.stream && last, verbose: o.verbose && last });
@@ -198,9 +225,23 @@ async function ipcFetch(path: string, init?: RequestInit): Promise<Response | nu
   try { return await fetch(t.url, { ...(t.opts as any), ...init, headers: { ...(t.opts as any).headers, ...(init?.headers ?? {}) } }); }
   catch { return null; }
 }
+/**
+ * Alive AND running this build. A daemon left over from an older version would
+ * keep serving the old request contract after an upgrade — invisible and nasty —
+ * so a version mismatch counts as "not alive" and the caller replaces it.
+ */
 export async function daemonAlive(): Promise<boolean> {
   const r = await ipcFetch("/health");
-  return !!r?.ok;
+  if (!r?.ok) return false;
+  const v = (await r.text().catch(() => "")).trim();
+  return v === "" || v === VERSION || v === "ok"; // "ok" = pre-versioning daemon, treated as current
+}
+/** Version the running daemon reports, or null when nothing is listening. */
+export async function daemonVersion(): Promise<string | null> {
+  const r = await ipcFetch("/health");
+  if (!r?.ok) return null;
+  const v = (await r.text().catch(() => "")).trim();
+  return v === "ok" ? "pre-0.2" : v;
 }
 export async function daemonStop(): Promise<boolean> {
   const r = await ipcFetch("/stop");
@@ -230,9 +271,13 @@ export async function runDaemon(): Promise<void> {
     if (IPC.kind === "tcp" && req.headers.get("x-apiplan-token") !== token && u.pathname !== "/health") {
       return new Response("forbidden", { status: 403 });
     }
-    if (u.pathname === "/health") return new Response("ok");
+    if (u.pathname === "/health") return new Response(VERSION);
     if (u.pathname === "/stop") { queueMicrotask(() => process.exit(0)); return new Response("bye"); }
     if (u.pathname === "/call" && req.method === "POST") {
+      // A client from a different build must not be served by this one: the request
+      // contract may have changed. Tell it to replace us instead of answering wrongly.
+      const cv = req.headers.get("x-apiplan-version");
+      if (cv && cv !== VERSION) return new Response(`version mismatch: daemon ${VERSION}, client ${cv}`, { status: 409 });
       try {
         const s: any = await req.json();
         const m: Model = s.model;
@@ -278,27 +323,61 @@ export async function runDaemon(): Promise<void> {
   if (idle > 0) setInterval(() => { if (Date.now() - lastReq > idle) process.exit(0); }, 60_000);
   const where = IPC.kind === "unix" ? IPC.path : `127.0.0.1:${server.port}`;
   process.stderr.write(`apiplan daemon listening on ${where} (warm+keepalive ${ka}ms, idle-exit ${Math.round(idle / 60_000)}m)\n`);
+
+  // Serve until told to stop. Without this the function returns, the caller exits,
+  // and the daemon dies the instant it was born — which silently turned the warm
+  // path into a 2s penalty (every call re-spawned it). See DARWIN.md round 1.
+  const bye = () => { if (IPC.kind === "unix") { try { unlinkSync(IPC.path); } catch {} } process.exit(0); };
+  process.on("SIGINT", bye);
+  process.on("SIGTERM", bye);
+  await new Promise<never>(() => {});
 }
 
-async function ensureDaemon(entry: string): Promise<boolean> {
-  if (await daemonAlive()) return true;
-  const p = Bun.spawn([process.execPath, entry, "--daemon"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-  p.unref();
-  for (let i = 0; i < 40; i++) { await Bun.sleep(50); if (await daemonAlive()) return true; }
-  return false;
+/**
+ * Start the daemon for LATER calls without making this one wait for it. Blocking
+ * on startup used to cost the first call up to 2s — worse than not having a daemon.
+ * Fire and forget: this call goes direct, the next one finds a warm daemon.
+ */
+function spawnDaemonDetached(entry: string) {
+  try {
+    const p = Bun.spawn([process.execPath, entry, "--daemon"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    p.unref();
+  } catch {}
 }
+
+/**
+ * Config that changes what a request IS (endpoint, identity, credential source).
+ * The daemon runs with its own environment, so if the caller has overridden any of
+ * these, the daemon would silently ignore them — go direct instead and honour them.
+ */
+const OVERRIDE_ENV = ["APIPLAN_ANTHROPIC_BASE", "APIPLAN_OPENAI_BASE", "APIPLAN_IDENTITY",
+  "APIPLAN_OAUTH_BETA", "APIPLAN_API_VERSION", "APIPLAN_ORIGINATOR", "APIPLAN_RESPONSES_PATH",
+  "APIPLAN_CODEX_AUTH", "APIPLAN_ANTHROPIC_CRED_FILE", "APIPLAN_KEYCHAIN_SERVICE"];
+export const hasRequestOverrides = () => OVERRIDE_ENV.some((k) => process.env[k]?.length);
 
 /** Serve the call through the daemon; false means "fall back to in-process". */
 export async function callViaDaemon(m: Model, turns: Turn[], o: Opts, entry: string): Promise<boolean> {
+  if (hasRequestOverrides()) return false;
   const p = providerFor(m);
   const spec = JSON.stringify({ model: m, turns, opts: o });
-  const post = () => ipcFetch("/call", { method: "POST", headers: { "content-type": "application/json" }, body: spec });
-  let res = await post();
+  const post = () => (markDispatch(), ipcFetch("/call", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-apiplan-version": VERSION },
+    body: spec,
+  }));
+  const res = await post();
   if (!res) {
-    if ((process.env.APIPLAN_DAEMON ?? "auto") === "off") return false;
-    if (!(await ensureDaemon(entry))) return false;
-    res = await post();
-    if (!res) return false;
+    // No daemon yet (or a stale socket). Warm one up for next time and let THIS
+    // call go direct, so a cold start is never slower than having no daemon at all.
+    if ((process.env.APIPLAN_DAEMON ?? "auto") !== "off") spawnDaemonDetached(entry);
+    return false;
+  }
+  if (res.status === 409) {
+    // Left over from an older install: retire it, start the current one for next
+    // time, and serve this call directly.
+    await daemonStop();
+    spawnDaemonDetached(entry);
+    return false;
   }
   if (res.status === 500) { // daemon-side failure (e.g. bad creds): report it properly
     const j = await res.json().catch(() => ({} as any));

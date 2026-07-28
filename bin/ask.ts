@@ -87,8 +87,16 @@ if (!turns.length) {
   die("no prompt — type it after the command, or pipe it in.", 1);
 }
 
-// The daemon can't help with dry-runs, raw JSON, or multi-pass loops; those go direct.
-const eligible = !o.dryRun && !o.json && o.loop === 1 && !o.noDaemon && (process.env.APIPLAN_DAEMON ?? "auto") !== "off";
-if (!(eligible && (await callViaDaemon(model, turns, o, ENTRY)))) {
-  await callDirect(model, turns, o);
+// Anything that throws from here (a missing login, a network failure) is a normal
+// operating condition, not a crash: report one clear line, never a stack trace.
+try {
+  // The daemon can't help with dry-runs, raw JSON, or multi-pass loops; those go direct.
+  const eligible = !o.dryRun && !o.json && o.loop === 1 && !o.noDaemon && (process.env.APIPLAN_DAEMON ?? "auto") !== "off";
+  if (!(eligible && (await callViaDaemon(model, turns, o, ENTRY)))) {
+    await callDirect(model, turns, o);
+  }
+} catch (e: any) {
+  const msg = e?.message ?? String(e);
+  const hint = providerFor(model).probe().loginHint;
+  die(hint && /credential|token|auth|log ?in/i.test(msg) ? `${msg}\n  → ${hint}` : msg, /auth|token|credential/i.test(msg) ? 3 : 1);
 }

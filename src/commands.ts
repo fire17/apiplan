@@ -5,7 +5,7 @@
 // config edit plus a re-sync, and `apiplan sync` can always rebuild PATH from scratch.
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { STATE_DIR, defaultBinDir, readJson, writeJson, writeShim, removeShim, shadowsExisting, whichSync, IS_WIN } from "./platform.ts";
+import { STATE_DIR, defaultBinDir, readJson, writeJson, writeShim, removeShim, shadowsExisting, whichSync, isOurShim, IS_WIN } from "./platform.ts";
 import { resolve, models } from "./registry.ts";
 
 export type Command = {
@@ -36,8 +36,13 @@ export function defaults(): Command[] {
   const fastFlags = (p: string) => (p === "anthropic" ? ["--effort", "low", "--thinking", "off", "--stream"] : ["--effort", "low", "--stream"]);
   const out: Command[] = [];
   const seen = new Set<string>();
+  const bin = defaultBinDir();
   const add = (name: string, model: string, flags?: string[], note?: string) => {
     if (seen.has(name)) return;
+    // Don't propose a name a real system tool already owns (macOS ships /usr/sbin/gpt).
+    // The variant command for that provider still covers it, and on a machine without
+    // the clash the name is offered normally — so the default set adapts per platform.
+    if (shadowsExisting(name, bin)) return;
     seen.add(name);
     out.push({ name, model, ...(flags ? { flags } : {}), ...(note ? { note } : {}) });
   };
@@ -104,6 +109,30 @@ export function remove(c: Config, name: string): { ok: boolean; why?: string; re
   c.commands.splice(i, 1);
   return { ok: true, removed: removeShim(binDirOf(c), name) };
 }
+/**
+ * Shims we wrote that the config no longer knows about — left behind when a command
+ * is renamed outside the tool, or by an upgrade that dropped a command. They point at
+ * files that may not exist any more, so they are worse than useless.
+ */
+export function orphans(c: Config): string[] {
+  const binDir = binDirOf(c);
+  const keep = new Set<string>(["apiplan", ...c.commands.map((x) => x.name)]);
+  const out: string[] = [];
+  try {
+    for (const f of require("node:fs").readdirSync(binDir) as string[]) {
+      const name = f.replace(/\.(cmd|ps1)$/, "");
+      if (keep.has(name)) continue;
+      if (isOurShim(join(binDir, f))) out.push(name);
+    }
+  } catch {}
+  return [...new Set(out)];
+}
+export function prune(c: Config): string[] {
+  const gone: string[] = [];
+  for (const name of orphans(c)) gone.push(...removeShim(binDirOf(c), name));
+  return gone;
+}
+
 /** Is this command actually reachable as typed, and does PATH resolve to ours? */
 export function health(c: Config, name: string): { installed: boolean; onPath: boolean; resolves: string | null } {
   const binDir = binDirOf(c);

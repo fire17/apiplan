@@ -1,0 +1,19 @@
+{
+  "name": "apiplan",
+  "version": "0.2.0",
+  "description": "Call frontier models from your shell using the Claude Code and Codex subscriptions you already have — one command per model, pipeable, image-capable, with a warm daemon.",
+  "license": "MIT",
+  "author": "fire17",
+  "repository": { "type": "git", "url": "https://github.com/fire17/apiplan" },
+  "keywords": ["cli", "claude", "opus", "codex", "gpt", "anthropic", "openai", "subscription", "oauth", "llm", "tui", "cross-platform"],
+  "type": "module",
+  "bin": { "apiplan": "bin/apiplan.ts" },
+  "scripts": {
+    "test": "bun test",
+    "bench": "bun bench/perf.ts",
+    "install-commands": "bun bin/apiplan.ts install",
+    "doctor": "bun bin/apiplan.ts doctor"
+  },
+  "engines": { "bun": ">=1.1.0" },
+  "files": ["bin", "src", "install.sh", "install.ps1", "README.md", "LICENSE"]
+}

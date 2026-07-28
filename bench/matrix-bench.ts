@@ -9,7 +9,7 @@ const N = +flag("--n", "4");
 const MODEL = flag("--model", "opus");
 const P_TEXT = flag("--prompt-text", "Name three prime numbers between 10 and 40. One short sentence.");
 const P_IMG = flag("--prompt-image", "Describe what is in this image in one short sentence.");
-const API = new URL(".", import.meta.url).pathname + "api.ts";
+const API = new URL("..", import.meta.url).pathname + "/bin/ask.ts";
 
 async function timeCall(extra: string[], prompt: string): Promise<{ ttft: number; total: number } | null> {
   const t0 = performance.now();

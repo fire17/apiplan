@@ -57,11 +57,11 @@ export function onPath(dir: string): boolean {
  * BOTH a .cmd (for cmd.exe/PowerShell) and a .ps1 (for pwsh piping), because a
  * bare `.cmd` mangles some quoting that PowerShell users depend on.
  */
-export function writeShim(binDir: string, name: string, runner: string, entry: string, args: string[]): string[] {
+export function writeShim(binDir: string, name: string, runner: string, entry: string, args: string[], forWindows = IS_WIN): string[] {
   ensureDir(binDir);
   const argline = args.map(shellQuote).join(" ");
   const written: string[] = [];
-  if (IS_WIN) {
+  if (forWindows) {
     const cmd = join(binDir, `${name}.cmd`);
     writeFileSync(cmd, `@echo off\r\n"${runner}" "${entry}" ${args.map(winQuote).join(" ")} %*\r\n`);
     written.push(cmd);
@@ -132,7 +132,11 @@ export type Ipc =
   | { kind: "tcp"; portFile: string };
 export function ipc(): Ipc {
   if (process.env.APIPLAN_SOCK) return { kind: "unix", path: process.env.APIPLAN_SOCK };
-  return IS_WIN
+  // APIPLAN_IPC lets the Windows transport be exercised on any OS, so the loopback
+  // path is tested rather than assumed.
+  const forced = process.env.APIPLAN_IPC;
+  const useTcp = forced ? forced === "tcp" : IS_WIN;
+  return useTcp
     ? { kind: "tcp", portFile: join(STATE_DIR, "daemon.json") }
     : { kind: "unix", path: join(STATE_DIR, "daemon.sock") };
 }
