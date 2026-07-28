@@ -90,7 +90,12 @@ describe("installer finds THIS checkout, never a second clone", () => {
         stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       const out = p.stdout.toString();
-      expect(out).toContain(`source:  ${ROOT}`);   // the checkout, not a clone
+      // Compare resolved paths: on macOS /var is a symlink to /private/var, so the
+      // installer's `pwd` and the test's import.meta.dir spell the same directory
+      // differently. Comparing raw strings passes in a repo and fails in /tmp.
+      const reported = out.match(/^source:\s+(.+)$/m)?.[1] ?? "";
+      const real = (d: string) => { try { return require("node:fs").realpathSync(d); } catch { return d; } };
+      expect(real(reported)).toBe(real(ROOT));     // the checkout, not a clone
       expect(require("node:fs").existsSync(src)).toBe(false);
     });
   }
