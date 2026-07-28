@@ -7,9 +7,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSy
 
 export const IS_WIN = platform() === "win32";
 export const IS_MAC = platform() === "darwin";
-/** WSL is Linux, but with a Windows host reachable through interop. */
+/**
+ * WSL is Linux, but with a Windows host reachable through interop. Kept as a pure
+ * function of /proc/version so the branch can be tested on a machine that isn't WSL
+ * (real strings from WSL1, WSL2 and plain Linux live in test/platform.test.ts).
+ */
+export function detectWsl(procVersion: string, env: Record<string, string | undefined> = {}): boolean {
+  if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return true;   // set by WSL itself
+  return /microsoft|wsl/i.test(procVersion);
+}
 export const IS_WSL = !IS_WIN && !IS_MAC && (() => {
-  try { return /microsoft|wsl/i.test(readFileSync("/proc/version", "utf8")); } catch { return false; }
+  try { return detectWsl(readFileSync("/proc/version", "utf8"), process.env); } catch { return false; }
 })();
 
 export const HOME = homedir();

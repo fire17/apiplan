@@ -141,6 +141,10 @@ async function cmdDoctor() {
   rows.push(["runtime", true, `${process.execPath} (bun ${Bun.version})`]);
   rows.push(["platform", true, `${osLabel()} ${process.arch}`]);
   rows.push(["state dir", true, STATE_DIR.replace(HOME, "~")]);
+  // Which tree these commands actually run — a curl-install and a dev checkout can
+  // both exist, and knowing which one is wired is the difference between confusion
+  // and a five-second fix.
+  rows.push(["install root", true, join(import.meta.dir, "..").replace(HOME, "~")]);
   rows.push(["bin dir", true, bd.replace(HOME, "~")]);
   rows.push(["bin dir on PATH", onPath(bd) ? true : "warn", onPath(bd) ? "yes" : `no — add it: export PATH="${bd.replace(HOME, "$HOME")}:$PATH"`]);
   for (const p of providerViews()) rows.push([`provider ${p.id}`, p.connected, p.connected ? p.detail : `${p.detail} → ${p.hint}`]);
@@ -443,6 +447,9 @@ switch (sub) {
   }
   case "path": {
     const bd = C.binDirOf(C.load());
+    // --raw prints just the directory, already expanded, for scripts to compare
+    // against $PATH. The default form is meant to be pasted into a shell rc.
+    if (has("--raw")) { process.stdout.write(bd + "\n"); break; }
     process.stdout.write(IS_WIN ? `$env:PATH = "${bd};$env:PATH"\n` : `export PATH="${bd.replace(HOME, "$HOME")}:$PATH"\n`);
     break;
   }

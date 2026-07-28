@@ -23,27 +23,32 @@ under a second.
 
 ---
 
-## Install
+## Install — one line
 
 ```sh
-git clone https://github.com/fire17/apiplan && cd apiplan
-sh install.sh                  # macOS · Linux · WSL
+curl -fsSL https://raw.githubusercontent.com/fire17/apiplan/main/install.sh | sh
 ```
 
 ```powershell
-git clone https://github.com/fire17/apiplan; cd apiplan
-powershell -ExecutionPolicy Bypass -File install.ps1    # Windows
+irm https://raw.githubusercontent.com/fire17/apiplan/main/install.ps1 | iex   # Windows
 ```
 
-Needs [bun](https://bun.sh) (one binary, no admin) — the installer offers to fetch it.
-You must already be logged into `claude` and/or `codex`; apiplan never asks for a
-credential and never stores one.
+That's the whole setup on a new machine: it fetches itself to `~/.apiplan/src`, installs
+[bun](https://bun.sh) if you don't have it (one binary, no admin), and puts every model
+command on your PATH. Re-run it any time to update, or use `apiplan update`.
+
+Working from a clone instead? `git clone … && cd apiplan && sh install.sh` — it detects the
+checkout and wires the commands to it, and tells you which tree it used.
+
+You must already be logged into `claude` and/or `codex`. **apiplan never asks for a
+credential, never stores one, and never sends one anywhere except the provider it came
+from.**
 
 Then `apiplan` shows you everything:
 
 ```console
 $ apiplan status
-apiplan v0.2.0  ·  macOS  ·  daemon warm
+apiplan v0.2.1  ·  macOS  ·  daemon warm
 
 PROVIDERS
   ● anthropic    Keychain (Claude Code-credentials) · expires 2026-07-28 20:14 · team
@@ -125,6 +130,9 @@ apiplan rename ask q                                       # call it whatever yo
 apiplan rm q
 apiplan commands                                           # what exists, and is it on PATH
 apiplan sync                                               # rebuild every shim from config
+apiplan prune                                              # drop shims an old version left
+apiplan update                                             # pull the latest + re-sync
+apiplan path --raw                                         # just the bin dir, for scripts
 ```
 
 Or run `apiplan` with no arguments for a dashboard: `↑↓` to select, `1`/`2`/`3` to move
@@ -142,10 +150,10 @@ Measured on this machine (bun 1.3.14, darwin arm64); reproduce with `bun bench/p
 | | |
 |---|---|
 | client overhead, no network | **18 ms** (bun's own floor is 11 ms) |
-| overhead we add to a warm call | **−362 ms** — a warm call beats a cold raw `fetch`, because the connection is already open |
+| overhead we add to a warm call | **~4 ms** — measured inside the client (dispatch + drain), not inferred from noisy end-to-end timings |
 | first token, warm | **~0.96 s** (text) · ~1.7 s (with an image) |
 | 25 calls in parallel | **25/25**, 2.4 s wall clock, per-call p50 1.06 s |
-| idle daemon | **44 MB**, ~0 % CPU, exits itself after 30 min |
+| idle daemon | **40–51 MB**, ~0 % CPU, exits itself after 30 min |
 
 The daemon starts on your first call, caches the credential (a Keychain read costs 13 ms
 every time otherwise) and holds the connection to each provider open. It never delays a
@@ -184,9 +192,16 @@ than guessed, and every fragile constant is overridable by environment variable
 Codex reads `~/.codex/auth.json` everywhere. The Windows transport is exercised on every
 platform via `APIPLAN_IPC=tcp`, and an unauthenticated request to that port gets a 403.
 
-**Honest status:** developed and live-verified on macOS. Linux, WSL and Windows are
-covered by the platform test-suite and the forced-TCP run, but have **not yet been run on
-those operating systems** — see `DARWIN.md`.
+**Honest status per platform:**
+
+| | status |
+|---|---|
+| **macOS** | ✅ live-verified — developed here; both providers, images, parallel calls |
+| **Linux** | ✅ live-verified — the *published* repo run in a container: 80/80 tests, correct platform detection, unix-socket IPC, credential fallback to `~/.claude/.credentials.json`, and the one-line install on a bare box |
+| **WSL** | ⚠️ logic verified, never run — `detectWsl()` is tested against real WSL1/WSL2 kernel strings and the interop env vars, but no process has executed on WSL |
+| **Windows** | ⚠️ logic verified, never run — `.cmd`/`.ps1` shim generation and the loopback-TCP daemon (incl. its 403) are tested, but not on Windows itself |
+
+Running it on WSL or Windows and reporting back is the most useful contribution right now.
 
 ## Troubleshooting
 
@@ -206,12 +221,12 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 79 tests: aliases, wire contracts, CLI, platform layer
+bun test                  # 87 tests: aliases, wire contracts, CLI, installer, platform layer
 bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
 ```
 
 `VISION.md` is the founding brief, `BUDGETS.md` turns its adjectives into enforced
-numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs five rounds of
+numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs ten rounds of
 measure-fix-verify — including the round where the daemon turned out to be making calls
 1.6 s *slower*, and the optimisation that was measured, rejected and recorded.
 

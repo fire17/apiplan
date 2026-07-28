@@ -4,7 +4,7 @@ import { expect, test, describe, afterAll } from "bun:test";
 import { join } from "node:path";
 import { readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { writeShim, removeShim, RESERVED, shadowsExisting, isOurShim, ipc, readJson, writeJson, osLabel, IS_WIN } from "../src/platform.ts";
+import { writeShim, removeShim, RESERVED, shadowsExisting, isOurShim, ipc, readJson, writeJson, osLabel, detectWsl, IS_WIN } from "../src/platform.ts";
 
 const SB = join(tmpdir(), `apiplan-test-${process.pid}`);
 mkdirSync(SB, { recursive: true });
@@ -60,6 +60,24 @@ describe("name safety", () => {
     const f = join(SB, "unittest-foreign");
     writeFileSync(f, "#!/bin/sh\necho hello from some other tool\n");
     expect(isOurShim(f)).toBe(false);
+  });
+});
+
+describe("WSL detection (real /proc/version strings)", () => {
+  test("WSL2 kernel is recognised", () => {
+    expect(detectWsl("Linux version 5.15.167.4-microsoft-standard-WSL2 (root@941d701f84f1) #1 SMP")).toBe(true);
+  });
+  test("WSL1 kernel is recognised", () => {
+    expect(detectWsl("Linux version 4.4.0-19041-Microsoft (Microsoft@Microsoft.com) #488-Microsoft")).toBe(true);
+  });
+  test("plain Linux is NOT WSL", () => {
+    expect(detectWsl("Linux version 6.1.0-18-arm64 (debian-kernel@lists.debian.org) #1 SMP Debian")).toBe(false);
+    expect(detectWsl("Linux version 5.10.0-21-amd64 (gcc-10) #1 SMP Debian 5.10.162-1")).toBe(false);
+  });
+  test("WSL's own environment variables are trusted even if /proc/version is odd", () => {
+    expect(detectWsl("Linux version 6.6.0-generic", { WSL_DISTRO_NAME: "Ubuntu" })).toBe(true);
+    expect(detectWsl("Linux version 6.6.0-generic", { WSL_INTEROP: "/run/WSL/8_interop" })).toBe(true);
+    expect(detectWsl("Linux version 6.6.0-generic", {})).toBe(false);
   });
 });
 

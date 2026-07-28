@@ -15,12 +15,17 @@ REPO="${APIPLAN_REPO:-https://github.com/fire17/apiplan.git}"
 SRC="${APIPLAN_SRC:-$HOME/.apiplan/src}"
 
 # ---- find the source: this checkout, or clone/update one -------------------------
-HERE=""
-case "${0:-}" in
-  */*) HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) ;;
-esac
-if [ -n "$HERE" ] && [ -f "$HERE/bin/apiplan.ts" ]; then
-  ROOT="$HERE"                        # running inside a checkout
+# Three cases must all work: `sh install.sh` (no slash in $0), `sh ./path/install.sh`,
+# and `curl … | sh` (no file at all). Getting this wrong silently clones a second copy
+# and wires your commands to it instead of the checkout you are standing in.
+ROOT=""
+if [ -n "${0:-}" ] && [ "$0" != "sh" ] && [ "$0" != "-" ] && [ -f "$0" ]; then
+  HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  [ -f "$HERE/bin/apiplan.ts" ] && ROOT="$HERE"
+fi
+[ -z "$ROOT" ] && [ -f "./bin/apiplan.ts" ] && ROOT=$(pwd)   # run from the repo root
+if [ -n "$ROOT" ]; then
+  :                                   # running inside a checkout
 else
   command -v git >/dev/null 2>&1 || { echo "apiplan: git is required to bootstrap"; exit 1; }
   if [ -d "$SRC/.git" ]; then
@@ -53,12 +58,13 @@ else
   [ -x "$BUN" ] || { echo "bun install failed; see https://bun.sh"; exit 1; }
 fi
 echo "runtime: bun $("$BUN" --version 2>/dev/null) at $BUN"
+echo "source:  $ROOT"
 
 # ---- install the commands -------------------------------------------------------
 "$BUN" "$ROOT/bin/apiplan.ts" install "$@"
 
 # ---- shell glue -----------------------------------------------------------------
-BIN=$("$BUN" "$ROOT/bin/apiplan.ts" path 2>/dev/null | sed -E 's/^export PATH="([^:]*).*/\1/')
+BIN=$("$BUN" "$ROOT/bin/apiplan.ts" path --raw 2>/dev/null)
 SHELL_NAME=$(basename "${SHELL:-sh}")
 case "$SHELL_NAME" in
   zsh)  RC="$HOME/.zshrc" ;;
@@ -67,8 +73,15 @@ case "$SHELL_NAME" in
   *)    RC="" ;;
 esac
 
+# Only suggest a PATH line if the dir isn't already reachable — suggesting one for a
+# directory that already works reads as noise and invites a duplicate rc entry.
 PATH_LINE=""
-[ -n "${BIN:-}" ] && PATH_LINE=$(printf 'export PATH="%s:$PATH"' "$(printf '%s' "$BIN" | sed "s|$HOME|\$HOME|")")
+if [ -n "${BIN:-}" ]; then
+  case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *) PATH_LINE=$(printf 'export PATH="%s:$PATH"' "$(printf '%s' "$BIN" | sed "s|$HOME|\$HOME|")") ;;
+  esac
+fi
 INIT_LINE='eval "$(apiplan shell-init)"'
 
 # Already wired? Then say so and stop.
@@ -77,7 +90,7 @@ if [ -n "$RC" ] && [ -f "$RC" ] && grep -q 'apiplan shell-init' "$RC" 2>/dev/nul
   echo "shell already wired in $RC — open a new shell and try:  opus hello"
 else
   echo
-  echo "Two lines finish the setup:"
+  if [ -n "$PATH_LINE" ]; then echo "Two lines finish the setup:"; else echo "One line finishes the setup:"; fi
   echo
   [ -n "$PATH_LINE" ] && echo "  $PATH_LINE"
   echo "  $INIT_LINE      # so \`opus is this right?\` needs no quotes"
@@ -92,9 +105,11 @@ else
   fi
   if [ "$DO" = "y" ] && [ -n "$RC" ]; then
     { echo ""; echo "# apiplan"; [ -n "$PATH_LINE" ] && echo "$PATH_LINE"; echo "$INIT_LINE"; } >> "$RC"
-    echo "appended to $RC"
+    echo "appended to $RC — open a new shell and try:  opus hello"
+  elif [ -z "$RC" ]; then
+    echo "(couldn't tell which shell rc to use — add the line above to yours.)"
   else
-    echo "left alone — run those lines yourself when ready."
+    echo "left alone — run the line(s) above yourself when ready."
   fi
 fi
 

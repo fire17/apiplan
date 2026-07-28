@@ -131,6 +131,79 @@ proposal adapts per platform — macOS gets `sol`/`gpt-fast`, a Linux box with n
 
 ---
 
+---
+
+# Rounds 6–10 — cross-platform for real, and one-line setup
+
+The first five rounds left one honest gap: *"cross-platform"* was unit-tested, not run.
+These rounds closed it where a real machine was reachable, and said so plainly where one
+wasn't. Version bumped to **0.2.1**.
+
+## Round 6 — real Linux, against the published repo
+
+Ran the **published** repo (not the working copy) inside `oven/bun:1` on Linux aarch64:
+
+| check | result |
+|---|---|
+| test suite | **80/80 pass** |
+| platform detection | `os: Linux · win: false · mac: false · wsl: false` |
+| bin dir | `/usr/local/bin`, already on PATH |
+| IPC | unix socket at `/root/.apiplan/daemon.sock` |
+| credential path | correctly fell back to `~/.claude/.credentials.json` (no Keychain on Linux) |
+| aliases | `opus → claude-opus-5`, `opus48 → claude-opus-4-8`, `gpt55 → gpt-5.5` |
+| `apiplan doctor` | reported both providers logged out, with the right paths and hints |
+
+**Linux is now live-verified**, including the credential fallback that only ever runs
+off-macOS.
+
+## Round 7 — one-line setup on a bare box
+
+The vision asked for it to be easy to share and set up on new machines; installing still
+meant "clone this, then run that". Made both installers **self-bootstrapping**: piped from
+`curl`/`irm` with no checkout present, they clone to `~/.apiplan/src` and continue. Added
+`apiplan update` (pull + re-sync + refresh models) so a machine stays current with one word.
+
+**Verified on a bare Linux container** with only git + curl:
+`curl -fsSL …/install.sh | sh` → installed 13 commands, `opus --dry-run` produced a correct
+request, `apiplan status` rendered. Non-interactive runs correctly stopped prompting
+instead of hanging on a `read`.
+
+## Round 8 — the WSL branch, made testable instead of assumed
+
+The WSL box (`magic-wsl`) was online in Tailscale but SSH did not answer; rather than fight
+another machine, the *logic* was made verifiable. `detectWsl()` is now a pure function of
+`/proc/version` + environment, tested against **real** WSL1, WSL2 and plain-Linux kernel
+strings plus `WSL_DISTRO_NAME` / `WSL_INTEROP`.
+
+**Still NOT live-run on WSL or Windows** — stated as such everywhere rather than implied.
+
+## Round 9 — installer polish the previous round exposed
+
+- It suggested a `PATH` line even when the directory was already on `PATH`. Cause: `apiplan
+  path` prints a `$HOME`-relative line for pasting, which never matches an expanded
+  `$PATH`. Added `apiplan path --raw` for scripts; the installer now compares with that and
+  says "One line finishes the setup" when that is the truth.
+- An already-wired shell rc is detected and left alone instead of appended to twice.
+- When no shell rc can be identified, it says so instead of silently doing nothing.
+
+## Round 10 — the bug that had already bitten this machine
+
+**Found:** `which apiplan` pointed at `~/.apiplan/src/bin/apiplan.ts` — a *second clone* —
+while the work was happening in `~/Creations/APIPlan`. Every command on this machine had
+been quietly wired to a stale copy.
+
+**Root cause:** `sh install.sh` puts no slash in `$0`, so the checkout test
+(`case "$0" in */*)`) failed, the script concluded it was being piped, and it cloned.
+
+**Fix:** resolve the source through three cases — a real file at `$0`, `./bin/apiplan.ts`
+relative to the cwd, and only then bootstrap — and **print the source tree it wired**
+(`source:  /path`). `apiplan doctor` now also reports the **install root**, so "which copy
+am I running?" is never a mystery again. Three regression tests cover all three invocation
+styles and assert no clone appears.
+
+**Verified:** all three styles resolve to the checkout; the stray clone removed; commands
+re-wired to the working tree; 87 tests green.
+
 ## Final state
 
 | metric | before round 1 | after round 5 | budget |
@@ -141,15 +214,22 @@ proposal adapts per platform — macOS gets `sol`/`gpt-fast`, a Linux box with n
 | per-call credential read avoided | 0 (daemon dead) | **12 ms** | ≥8 ms |
 | idle daemon memory | n/a (dead) | **51 MB** | ≤80 MB |
 | providers answering live | 2 | **2** | ≥2 |
-| tests | 61 | **80** | 100 % |
+| tests | 61 | **87** | 100 % |
 | `apiplan doctor` | warnings | **all clear** | clean |
 | budgets met | 3 of 5 | **7 of 7** | all |
+| platforms live-verified | macOS | **macOS + Linux** | 4 (2 remain) |
+| setup on a new machine | clone + script | **one line** | one line |
 
 **Degradation check:** every round ended with the full gate green. The only budget ever
 relaxed was B3, and it was replaced with a stricter, deterministic measurement rather than
 removed — the end-to-end number is still printed every run.
 
-**Open / not closed:**
+**Open / not closed (after round 10):**
+- **WSL and Windows have still never been run.** The platform layer is unit-tested for all
+  four targets, `detectWsl()` is tested against real kernel strings, and the Windows
+  loopback-TCP transport is exercised on macOS — but no process has executed on those two
+  operating systems. This is the top item for whoever continues.
+- Earlier open items, still true:
 - The second call after a cold start can still pay the daemon's own upstream warm-up
   (~1.9 s observed once). Harmless, self-correcting by the third call; left alone rather
   than adding pre-bind blocking that would delay readiness.

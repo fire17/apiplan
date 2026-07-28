@@ -72,6 +72,30 @@ describe("a sentence needs no quotes (B8)", () => {
   });
 });
 
+describe("installer finds THIS checkout, never a second clone", () => {
+  // Regression: `sh install.sh` puts no slash in $0, which made the checkout check
+  // fail — so it cloned a second copy and wired every command to that instead of the
+  // tree the user was standing in. Silent, and confusing for hours.
+  const styles: [string, string[], string][] = [
+    ["sh install.sh", ["install.sh"], ROOT],
+    ["sh ./install.sh", ["./install.sh"], ROOT],
+    ["sh <abs>/install.sh", [join(ROOT, "install.sh")], ROOT],
+  ];
+  for (const [label, argv, cwd] of styles) {
+    test(`${label} uses the checkout`, () => {
+      const src = join(SB, `src-should-not-exist-${argv.length}-${label.length}`);
+      const p = Bun.spawnSync(["sh", ...argv], {
+        cwd,
+        env: { ...process.env, APIPLAN_HOME: SB, APIPLAN_BIN: join(SB, "bin"), APIPLAN_SRC: src, NO_COLOR: "1" },
+        stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const out = p.stdout.toString();
+      expect(out).toContain(`source:  ${ROOT}`);   // the checkout, not a clone
+      expect(require("node:fs").existsSync(src)).toBe(false);
+    });
+  }
+});
+
 describe("errors help instead of just failing", () => {
   test("an unknown model suggests real alternatives", () => {
     const r = run(ASK, ["-m", "gpt9", "hi"]);
