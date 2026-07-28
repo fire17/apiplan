@@ -1,0 +1,89 @@
+# Cross-platform verification that actually executes, on all three runner OSes.
+# The project claims to work on macOS, Linux, WSL and Windows; three of those can be
+# proven here on every push, so the claim stops resting on unit tests alone.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: platform layer sees the right OS
+        run: bun -e "import {osLabel, IS_WIN, IS_MAC, IS_WSL, ipc, defaultBinDir} from './src/platform.ts'; console.log('os', osLabel(), '| win', IS_WIN, '| mac', IS_MAC, '| wsl', IS_WSL); console.log('ipc', JSON.stringify(ipc())); console.log('binDir', defaultBinDir())"
+
+      - name: test suite
+        run: bun test
+
+      - name: aliases resolve (opus must be Opus 5)
+        run: bun -e "import {resolve} from './src/registry.ts'; const want={opus:'claude-opus-5','opus48':'claude-opus-4-8',sonnet:'claude-sonnet-5',gpt:'gpt-5.6-sol',gpt55:'gpt-5.5'}; for (const [a,e] of Object.entries(want)) { const got=resolve(a)?.id; if (got!==e) { console.error(a+' -> '+got+' (expected '+e+')'); process.exit(1); } console.log(a,'->',got); }"
+
+      # Installs the real commands and runs one through the generated shim. On Windows
+      # that exercises the .cmd wrapper and argument forwarding; on POSIX the sh shim.
+      - name: install commands and run one (no credentials needed)
+        shell: bash
+        env:
+          APIPLAN_BIN: ${{ runner.temp }}/apiplan-bin
+          APIPLAN_HOME: ${{ runner.temp }}/apiplan-home
+        run: |
+          set -e
+          bun bin/apiplan.ts install
+          bun bin/apiplan.ts commands
+          export PATH="$APIPLAN_BIN:$PATH"
+          echo "--- a bare sentence through the installed command ---"
+          opus --dry-run explain monads in one sentence > out.json
+          grep -q '"model": "claude-opus-5"' out.json
+          grep -q 'explain monads in one sentence' out.json
+          echo "--- explicit version through the installed command ---"
+          opus --model opus48 --dry-run hi | grep -q '"model": "claude-opus-4-8"'
+          echo "--- help + doctor render ---"
+          opus --help > /dev/null
+          bun bin/apiplan.ts doctor
+
+      - name: windows also gets a .ps1 that PowerShell can run
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          APIPLAN_BIN: ${{ runner.temp }}/apiplan-bin
+          APIPLAN_HOME: ${{ runner.temp }}/apiplan-home
+        run: |
+          $env:PATH = "$env:APIPLAN_BIN;$env:PATH"
+          Get-ChildItem $env:APIPLAN_BIN | Select-Object -First 6 Name
+          # the .cmd wrapper, invoked the way a Windows user would
+          $out = & opus --dry-run explain monads in one sentence
+          if ($out -notmatch 'claude-opus-5') { throw "cmd shim did not reach Opus 5" }
+          if ($out -notmatch 'explain monads in one sentence') { throw "cmd shim mangled the prompt" }
+          # and the .ps1 twin
+          $out2 = & "$env:APIPLAN_BIN/opus.ps1" --dry-run hello from powershell
+          if ($out2 -notmatch 'hello from powershell') { throw "ps1 shim mangled the prompt" }
+          Write-Host "windows shims OK"
+
+      - name: daemon transport comes up (loopback TCP on Windows, socket elsewhere)
+        shell: bash
+        env:
+          APIPLAN_HOME: ${{ runner.temp }}/apiplan-home
+        run: |
+          set -e
+          bun bin/apiplan.ts daemon &
+          sleep 4
+          bun -e "
+            import {daemonVersion} from './src/engine.ts';
+            const v = await daemonVersion();
+            if (!v) { console.error('daemon not reachable'); process.exit(1); }
+            console.log('daemon reachable, version', v);
+          "
+          bun bin/apiplan.ts daemon stop

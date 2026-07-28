@@ -72,7 +72,8 @@ describe("a sentence needs no quotes (B8)", () => {
   });
 });
 
-describe("installer finds THIS checkout, never a second clone", () => {
+// install.sh is POSIX; Windows uses install.ps1, which has its own checks.
+describe.skipIf(process.platform === "win32")("installer finds THIS checkout, never a second clone", () => {
   // Regression: `sh install.sh` puts no slash in $0, which made the checkout check
   // fail — so it cloned a second copy and wired every command to that instead of the
   // tree the user was standing in. Silent, and confusing for hours.
