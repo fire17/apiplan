@@ -226,6 +226,66 @@ Three separate causes, each a lesson about measuring the right thing:
 
 **Verified:** four consecutive gate runs, all clean, with the same code.
 
+---
+
+# Rounds 11–13 — the remaining two operating systems, actually run
+
+Rounds 6–10 left WSL and Windows verified-by-logic only, and the honest note said so. A
+stop-gate rejected that as incomplete — correctly, because "I could not reach a box" is a
+statement about effort, not about the software. Both were reachable with more work.
+
+## Round 11 — WSL, on a real WSL2 machine
+
+Plain `ssh` to the box hung, which is where the previous attempt stopped. **`tailscale ssh`
+answered immediately.** The box: `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64`, with no
+bun, no claude and no codex installed — a genuinely cold machine.
+
+| check | result |
+|---|---|
+| one-line install (`curl … \| sh`) | fetched bun (absent), installed **13 commands** into `~/.local/bin` |
+| PATH advice | said "**One line** finishes the setup" — the round-9 fix behaving correctly on a foreign machine |
+| platform detection | `osLabel: WSL · IS_WSL: true · IS_WIN: false · IS_MAC: false` |
+| IPC | unix socket at `/home/magic/.apiplan/daemon.sock` |
+| test suite | **87/87 pass** |
+| aliases | `opus → claude-opus-5`, `opus48 → claude-opus-4-8`, `gpt55 → gpt-5.5` |
+| bare sentence through the installed shim | correct request, prompt intact |
+
+**WSL is live-verified.** Note `WSL_DISTRO_NAME` and `WSL_INTEROP` were *empty* over that
+transport, so detection fell through to `/proc/version` — exactly the path round 8 made
+testable, now confirmed against the real thing.
+
+## Round 12 — Windows, on real Windows runners
+
+`.github/workflows/ci.yml` runs the suite on **ubuntu-latest, macos-latest and
+windows-latest** on every push: the platform layer's own view of the OS/IPC/bin-dir, the
+full suite, alias resolution, installing the real commands and running one **through the
+generated shim with a bare unquoted sentence**, the `.ps1` twin invoked from PowerShell,
+and the daemon transport coming up (loopback TCP there, socket elsewhere).
+
+The first Windows run failed **at `actions/checkout`, before any test**: an earlier mangled
+shell command in this session had created a file whose *name* was a multi-line script
+fragment, and `git add -A` committed it. macOS and Linux accept such names; Windows cannot
+create them, so the repository was simply **uncloneable on Windows**. Removed, and a test
+now fails if any tracked path contains a character Windows rejects — verified by planting
+`bad?name.txt` and watching the guard trip.
+
+## Round 13 — two real Windows-only bugs, invisible from macOS
+
+With checkout fixed, Windows ran the suite and failed 2 of 88 — both genuine:
+
+1. **`removeShim()` never deleted extensionless shims on Windows** (it only looked for
+   `.cmd` and `.ps1`). Every rename, delete and `prune` silently orphaned a file there.
+2. **Git Bash users had no working command at all.** `.cmd` and `.ps1` are resolved by
+   cmd.exe and PowerShell through `PATHEXT`; bash appends only `.exe`, so `opus` found
+   nothing — for a large share of Windows developers.
+
+**Fix:** Windows now gets **three** files per command — `.cmd` (cmd.exe/PowerShell), `.ps1`
+(pwsh quoting and piping), and an extensionless sh shim (Git Bash/MSYS) — and `removeShim`
+cleans up all three.
+
+Neither bug was reachable by any amount of testing on macOS. This is the round that
+justifies the CI matrix existing at all.
+
 ## Final state
 
 | metric | before round 1 | after round 5 | budget |

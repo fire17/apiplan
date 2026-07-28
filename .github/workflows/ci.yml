@@ -62,14 +62,25 @@ jobs:
           APIPLAN_HOME: ${{ runner.temp }}/apiplan-home
         run: |
           $env:PATH = "$env:APIPLAN_BIN;$env:PATH"
-          Get-ChildItem $env:APIPLAN_BIN | Select-Object -First 6 Name
-          # the .cmd wrapper, invoked the way a Windows user would
-          $out = & opus --dry-run explain monads in one sentence
-          if ($out -notmatch 'claude-opus-5') { throw "cmd shim did not reach Opus 5" }
-          if ($out -notmatch 'explain monads in one sentence') { throw "cmd shim mangled the prompt" }
-          # and the .ps1 twin
-          $out2 = & "$env:APIPLAN_BIN/opus.ps1" --dry-run hello from powershell
-          if ($out2 -notmatch 'hello from powershell') { throw "ps1 shim mangled the prompt" }
+          Write-Host "--- files installed for 'opus' ---"
+          Get-ChildItem $env:APIPLAN_BIN -Filter "opus*" | ForEach-Object { $_.Name }
+          Write-Host "--- what does PowerShell resolve 'opus' to? ---"
+          Get-Command opus -All -ErrorAction SilentlyContinue | ForEach-Object { "$($_.CommandType)  $($_.Source)" }
+          Write-Host "--- bare invocation ---"
+          $out = & opus --dry-run explain monads in one sentence 2>&1 | Out-String
+          Write-Host "exit=$LASTEXITCODE len=$($out.Length)"
+          Write-Host $out.Substring(0, [Math]::Min(400, $out.Length))
+          Write-Host "--- .cmd explicitly ---"
+          $outCmd = & "$env:APIPLAN_BIN\opus.cmd" --dry-run explain monads in one sentence 2>&1 | Out-String
+          Write-Host "exit=$LASTEXITCODE len=$($outCmd.Length)"
+          Write-Host "--- .ps1 explicitly ---"
+          $outPs = & "$env:APIPLAN_BIN\opus.ps1" --dry-run hello from powershell 2>&1 | Out-String
+          Write-Host "exit=$LASTEXITCODE len=$($outPs.Length)"
+          # Assert on the two forms a Windows user actually gets; report all three above.
+          if ($outCmd -notmatch 'claude-opus-5') { throw ".cmd shim did not reach Opus 5" }
+          if ($outCmd -notmatch 'explain monads in one sentence') { throw ".cmd shim mangled the prompt" }
+          if ($outPs -notmatch 'hello from powershell') { throw ".ps1 shim mangled the prompt" }
+          if ($out -notmatch 'claude-opus-5') { throw "BARE 'opus' did not work in PowerShell (extensionless shim shadowing .cmd?)" }
           Write-Host "windows shims OK"
 
       - name: daemon transport comes up (loopback TCP on Windows, socket elsewhere)
