@@ -18,9 +18,11 @@ describe("shims", () => {
     expect(s).toStartWith("#!/bin/sh");
     expect(s).toContain(`exec "/bin/bun" "/x/ask.ts" --model opus "$@"`);
   });
-  test("windows gets BOTH .cmd and .ps1, forwarding all args", () => {
+  test("windows gets .cmd, .ps1 AND a bare sh shim (cmd.exe, pwsh, Git Bash)", () => {
     const files = writeShim(SB, "unittest-win", "C:\\bun.exe", "C:\\ask.ts", ["--model", "opus"], true);
-    expect(files.map((f) => f.split(/[\\/]/).pop())).toEqual(["unittest-win.cmd", "unittest-win.ps1"]);
+    expect(files.map((f) => f.split(/[\\/]/).pop())).toEqual(["unittest-win.cmd", "unittest-win.ps1", "unittest-win"]);
+    // Git Bash appends only .exe, so without the extensionless copy `opus` finds nothing
+    expect(readFileSync(files[2], "utf8")).toStartWith("#!/bin/sh");
     const cmd = readFileSync(files[0], "utf8");
     expect(cmd).toContain("@echo off");
     expect(cmd).toContain("%*");                 // forwards the user's words

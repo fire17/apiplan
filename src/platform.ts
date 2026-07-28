@@ -70,12 +70,20 @@ export function writeShim(binDir: string, name: string, runner: string, entry: s
   const argline = args.map(shellQuote).join(" ");
   const written: string[] = [];
   if (forWindows) {
+    // Three files, because Windows has three shells that resolve commands differently:
+    //   .cmd  — cmd.exe and PowerShell (via PATHEXT)
+    //   .ps1  — pwsh, where quoting and piping behave like a native cmdlet
+    //   bare  — Git Bash / MSYS, which append .exe only and would otherwise find nothing
     const cmd = join(binDir, `${name}.cmd`);
     writeFileSync(cmd, `@echo off\r\n"${runner}" "${entry}" ${args.map(winQuote).join(" ")} %*\r\n`);
     written.push(cmd);
     const ps1 = join(binDir, `${name}.ps1`);
     writeFileSync(ps1, `#!/usr/bin/env pwsh\n& "${runner}" "${entry}" ${args.map(psQuote).join(" ")} @args\nexit $LASTEXITCODE\n`);
     written.push(ps1);
+    const sh = join(binDir, name);
+    writeFileSync(sh, `#!/bin/sh\nexec "${runner}" "${entry}" ${argline} "$@"\n`);
+    try { chmodSync(sh, 0o755); } catch {}
+    written.push(sh);
   } else {
     const sh = join(binDir, name);
     writeFileSync(sh, `#!/bin/sh\nexec "${runner}" "${entry}" ${argline} "$@"\n`);
@@ -86,7 +94,7 @@ export function writeShim(binDir: string, name: string, runner: string, entry: s
 }
 export function removeShim(binDir: string, name: string): string[] {
   const gone: string[] = [];
-  const cands = IS_WIN ? [`${name}.cmd`, `${name}.ps1`] : [name];
+  const cands = IS_WIN ? [`${name}.cmd`, `${name}.ps1`, name] : [name];
   for (const c of cands) {
     const p = join(binDir, c);
     if (existsSync(p)) { try { unlinkSync(p); gone.push(p); } catch {} }
