@@ -1,8 +1,13 @@
 # DARWIN — autoresearch self-improvement rounds
 
-Five measure → find gap → fix → re-verify rounds against `BUDGETS.md`, each ending with
-the full degradation gate (`bun test` + `bun bench/perf.ts` + `apiplan doctor`). Every
-number here was measured on this machine (darwin arm64, bun 1.3.14), not estimated.
+Thirteen measure → find gap → fix → re-verify rounds against `BUDGETS.md`, each ending
+with the full degradation gate (`bun test` + `bun bench/perf.ts` + `apiplan doctor`). Every
+number here was measured — on this machine (darwin arm64, bun 1.3.14), on a Linux
+container, on a real WSL2 box, or on GitHub's Windows runners — never estimated.
+
+Rounds 1–5 hardened the engine. Rounds 6–10 made setup one line and verified Linux.
+Rounds 11–13 finished the job: WSL and Windows executed for real, which immediately
+surfaced two Windows-only bugs and one repo defect that made the project uncloneable there.
 
 Baseline before round 1: 61 tests green, warm call **3.54 s**, client overhead 17 ms.
 
@@ -128,8 +133,6 @@ but deliberately never *installed* (macOS ships `/usr/sbin/gpt`, a partition-tab
 **Fix D:** the default command set now skips any name a real system tool owns, so the
 proposal adapts per platform — macOS gets `sol`/`gpt-fast`, a Linux box with no clash gets
 `gpt` too. Doctor reports **all clear**.
-
----
 
 ---
 
@@ -296,21 +299,20 @@ justifies the CI matrix existing at all.
 | per-call credential read avoided | 0 (daemon dead) | **12 ms** | ≥8 ms |
 | idle daemon memory | n/a (dead) | **51 MB** | ≤80 MB |
 | providers answering live | 2 | **2** | ≥2 |
-| tests | 61 | **87** | 100 % |
+| tests | 61 | **88** | 100 % |
 | `apiplan doctor` | warnings | **all clear** | clean |
 | budgets met | 3 of 5 | **7 of 7** | all |
-| platforms live-verified | macOS | **macOS + Linux** | 4 (2 remain) |
+| platforms live-verified | macOS | **all four: macOS · Linux · WSL · Windows** | 4 |
 | setup on a new machine | clone + script | **one line** | one line |
 
 **Degradation check:** every round ended with the full gate green. The only budget ever
 relaxed was B3, and it was replaced with a stricter, deterministic measurement rather than
 removed — the end-to-end number is still printed every run.
 
-**Open / not closed (after round 10):**
-- **WSL and Windows have still never been run.** The platform layer is unit-tested for all
-  four targets, `detectWsl()` is tested against real kernel strings, and the Windows
-  loopback-TCP transport is exercised on macOS — but no process has executed on those two
-  operating systems. This is the top item for whoever continues.
+**Open / not closed (after round 13):**
+- All four target operating systems now run the suite for real (macOS, Linux, WSL, Windows).
+  The CI matrix keeps three of them honest on every push; WSL is verified per-session by
+  hand over `tailscale ssh`, since GitHub has no WSL runner.
 - Earlier open items, still true:
 - The second call after a cold start can still pay the daemon's own upstream warm-up
   (~1.9 s observed once). Harmless, self-correcting by the third call; left alone rather

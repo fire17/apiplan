@@ -1,5 +1,7 @@
 # apiplan
 
+[![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
+
 **Call frontier models from your shell using the subscriptions you already pay for.**
 
 You're logged into Claude Code and Codex. Those logins can answer API-shaped questions —
@@ -194,14 +196,21 @@ platform via `APIPLAN_IPC=tcp`, and an unauthenticated request to that port gets
 
 **Honest status per platform:**
 
-| | status |
-|---|---|
-| **macOS** | ✅ live-verified — developed here; both providers, images, parallel calls |
-| **Linux** | ✅ live-verified — the *published* repo run in a container: 80/80 tests, correct platform detection, unix-socket IPC, credential fallback to `~/.claude/.credentials.json`, and the one-line install on a bare box |
-| **WSL** | ⚠️ logic verified, never run — `detectWsl()` is tested against real WSL1/WSL2 kernel strings and the interop env vars, but no process has executed on WSL |
-| **Windows** | ⚠️ logic verified, never run — `.cmd`/`.ps1` shim generation and the loopback-TCP daemon (incl. its 403) are tested, but not on Windows itself |
+All four are verified by **actually running there**, not by unit tests alone:
 
-Running it on WSL or Windows and reporting back is the most useful contribution right now.
+| | verified how |
+|---|---|
+| **macOS** | ✅ developed here — both providers live, images, 25-way parallel calls |
+| **Linux** | ✅ the *published* repo in a container: 88 tests, platform detection, unix-socket IPC, credential fallback to `~/.claude/.credentials.json`, and the one-line install on a bare box with only git+curl |
+| **WSL** | ✅ a real WSL2 machine (`5.15-microsoft-standard-WSL2`) with no bun/claude/codex installed: one-line install fetched bun, `osLabel: WSL`, 87 tests, aliases, bare sentence through the shim |
+| **Windows** | ✅ every push, on `windows-latest`: 88 tests, alias resolution, the commands installed and invoked **through the generated `.cmd`** with an unquoted sentence, the `.ps1` twin from PowerShell, and the loopback-TCP daemon coming up |
+
+CI runs the matrix on every push — [see the runs](https://github.com/fire17/apiplan/actions/workflows/ci.yml).
+
+On Windows each command installs three files: `.cmd` (cmd.exe/PowerShell via `PATHEXT`),
+`.ps1` (pwsh quoting and piping) and an extensionless sh shim (Git Bash/MSYS, which appends
+only `.exe` and would otherwise find nothing). PowerShell still resolves the `.cmd` — checked
+in CI, not assumed.
 
 ## Troubleshooting
 
@@ -221,12 +230,12 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 87 tests: aliases, wire contracts, CLI, installer, platform layer
+bun test                  # 88 tests: aliases, wire contracts, CLI, installer, platform layer
 bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
 ```
 
 `VISION.md` is the founding brief, `BUDGETS.md` turns its adjectives into enforced
-numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs ten rounds of
+numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs thirteen rounds of
 measure-fix-verify — including the round where the daemon turned out to be making calls
 1.6 s *slower*, and the optimisation that was measured, rejected and recorded.
 
