@@ -1,6 +1,0 @@
-AAAAA
-::: RECOVER :::  IS_MAC:,IS_MAC); console.log( ipc:,JSON.stringify(ipc())); console.log( binDir:,defaultBinDir())\"
-echo \"--- test suite on WSL ---\"
-bun test 2>&1 | tail -4
-echo \"--- aliases ---\"
-bun -e \"import {resolve} from ./src/registry.ts; for (const a of [opus,opus48,sonnet,gpt,gpt55]) console.log( +a+ -

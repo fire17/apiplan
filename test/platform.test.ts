@@ -102,3 +102,16 @@ describe("state files", () => {
 test("os label names one of the four supported targets", () => {
   expect(["macOS", "Linux", "WSL", "Windows"]).toContain(osLabel());
 });
+
+// A tracked path that Windows cannot create makes `git checkout` fail outright — the
+// repo becomes uncloneable there, which is worse than any test failure. This happened:
+// a mangled shell command created a file whose NAME was a multi-line script, `git add
+// -A` committed it, and Windows CI died at checkout.
+test("no tracked file has a name Windows cannot check out", () => {
+  const p = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" });
+  if (p.exitCode !== 0) return;                      // not a git checkout (e.g. tarball) — nothing to assert
+  const paths = p.stdout.toString().split("\0").filter(Boolean);
+  expect(paths.length).toBeGreaterThan(0);
+  const illegal = paths.filter((f) => /[<>:"|?*\n\r]/.test(f) || /[ .]$/.test(f.split("/").pop() ?? ""));
+  expect(illegal).toEqual([]);
+});
