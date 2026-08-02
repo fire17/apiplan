@@ -1,12 +1,66 @@
-# apiplan
+<div align="center">
+  <img src="assets/banner.svg" width="100%" alt="apiplan — frontier models as ordinary Unix commands, on the subscriptions you already pay for">
+</div>
+
+<div align="center">
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
+[![tests](https://img.shields.io/badge/tests-118%20passing-e8b84a)](test/)
+[![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
+[![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![stars](https://img.shields.io/github/stars/fire17/apiplan?style=social)](https://github.com/fire17/apiplan/stargazers)
 
-**Call frontier models from your shell using the subscriptions you already pay for.**
+*You already pay for the frontier. This puts it in your shell.*
 
-You're logged into Claude Code and Codex. Those logins can answer API-shaped questions —
-so `apiplan` turns them into ordinary Unix commands. No API key, no per-token bill, no
-quotes around your question.
+**[⚡ Install](#install--one-line)** · **[🧠 Models](#a-family-name-always-means-the-newest-model)** · **[🎨 Images & speech](#pictures-and-speech)** · **[🛠 Your own commands](#make-your-own-commands)** · **[📐 How it works](#how-it-works)**
+
+</div>
+
+---
+
+## The part that should stop you
+
+**Every capability below runs on a subscription you already have. No API key is ever
+read, and nothing is billed per token.**
+
+- **Text** — `opus`, `sonnet`, `haiku`, `fable`, `sol`, `luna`, `terra`. The alias is
+  checked against the API's own served-model field, so `opus → claude-opus-5` is
+  observed, not assumed.
+- **Images** — `imagine a lighthouse at dusk` draws on the same Codex endpoint as chat,
+  via the built-in `image_generation` tool. No key, no separate service.
+- **Speech** — `tts <anything>` speaks in ten voices over OpenAI's realtime socket
+  (`gpt-realtime`), which accepts the ChatGPT login and returns PCM16 that needs a
+  44-byte wav header and **no codec**. Any language; Hebrew verified.
+- **Zero dependencies.** 2,254 lines of TypeScript, `dependencies: {}`, `devDependencies: {}`.
+  Speech needed no WebRTC stack in the end — just a WebSocket without a retired header.
+- **Every claim is receipted.** `DARWIN.md` logs 18 rounds including the failures: the
+  routes that 404'd, the budget that measured the operating system by mistake, and the
+  CAPTCHA that closed one path for good.
+
+> [!IMPORTANT]
+> If you pay for Claude Code or ChatGPT, you already own everything this ships. It just
+> makes it typeable.
+
+```mermaid
+flowchart LR
+  A["your shell<br/><i>opus · imagine · tts</i>"] --> B["shim on PATH"]
+  B --> C["warm daemon<br/><i>login + TLS held open</i>"]
+  C --> D{"provider adapter"}
+  D -->|"Keychain OAuth"| E["Anthropic<br/><i>/v1/messages</i>"]
+  D -->|"~/.codex/auth.json"| F["Codex Responses<br/><i>chat · images</i>"]
+  D -->|"same login"| G["realtime socket<br/><i>speech</i>"]
+  style A fill:#1a1030,stroke:#e8b84a,color:#f5d67b
+  style C fill:#101a2e,stroke:#7aa2f7,color:#c9d4ea
+  style E fill:#101a2e,stroke:#e8b84a,color:#f5d67b
+  style F fill:#101a2e,stroke:#e8b84a,color:#f5d67b
+  style G fill:#101a2e,stroke:#e8b84a,color:#f5d67b
+```
+
+---
+
+## See it
 
 ```console
 $ opus explain monads in one sentence
@@ -17,10 +71,16 @@ $ cat server.log | sonnet find the root cause | pbcopy
 $ sol -i screenshot.png what is wrong with this layout
 $ haiku-fast is 91 prime
 No — 91 = 7 × 13.
+
+$ imagine a lighthouse keeper reading a letter by lamplight
+image saved: apiplan-20260802-1834.png (2936KB)
+
+$ tts the lighthouse keeper found a letter in the sand
+audio saved: apiplan-20260802-1835.wav (157KB, voice alloy via realtime)
 ```
 
-Every model becomes its own command. Pipes work in both directions. Images work.
-A background daemon keeps your login and connection warm, so a repeat call answers in
+Every model becomes its own command. Pipes work in both directions. Images work. A
+background daemon keeps your login and connection warm, so a repeat call answers in
 under a second.
 
 ---
@@ -281,14 +341,33 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 88 tests: aliases, wire contracts, CLI, installer, platform layer
+bun test                  # 118 tests: aliases, wire contracts, CLI, installer, platform layer
 bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
 ```
 
 `VISION.md` is the founding brief, `BUDGETS.md` turns its adjectives into enforced
-numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs thirteen rounds of
+numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs eighteen rounds of
 measure-fix-verify — including the round where the daemon turned out to be making calls
 1.6 s *slower*, and the optimisation that was measured, rejected and recorded.
+
+## What it touches, and how to undo it
+
+| | |
+|---|---|
+| **Reads** | your existing logins — macOS Keychain / `~/.claude/.credentials.json`, and `~/.codex/auth.json` |
+| **Writes** | `~/.apiplan/` (your commands + cached model lists) and one shim per command in your bin dir |
+| **Never touches** | your credentials (never copied, never sent anywhere but the provider they came from), your Codex history (`store: false`), or a name a real system tool owns — the installer refuses `gpt` on macOS rather than shadow `/usr/sbin/gpt` |
+| **Uninstall** | `apiplan prune && rm -rf ~/.apiplan` — the shims are plain files, delete them any time |
+| **Escape hatch** | `APIPLAN_DAEMON=off` disables the daemon; `--no-daemon` for one call; `~/.apiplan/commands.json` is editable JSON |
+
+## How the claims are enforced
+
+Every push runs the suite on **ubuntu, macos and windows** ([CI](https://github.com/fire17/apiplan/actions/workflows/ci.yml)).
+The tests are wire-contract tests: they assert the exact request shape, so a silently
+degraded call (`-e high` becoming a 400 on Opus 4.8 — a real bug this caught) fails the
+build rather than your terminal. `bun bench/perf.ts` holds the numbers in `BUDGETS.md`,
+and reports the ones it can only observe — like the credential read — as observational
+rather than pretending to own them.
 
 ## Notes
 
@@ -296,4 +375,17 @@ Your subscription's terms and rate limits apply exactly as they do in the offici
 clients; this only changes the shape of the call, not the agreement. OpenAI calls set
 `store: false`, so they stay out of your Codex history.
 
-MIT
+<div align="center">
+
+### ⭐ If your shell got better today
+
+apiplan exists because a login you already have can do more than the app it came with.
+If that turned out to be true for you, a star is how the next person finds out.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=fire17/apiplan&type=Date)](https://star-history.com/#fire17/apiplan&Date)
+
+MIT · built with [Claude Code](https://claude.com/claude-code)
+
+<sub><i>Measured, not assumed — see DARWIN.md for the rounds that failed first.</i></sub>
+
+</div>

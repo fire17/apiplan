@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="apiplan — frontier models as ordinary Unix commands, on the subscriptions you already pay for">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f1a"/>
+      <stop offset="55%" stop-color="#101a2e"/>
+      <stop offset="100%" stop-color="#1a1030"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e8b84a"/>
+      <stop offset="100%" stop-color="#f5d67b"/>
+    </linearGradient>
+    <linearGradient id="wire" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e8b84a" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#e8b84a" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#7aa2f7" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="340" fill="url(#bg)"/>
+
+  <!-- the motif: one socket already open on the left, many commands fanning out right -->
+  <g opacity="0.85">
+    <circle cx="196" cy="170" r="46" fill="none" stroke="url(#gold)" stroke-width="2"/>
+    <circle cx="196" cy="170" r="66" fill="none" stroke="#e8b84a" stroke-width="1" stroke-opacity="0.35" stroke-dasharray="3 7"/>
+    <circle cx="196" cy="170" r="88" fill="none" stroke="#7aa2f7" stroke-width="1" stroke-opacity="0.20" stroke-dasharray="2 10"/>
+    <circle cx="196" cy="170" r="9" fill="#e8b84a"/>
+  </g>
+  <g stroke="url(#wire)" stroke-width="1.6" fill="none">
+    <path d="M262 170 C 330 170, 350 92, 430 92"/>
+    <path d="M262 170 C 330 170, 350 131, 430 131"/>
+    <path d="M262 170 C 340 170, 360 170, 430 170"/>
+    <path d="M262 170 C 330 170, 350 209, 430 209"/>
+    <path d="M262 170 C 330 170, 350 248, 430 248"/>
+  </g>
+  <g fill="#7aa2f7" opacity="0.9">
+    <circle cx="430" cy="92" r="3.5"/><circle cx="430" cy="131" r="3.5"/>
+    <circle cx="430" cy="170" r="3.5"/><circle cx="430" cy="209" r="3.5"/>
+    <circle cx="430" cy="248" r="3.5"/>
+  </g>
+
+  <text x="470" y="118" font-family="Georgia, 'Times New Roman', serif" font-size="72" font-weight="bold" fill="url(#gold)">apiplan</text>
+  <text x="474" y="160" font-family="Verdana, Geneva, sans-serif" font-size="19" fill="#c9d4ea" font-style="italic">frontier models as ordinary Unix commands</text>
+  <text x="474" y="192" font-family="Verdana, Geneva, sans-serif" font-size="19" fill="#c9d4ea" font-style="italic">on the subscriptions you already pay for</text>
+
+  <line x1="474" y1="219" x2="1130" y2="219" stroke="#e8b84a" stroke-width="1" stroke-opacity="0.45"/>
+
+  <text x="474" y="252" font-family="Verdana, Geneva, sans-serif" font-size="15" fill="#e8b84a" letter-spacing="2.5">NO API KEY  ·  NO PER-TOKEN BILL  ·  ZERO DEPENDENCIES</text>
+  <text x="474" y="282" font-family="Verdana, Geneva, sans-serif" font-size="14" fill="#8b9ec4" letter-spacing="1.5">TEXT  ·  IMAGES  ·  SPEECH   —   macOS · Linux · WSL · Windows</text>
+</svg>

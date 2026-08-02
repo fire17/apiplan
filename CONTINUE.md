@@ -7,7 +7,7 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.2.1, honest)
+## Current state (v0.4.0, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
@@ -19,7 +19,13 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
 - Pipes both ways, `--chat` multi-turn (remembers across turns), images from file/URL/
   data:/stdin/clipboard, `--loop`, `--dry-run`, effort per provider-advertised levels.
 - 13 global commands installed in `~/.bun/bin`; `apiplan doctor` reports **all clear**.
-- 80 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
+- 118 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
+- **Making things, all on the subscription, no API key** (added 2026-08-02):
+  `imagine` draws (image_generation tool on the same codex endpoint; `--raw` sends your
+  prompt character-for-character, default `--enhance` lets the model rewrite it, which is
+  what `prompt used:` reports); `tts` speaks any text over the realtime WebSocket
+  (`gpt-realtime`, 10 voices, PCM16 → wav, any language — Hebrew verified); `tts --aloud`
+  re-reads a ChatGPT message via `/backend-api/synthesize` in the 9 product voices.
 - Warm call ≈ 1.0 s first token, of which **4 ms is ours** (measured directly, not
   inferred). 25 parallel calls all succeed, p50 1.06 s.
 
@@ -65,11 +71,9 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
 
 ## Next steps
 
-1. **Run it on WSL and Windows** and record the result — the last unverified claim.
-   Linux is done (round 6). On Windows the specific things to watch: does the `.cmd` shim
-   forward a bare sentence intact, does the loopback-TCP daemon come up, and does
-   `defaultBinDir()` pick somewhere actually on PATH.
-2. ~~Publish~~ — done: github.com/fire17/apiplan, releases v0.2.0 and v0.2.1.
+1. ~~Run it on WSL and Windows~~ — done (round 13): all four target OSes verified by
+   execution; the CI matrix keeps ubuntu/macos/windows honest on every push.
+2. ~~Publish~~ — done: github.com/fire17/apiplan, releases through v0.4.0.
 3. **Grok and Gemini.** The provider interface is the extension point: add one adapter
    with `probe/creds/build/delta` plus its model list, and every command, image, pipe and
    daemon behaviour comes for free. Grok is OpenAI-shaped (`api.x.ai`); Gemini needs its
@@ -94,6 +98,14 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
   the **install root**; check it first when behaviour doesn't match the code you're editing.
 - **Don't gate a metric you don't own.** The credential-read timing measured how fast the
   macOS Keychain is, so a *faster* Keychain registered as a regression.
+- **The model rewrites a drawing prompt, not the image backend.** It owns the tool call,
+  so it authors the `prompt` argument — that is what `prompt used:` shows. `--raw` pins it.
+- **`OpenAI-Beta: realtime=v1` kills the realtime socket** (closed 4000
+  `beta_api_shape_disabled`). Omit it and the subscription token is accepted on the GA
+  shape. One header was the whole difference between "needs a WebRTC stack" and "works".
+- **Creating a ChatGPT conversation is CAPTCHA-gated.** `sentinel/chat-requirements`
+  reports `turnstile.required = true`; that path stays closed, which is why read-aloud can
+  only speak messages that already exist.
 - **Percentage drift bands are meaningless at small absolute values** (10 % of 18 ms is
   1.8 ms), and a median of a few samples is the wrong estimator for deterministic work —
   use the floor. Both made the perf gate fail on ~half of identical runs.
