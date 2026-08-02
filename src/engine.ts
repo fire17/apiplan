@@ -12,7 +12,7 @@ import { models, resolve, type Model } from "./registry.ts";
 import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
 
 export const START = performance.now();
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the
@@ -44,12 +44,14 @@ export type Opts = CallOpts & {
   /** non-text jobs */
   out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
   aloud: boolean; conversation?: string; message?: string; last: boolean; open: boolean;
+  direction?: string; directionFile?: string;
 };
 
 /** Flags that consume the next argv item (so it is never mistaken for prompt text). */
 const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
   "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image",
-  "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message"]);
+  "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message",
+  "--as", "--style", "--emotion", "--direction", "--as-file"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -88,6 +90,8 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--size": o.imageSize = val(); break;
       case "--quality": o.imageQuality = val(); break;
       case "--speak": case "--say": o.speak = true; break;
+      case "--as": case "--style": case "--emotion": case "--direction": o.direction = val(); o.speak = true; break;
+      case "--as-file": o.directionFile = val(); o.speak = true; break;
       case "--voice": o.voice = val(); break;
       case "--format": o.audioFormat = val(); break;
       case "--play": o.play = true; break;
@@ -293,10 +297,11 @@ export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> 
   // The subscription path returns wav whatever was asked for — it hands back raw PCM
   // and we add the header — so report the format actually produced, never a guess.
   let out: { bytes: Uint8Array; contentType: string };
-  try { out = await p.speak({ text, voice, format: fmt }); }
+  try { out = await p.speak({ text, voice, format: fmt, direction: o.direction }); }
   catch (e: any) { sayItHere(e?.message ?? String(e)); return; }
   const ext = out.contentType.includes("wav") ? "wav" : fmt;
-  deliverAudio(out.bytes, ext, `voice ${voice} via ${live.backend}`, o);
+  const how = o.direction ? `voice ${voice}, as “${o.direction.replace(/\s+/g, " ").slice(0, 48)}”` : `voice ${voice}`;
+  deliverAudio(out.bytes, ext, `${how} via ${live.backend}`, o);
 }
 
 /**
@@ -507,6 +512,7 @@ export async function buildTurns(o: Opts): Promise<Turn[]> {
   const piped = !stdinIsImage && !process.stdin.isTTY ? await Bun.stdin.text() : "";
   const images = await Promise.all(o.images.map(loadImage));
   if (o.systemFile) o.system = (o.system ? o.system + "\n\n" : "") + readFileSync(o.systemFile, "utf8");
+  if (o.directionFile) o.direction = (o.direction ? o.direction + "\n\n" : "") + readFileSync(o.directionFile, "utf8").trim();
 
   if (o.chat) {
     if (!piped.trim()) die("--chat needs a JSON messages array (or {messages:[…]}) on stdin.");

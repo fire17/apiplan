@@ -31,14 +31,14 @@ MODEL
       --fast             Anthropic Fast Mode (Opus 4.7/4.8 — separate rate limit)
       --1m               enable the 1M-context beta for very large inputs
 
-MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech needs a key)
-      --draw             draw the prompt${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|medium|high>
+MAKE THINGS (all of it on your subscription — no API key)
+      --draw             draw it${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|med|high>  --open
       --raw              draw exactly what you typed (default: the model improves it)
-      --open             open the image when it's done (imagine already does)
       --aloud            read your newest ChatGPT reply in a ChatGPT voice
                          (--conversation/--message <id> picks another)
       --speak            say your own text in an OpenAI voice, on the subscription
-                         (--local forces your OS voice, offline)
+      --as <direction>   HOW to say it: "excited, laughing" · "whisper" · "furious" ·
+                         "slowly, heartbroken" · any character (--as-file <f>; --local)
       --voice <name>     see apiplan voices   --play   --format aac|mp3|wav
   -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
 

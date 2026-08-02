@@ -7,7 +7,7 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.4.0, honest)
+## Current state (v0.5.0, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
@@ -19,12 +19,14 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
 - Pipes both ways, `--chat` multi-turn (remembers across turns), images from file/URL/
   data:/stdin/clipboard, `--loop`, `--dry-run`, effort per provider-advertised levels.
 - 13 global commands installed in `~/.bun/bin`; `apiplan doctor` reports **all clear**.
-- 118 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
+- 122 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
 - **Making things, all on the subscription, no API key** (added 2026-08-02):
   `imagine` draws (image_generation tool on the same codex endpoint; `--raw` sends your
   prompt character-for-character, default `--enhance` lets the model rewrite it, which is
   what `prompt used:` reports); `tts` speaks any text over the realtime WebSocket
-  (`gpt-realtime`, 10 voices, PCM16 → wav, any language — Hebrew verified); `tts --aloud`
+  (`gpt-realtime`, 10 voices, PCM16 → wav, any language — Hebrew verified) and takes a
+  performance direction as a separate input (`--as "excited, laughing"` — measured: 2.7×
+  loudness range, 2.5× duration range, laughter 3/3); `tts --aloud`
   re-reads a ChatGPT message via `/backend-api/synthesize` in the 9 product voices.
 - Warm call ≈ 1.0 s first token, of which **4 ms is ours** (measured directly, not
   inferred). 25 parallel calls all succeed, p50 1.06 s.

@@ -242,6 +242,35 @@ describe("speech from fresh text runs on the subscription", () => {
   });
 });
 
+describe("performance direction — how it is said, separate from what is said", () => {
+  test("--as and its synonyms all land in one field, and imply speech", () => {
+    for (const flag of ["--as", "--style", "--emotion", "--direction"]) {
+      const o = parseArgs([flag, "excited, laughing", "hello", "there"]);
+      expect(o.direction).toBe("excited, laughing");
+      expect(o.speak).toBe(true);
+      expect(o.prompt.join(" ")).toBe("hello there");   // the direction must not leak into the words
+    }
+  });
+  test("without a direction the instruction stays strictly verbatim", () => {
+    const src = readSource("providers.ts");
+    const fn = src.slice(src.indexOf("function perform("), src.indexOf("* Speak text through"));
+    expect(fn).toContain("verbatim");
+    expect(fn).toContain("Direction:");
+    // the words are pinned in the same breath as the direction, or the model ad-libs
+    expect(fn).toContain("nothing else");
+  });
+  test("a direction tells the model to perform, never to narrate the direction", () => {
+    const src = readSource("providers.ts");
+    const fn = src.slice(src.indexOf("function perform("), src.indexOf("* Speak text through"));
+    expect(fn).toMatch(/never announce or describe/i);
+    expect(fn).toMatch(/bracketed stage directions/i);
+  });
+  test("the direction reaches speak() rather than being dropped in the engine", () => {
+    const eng = readSource("engine.ts");
+    expect(eng).toContain("direction: o.direction");
+  });
+});
+
 describe("stream event mapping", () => {
   test("anthropic text, thinking, served model and errors", () => {
     expect(anthropic.delta({ type: "content_block_delta", delta: { type: "text_delta", text: "hi" } })).toEqual({ text: "hi" });

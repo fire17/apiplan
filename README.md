@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-118%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-122%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -177,7 +177,8 @@ imagine --size 1024x1536 --quality high -o cover.png a paperback cover
 imagine --raw a single red triangle on white   # your words, character for character
 
 tts a short fresh sentence                     # any text, spoken on the subscription
-tts --voice cedar --play a longer one
+tts --as "excited, laughing" you actually did it
+tts --as "whispering" --voice cedar a secret
 tts --aloud --voice cove                       # re-read your newest ChatGPT reply
 apiplan voices                                 # every voice, and where it comes from
 ```
@@ -203,6 +204,37 @@ what read-aloud *is*: `GET /backend-api/synthesize` takes a `conversation_id` an
 over OpenAI's **realtime** socket (`gpt-realtime`), which accepts the ChatGPT login and
 streams back PCM16 that needs a 44-byte wav header and no codec at all. Ten voices:
 `alloy ash ballad coral echo sage shimmer verse marin cedar`.
+
+### Direct the performance, not just the words
+
+`gpt-realtime` is a conversational speech model, so **how** a line is said is a second
+input. `--as` takes free text — an emotion, a pace, a character, a stage direction:
+
+```sh
+tts --as "excited, laughing out loud" I cannot believe you actually pulled that off
+tts --as "furious, shouting" the server has been down for three days
+tts --as "very slowly, heartbroken, tearful" I did not think it would end this way
+tts --as "a grizzled pirate captain, gravelly and theatrical" --voice ash land ho
+tts --as-file director-notes.md the long monologue
+```
+
+`--style`, `--emotion` and `--direction` are synonyms. It really performs — measured on
+one identical line, direction only:
+
+| `--as` | seconds | loudness (RMS) |
+|---|---|---|
+| *(none — baseline)* | 3.70 | 0.0997 |
+| `excited, laughing out loud` | 4.65 | 0.1364 |
+| `whispering, conspiratorial` | 3.75 | **0.0572** |
+| `furious, shouting` | 3.85 | 0.1354 |
+| `very slowly, heartbroken, tearful` | **9.15** | **0.0509** |
+
+A whisper is 2.7× quieter than a laugh and a heartbroken read runs 2.5× longer than the
+baseline — same words each time. Asked to laugh, it laughs: three of three runs put a
+real `[laughs]` in the model's own transcript. Directions work in any language.
+
+Without `--as`, the read stays strictly verbatim — the direction is opt-in, and a test
+holds it from leaking into the spoken words.
 
 `--aloud` is a second, older engine: ChatGPT's product read-aloud, in the app's own
 voices (`maple juniper orbit fathom breeze ember glimmer vale cove`). It can only speak
@@ -341,7 +373,7 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 118 tests: aliases, wire contracts, CLI, installer, platform layer
+bun test                  # 122 tests: aliases, wire contracts, CLI, installer, platform layer
 bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
 ```
 

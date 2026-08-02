@@ -19,7 +19,9 @@ export type CallOpts = {
 };
 
 /** Text-to-speech is a different shape from a chat call: one request, binary back. */
-export type SpeechOpts = { text: string; voice: string; format: string; model?: string; speed?: number };
+export type SpeechOpts = { text: string; voice: string; format: string; model?: string; speed?: number;
+  /** How to perform it — emotion, pace, character. Separate input from the words. */
+  direction?: string };
 export type SpeechResult = { bytes: Uint8Array; contentType: string };
 export type Creds = { token: string; account?: string; expiresAt?: number; source: string };
 export type Built = { url: string; headers: Record<string, string>; body: any };
@@ -81,6 +83,25 @@ function wav(pcm: Uint8Array, rate = 24000): Uint8Array {
 }
 
 /**
+ * The instruction that turns a conversational model into a narrator. Two inputs, kept
+ * apart: the WORDS are fixed, the DIRECTION is free. Measured — a direction changes
+ * loudness ~3x between whisper and shout, and "laugh" produces a real laugh — but the
+ * model will also happily ad-lib, so the words are pinned in the same breath.
+ */
+function perform(o: SpeechOpts): string {
+  if (!o.direction) return `Read the following text aloud, verbatim, and say nothing else — no greeting, no comment:\n\n${o.text}`;
+  return [
+    "You are performing a line of dialogue, not chatting.",
+    `Direction: ${o.direction}`,
+    "Perform that direction with your voice — actually laugh, whisper, shout, pause or cry as asked; never announce or describe it.",
+    "Say the words below and nothing else: no greeting, no commentary, no added sentences.",
+    "If the words contain bracketed stage directions, perform them instead of reading them aloud.",
+    "",
+    o.text,
+  ].join("\n");
+}
+
+/**
  * Speak text through the realtime endpoint using the ChatGPT subscription token.
  * One WebSocket, one response, PCM16 back. The model is told to read the text
  * verbatim — it is a conversational model being used as a narrator, so the
@@ -102,8 +123,7 @@ export function speakRealtime(c: Creds, o: SpeechOpts, timeoutMs = 120000): Prom
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", output_modalities: ["audio"],
         audio: { output: { voice: o.voice, format: { type: "audio/pcm", rate: 24000 } } } } }));
-      ws.send(JSON.stringify({ type: "response.create", response: {
-        instructions: `Read the following text aloud, verbatim, and say nothing else — no greeting, no comment:\n\n${o.text}` } }));
+      ws.send(JSON.stringify({ type: "response.create", response: { instructions: perform(o) } }));
     };
     ws.onmessage = (e: any) => {
       let ev: any;

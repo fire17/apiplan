@@ -493,3 +493,45 @@ every Windows user if the matrix hadn't been there. It is the second time (see r
 that a real Windows defect was invisible locally.
 
 **Degradation check:** 118 tests pass, unchanged; the fix removed a false green, not a test.
+
+## Round 20 — the model was always expressive; the prompt was gagging it
+
+`tts` shipped in v0.4.0 with this instruction: *"Read the following text aloud, verbatim,
+and say nothing else — no greeting, no comment."* `gpt-realtime` is a **conversational
+speech** model, so that line was not neutral — it actively suppressed the expressiveness
+the model has. The steering channel was open the whole time, held shut from our side.
+
+Splitting the inputs — the WORDS are pinned, the DIRECTION is free (`--as`) — and
+measuring rather than vibing. Same sentence every row, direction only:
+
+| `--as` | secs | RMS | peak |
+|---|---|---|---|
+| *(none)* | 3.70 | 0.0997 | 0.962 |
+| excited, laughing out loud | 4.65 | 0.1364 | 0.975 |
+| whispering, conspiratorial | 3.75 | **0.0572** | 0.763 |
+| furious, shouting | 3.85 | 0.1354 | 0.796 |
+| very slowly, heartbroken, tearful | **9.15** | **0.0509** | 0.474 |
+
+2.7× loudness range, 2.5× duration range, identical words.
+
+**How this was measured without ears** — the honest part. Three objective signals:
+duration, RMS/peak amplitude from the PCM, and the model's **own transcript**, which
+records its non-speech vocalisations. Asked to laugh, it emits `[laughs]` into that
+transcript — so "did it actually laugh" is a string match, not an opinion. Reliability
+over repeats: laughter **3/3** (`[laughs]`, `[laughs]`, `[laughter]`), whisper **3/3**
+in a tight band (RMS 0.033–0.042 vs 0.096–0.106 for the laughing takes).
+
+Characters work as readily as emotions ("a grizzled pirate captain, gravelly and
+theatrical"), as do directions with an arc ("start deadpan, then crack up halfway"), in
+any language.
+
+**Not verified by ear, and said so:** whether inline bracketed cues (`[laughs]` written
+mid-sentence) are *performed* rather than read aloud. Duration and transcript are
+consistent with performance; only a listener can close that one. The user feel-tested the
+eight samples before this shipped.
+
+**The lesson:** a prompt that reads as "neutral" can be a strong negative instruction. It
+took a user asking "can we do emotions?" to notice that our own default forbade them.
+
+**Degradation check:** 122 tests pass, up from 118; four new ones pin that a direction
+never leaks into the spoken words and that verbatim stays verbatim without `--as`.
