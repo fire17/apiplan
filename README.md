@@ -116,10 +116,10 @@ imagine a lighthouse at dusk, watercolour      # draws it, then opens it
 imagine --size 1024x1536 --quality high -o cover.png a paperback cover
 imagine --raw a single red triangle on white   # your words, character for character
 
-aloud                                          # speaks your newest ChatGPT reply
-aloud --voice cove                             # in any ChatGPT product voice
-tts a short fresh sentence                     # your own text, spoken
-apiplan voices                                 # every voice, and what it costs
+tts a short fresh sentence                     # any text, spoken on the subscription
+tts --voice cedar --play a longer one
+tts --aloud --voice cove                       # re-read your newest ChatGPT reply
+apiplan voices                                 # every voice, and where it comes from
 ```
 
 By default the model rewrites your prompt before drawing — `a single red triangle on
@@ -140,15 +140,20 @@ what read-aloud *is*: `GET /backend-api/synthesize` takes a `conversation_id` an
 `message_id` and no text parameter at all.
 
 `tts` speaks your own words — also on the subscription, also with no API key. It goes
-over OpenAI's **realtime** socket, which accepts the ChatGPT login and streams back
-PCM16 that needs a 44-byte wav header and no codec at all. Ten voices:
+over OpenAI's **realtime** socket (`gpt-realtime`), which accepts the ChatGPT login and
+streams back PCM16 that needs a 44-byte wav header and no codec at all. Ten voices:
 `alloy ash ballad coral echo sage shimmer verse marin cedar`.
+
+`--aloud` is a second, older engine: ChatGPT's product read-aloud, in the app's own
+voices (`maple juniper orbit fathom breeze ember glimmer vale cove`). It can only speak
+a message that already exists in your history, so it is a flag rather than a command.
+Prefer `tts`; reach for `--aloud` when you specifically want one of those voices.
 
 ```sh
 tts a lighthouse keeper found a letter in the sand
 tts --voice cedar שלום, זה מבחן קצר בעברית      # any language, same command
 tts --local a short offline test                # force the OS voice instead
-aloud --conversation <id> --message <id>        # read one specific message
+tts --aloud --conversation <id> --message <id>  # read one specific message
 ```
 
 If the realtime socket is ever unavailable, `tts` falls back to your OS voice and says

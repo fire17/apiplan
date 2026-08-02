@@ -57,9 +57,9 @@ export interface Provider {
   voices?: string[];
   /** Voices the live backend serves right now (a local server may offer its own). */
   listVoices?(): Promise<{ backend: string; voices: string[] }>;
-  /** Speak a message that already exists in the account — the subscription's own
-   *  read-aloud. No API key, real product voices, but it can only read what is
-   *  already there: see readAloud's note for why arbitrary text can't go through it. */
+  /** Speak a message that already exists in the account — ChatGPT's product
+   *  read-aloud. A separate, older engine from speak()'s realtime path, with its own
+   *  voice set; kept because those voices exist nowhere else. */
   readAloud?(o: AloudOpts): Promise<SpeechResult & { spoke: string; voice: string }>;
   /** The read-aloud voices this account is entitled to, live. */
   aloudVoices?(): Promise<{ selected: string; voices: string[] }>;

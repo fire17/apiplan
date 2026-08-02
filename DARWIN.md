@@ -454,3 +454,25 @@ the user's `--system` rather than replacing it, which a test holds.
 
 **Degradation check:** 118 tests pass, up from 114. The help budget (B9, ≤48 lines) was
 paid for twice this round by compressing existing lines, never by raising the bar.
+
+## Round 18 — one speech command, two engines
+
+`aloud` was a command because, when it shipped, read-aloud was the only speech the
+subscription covered. Round 16 removed that reason: `tts` speaks anything. So the
+command is gone and `--aloud` stays a flag on `tts`.
+
+The two engines are genuinely different and both are worth keeping reachable:
+
+| | `tts` | `tts --aloud` |
+|---|---|---|
+| endpoint | `wss://api.openai.com/v1/realtime` | `GET /backend-api/synthesize` |
+| model | `gpt-realtime` | not disclosed by the endpoint |
+| input | any text you type | only a message already in your history |
+| audio | PCM16 24 kHz → wav | AAC |
+| voices | alloy ash ballad coral echo sage shimmer verse marin cedar | maple juniper orbit fathom breeze ember glimmer vale cove |
+
+The voice sets do not overlap, which is the whole reason the flag survives: `cove` and
+`maple` cannot be reached any other way.
+
+**Degradation check:** 118 tests pass, unchanged; the removed command took its test with
+it and gained one asserting the flag still works.

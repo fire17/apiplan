@@ -305,10 +305,12 @@ describe("making things is seamless", () => {
     const imagine = C.defaults().find((c: any) => c.name === "imagine");
     if (imagine) expect(imagine.flags).toEqual(["--draw", "--open"]);
   });
-  test("aloud needs no flag beyond its own name", () => {
+  test("read-aloud is a flag on tts, not a command of its own", () => {
     const C = require("../src/commands.ts");
-    const aloud = C.defaults().find((c: any) => c.name === "aloud");
-    if (aloud) expect(aloud.flags).toEqual(["--aloud", "--play"]);
+    expect(C.defaults().find((c: any) => c.name === "aloud")).toBeUndefined();
+    const tts = C.defaults().find((c: any) => c.name === "tts");
+    if (tts) expect(tts.flags).toEqual(["--speak", "--play"]);
+    expect(parseArgs(["--aloud"]).aloud).toBe(true);       // the flag still works
   });
   test("the OS voice follows the script the text is written in", () => {
     const { localVoiceFor } = require("../src/platform.ts");

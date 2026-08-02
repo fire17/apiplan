@@ -67,13 +67,13 @@ export function defaults(): Command[] {
   if (drawer) {
     const alias = aliasesFor(drawer)[0] ?? drawer.id;
     add("imagine", alias, ["--draw", "--open"], "generate an image and open it");
-    // Read-aloud is the speech path the subscription actually covers, so it earns a
-    // command of its own rather than hiding behind a flag on `tts`.
-    add("aloud", alias, ["--aloud", "--play"], "read your newest ChatGPT reply in a real ChatGPT voice");
+    // No `aloud` command: `tts` speaks anything, so read-aloud stopped being the only
+    // way to hear something and went back to being a flag (`tts --aloud`). It survives
+    // as a flag because the ChatGPT product voices are a different set from realtime's.
     // `tts` is the portable name; `speak` is nicer but espeak-ng already owns it on
     // many machines, so it is offered only where the name is genuinely free.
-    add("tts", alias, ["--speak", "--play"], "speak your own text (needs OPENAI_API_KEY; --local uses the OS voice)");
-    add("speak", alias, ["--speak", "--play"], "speak your own text (same as tts, where the name is free)");
+    add("tts", alias, ["--speak", "--play"], "speak any text on the subscription (--aloud reads a ChatGPT reply)");
+    add("speak", alias, ["--speak", "--play"], "same as tts, where the name is free");
   }
   return out;
 }
