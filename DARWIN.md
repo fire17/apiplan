@@ -476,3 +476,20 @@ The voice sets do not overlap, which is the whole reason the flag survives: `cov
 
 **Degradation check:** 118 tests pass, unchanged; the removed command took its test with
 it and gained one asserting the flag still works.
+
+## Round 19 — the CI matrix earns its keep again
+
+The v0.4.0 README push went red on **windows-latest only**; ubuntu and macos were green.
+Cause was mine and entirely Windows-shaped: the new source-scanning tests located their
+own source with `new URL("../src/providers.ts", import.meta.url).pathname`, which on
+Windows returns `/D:/a/apiplan/apiplan/src/providers.ts` — a leading slash before the
+drive letter, so `ENOENT` on a file that plainly exists.
+
+Fixed with `fileURLToPath` + `path.join`, which is what that API is for. Eight call
+sites, one helper.
+
+Worth stating plainly: this shipped green on macOS and would have gone out broken for
+every Windows user if the matrix hadn't been there. It is the second time (see round 13)
+that a real Windows defect was invisible locally.
+
+**Degradation check:** 118 tests pass, unchanged; the fix removed a false green, not a test.

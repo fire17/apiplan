@@ -5,6 +5,13 @@ import { expect, test, describe } from "bun:test";
 import { anthropic, openai } from "../src/providers.ts";
 import { resolve } from "../src/registry.ts";
 import { parseArgs } from "../src/engine.ts";
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+
+// fileURLToPath, never url.pathname: on Windows the latter yields "/D:/a/…", which is
+// not a path any OS can open. CI on windows-latest caught exactly that.
+const readSource = (name: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", name), "utf8");
 
 const CREDS = { token: "T", account: "ACC", source: "test" };
 const M = (n: string) => resolve(n)!;
@@ -172,14 +179,14 @@ describe("read-aloud — the speech path the subscription really covers", () => 
     expect(o.prompt).toEqual([]);        // the ids must not leak into the prompt
   });
   test("bare --aloud just works — no second flag to confirm the obvious", () => {
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     const fn = src.slice(src.indexOf("async readAloud"), src.indexOf("async aloudVoices"));
     expect(fn).not.toContain("throw new Error(\n");   // no consent gate left in the path
     expect(parseArgs(["--last"]).last).toBe(true);      // still accepted, just not required
   });
   test("read-aloud is the only thing in apiplan that reads stored history", () => {
-    const eng = require("node:fs").readFileSync(new URL("../src/engine.ts", import.meta.url).pathname, "utf8");
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const eng = readSource("engine.ts");
+    const src = readSource("providers.ts");
     expect(eng).not.toContain("/backend-api/conversations");
     expect(src.split("/backend-api/conversation").length - 1).toBeLessThanOrEqual(3);
   });
@@ -189,12 +196,12 @@ describe("read-aloud — the speech path the subscription really covers", () => 
   test("the two voice sets are kept apart — product voices are asked for live", () => {
     // ChatGPT's read-aloud voices (cove, maple, …) are not the API's (alloy, nova, …);
     // hardcoding either list into the other is the bug this guards.
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     expect(src).toContain("/backend-api/settings/voices");
     expect(openai.voices).not.toContain("cove");
   });
   test("read-aloud goes to the ChatGPT synthesize route, no API key in sight", () => {
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     const fn = src.slice(src.indexOf("async readAloud"), src.indexOf("async aloudVoices"));
     expect(fn).toContain("/backend-api/synthesize?conversation_id=");
     expect(fn).toContain("message_id=");
@@ -211,7 +218,7 @@ describe("speech from fresh text runs on the subscription", () => {
     expect(openai.voices).toEqual(REALTIME_VOICES);
   });
   test("it speaks over the realtime socket with no API key and no beta header", () => {
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     const fn = src.slice(src.indexOf("export function speakRealtime"), src.indexOf("const env ="));
     expect(fn).toContain("wss://api.openai.com/v1/realtime");
     expect(fn).not.toContain('"OpenAI-Beta"');         // the beta shape is retired: it closes 4000
@@ -221,7 +228,7 @@ describe("speech from fresh text runs on the subscription", () => {
   test("PCM16 is wrapped in a real 44-byte wav header", async () => {
     const { speakRealtime } = require("../src/providers.ts");
     expect(typeof speakRealtime).toBe("function");
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     expect(src).toContain('h.write("RIFF", 0)');
     expect(src).toContain("h.writeUInt32LE(rate * 2, 28)");   // byte rate, mono 16-bit
   });
@@ -229,7 +236,7 @@ describe("speech from fresh text runs on the subscription", () => {
     expect(anthropic.speak).toBeUndefined();
   });
   test("no local server is ever auto-detected — only an explicit APIPLAN_TTS_BASE", () => {
-    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const src = readSource("providers.ts");
     expect(src).not.toContain("findLocalSpeechServer");
     expect(src).not.toMatch(/127\.0\.0\.1:88\d\d/);
   });
