@@ -131,19 +131,21 @@ id, nothing retained. `aloud` is the one command that reads stored history — t
 what read-aloud *is*: `GET /backend-api/synthesize` takes a `conversation_id` and a
 `message_id` and no text parameter at all.
 
-`tts` speaks your own words instead, and picks a backend rather than failing at you:
-`OPENAI_API_KEY` gets OpenAI's voices, and without one your OS voice still speaks —
-choosing itself to match the text's language, so Hebrew gets a Hebrew voice rather than
-an English one reading letters.
+`tts` speaks your own words — also on the subscription, also with no API key. It goes
+over OpenAI's **realtime** socket, which accepts the ChatGPT login and streams back
+PCM16 that needs a 44-byte wav header and no codec at all. Ten voices:
+`alloy ash ballad coral echo sage shimmer verse marin cedar`.
 
 ```sh
-aloud --conversation <id> --message <id>       # read a specific message
-tts --local a short offline test               # force the OS voice
+tts a lighthouse keeper found a letter in the sand
+tts --voice cedar שלום, זה מבחן קצר בעברית      # any language, same command
+tts --local a short offline test                # force the OS voice instead
+aloud --conversation <id> --message <id>        # read one specific message
 ```
 
-Speaking *fresh* text in a ChatGPT voice is not available: it would mean creating a
-conversation first, and that endpoint sits behind a Cloudflare CAPTCHA
-(`turnstile.required = true`). See `DARWIN.md` round 15 for every route tried.
+If the realtime socket is ever unavailable, `tts` falls back to your OS voice and says
+it did — picking a voice that matches the text's script, because an English voice
+reading Hebrew is noise rather than speech.
 
 ### Quotes, `?` and `*`
 

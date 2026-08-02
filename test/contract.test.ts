@@ -182,24 +182,31 @@ describe("read-aloud — the speech path the subscription really covers", () => 
   });
 });
 
-describe("speech is OpenAI-only and honest about it", () => {
-  test("anthropic offers no speak() at all", () => {
-    expect(anthropic.speak).toBeUndefined();
+describe("speech from fresh text runs on the subscription", () => {
+  test("the realtime voice list is the server's, and is not the read-aloud set", () => {
+    const { REALTIME_VOICES } = require("../src/providers.ts");
+    expect(REALTIME_VOICES).toContain("cedar");
+    expect(REALTIME_VOICES).toContain("alloy");
+    expect(REALTIME_VOICES).not.toContain("cove");     // that one is read-aloud only
+    expect(openai.voices).toEqual(REALTIME_VOICES);
   });
-  test("without a key it explains that the subscription does not cover speech", async () => {
-    const prev = { a: process.env.OPENAI_API_KEY, b: process.env.APIPLAN_OPENAI_API_KEY, c: process.env.APIPLAN_TTS_BASE };
-    delete process.env.OPENAI_API_KEY; delete process.env.APIPLAN_OPENAI_API_KEY; delete process.env.APIPLAN_TTS_BASE;
-    try {
-      await openai.speak!({ text: "hi", voice: "alloy", format: "mp3" });
-      throw new Error("should have refused");
-    } catch (e: any) {
-      expect(e.message).toContain("does not cover it");
-      expect(e.message).toContain("OPENAI_API_KEY");
-    } finally {
-      if (prev.a) process.env.OPENAI_API_KEY = prev.a;
-      if (prev.b) process.env.APIPLAN_OPENAI_API_KEY = prev.b;
-      if (prev.c) process.env.APIPLAN_TTS_BASE = prev.c;
-    }
+  test("it speaks over the realtime socket with no API key and no beta header", () => {
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const fn = src.slice(src.indexOf("export function speakRealtime"), src.indexOf("const env ="));
+    expect(fn).toContain("wss://api.openai.com/v1/realtime");
+    expect(fn).not.toContain('"OpenAI-Beta"');         // the beta shape is retired: it closes 4000
+    expect(fn).not.toContain("OPENAI_API_KEY");
+    expect(fn).toContain("output_modalities");
+  });
+  test("PCM16 is wrapped in a real 44-byte wav header", async () => {
+    const { speakRealtime } = require("../src/providers.ts");
+    expect(typeof speakRealtime).toBe("function");
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    expect(src).toContain('h.write("RIFF", 0)');
+    expect(src).toContain("h.writeUInt32LE(rate * 2, 28)");   // byte rate, mono 16-bit
+  });
+  test("anthropic still offers no speech of its own", () => {
+    expect(anthropic.speak).toBeUndefined();
   });
   test("no local server is ever auto-detected — only an explicit APIPLAN_TTS_BASE", () => {
     const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");

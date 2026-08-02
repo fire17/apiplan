@@ -91,8 +91,8 @@ async function cmdVoices() {
   }
   for (const p of Object.values(PROVIDERS)) {
     if (!p.speak || !p.voices?.length) continue;
-    const keyed = !!(process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY);
-    process.stdout.write(`${bold("your own text")} ${dim(`— ${p.label} API${keyed ? ", key found" : ", needs OPENAI_API_KEY"}  ·  --speak`)}\n`);
+    const custom = !!process.env.APIPLAN_TTS_BASE;
+    process.stdout.write(`${bold("your own text")} ${dim(`— ${custom ? process.env.APIPLAN_TTS_BASE : "realtime, on your subscription — no API key"}  ·  --speak`)}\n`);
     process.stdout.write(`  ${p.voices.join("  ")}\n\n`);
   }
   process.stdout.write(`${bold("offline")} ${dim("— your operating system's own voice  ·  --local")}\n`);

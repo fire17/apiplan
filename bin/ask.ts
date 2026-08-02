@@ -37,8 +37,8 @@ MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech need
       --open             open the image when it's done (imagine already does)
       --aloud            read your newest ChatGPT reply in a real ChatGPT voice
                          (--conversation/--message <id> picks another)
-      --speak            say your own text — OpenAI voices with OPENAI_API_KEY, else
-                         your OS voice, picked to match the text's language
+      --speak            say your own text in an OpenAI voice, on the subscription
+                         (--local forces your OS voice, offline)
       --voice <name>     see apiplan voices   --play   --format aac|mp3|wav
   -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
 

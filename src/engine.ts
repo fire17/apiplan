@@ -12,7 +12,7 @@ import { models, resolve, type Model } from "./registry.ts";
 import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
 
 export const START = performance.now();
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the
@@ -272,19 +272,14 @@ export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> 
   if (o.aloud) return runAloud(m, o);
   if (!text.trim()) die("nothing to say — give me some text, or pipe it in.");
   const p = providerFor(m);
-  // Speaking fresh text has exactly one requirement — a backend that can do it — so
-  // pick the best one available instead of making the user find out by failing. A key
-  // means real OpenAI voices; without one the OS voice still speaks, today, for free.
-  const keyed = !!(process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY || process.env.APIPLAN_TTS_BASE);
-  if (o.local || !keyed || !p.speak) {
+  const sayItHere = (why?: string) => {
     const tool = speakLocally(text);
-    if (!tool) die("no local voice available (macOS `say`, Linux `spd-say`/`espeak`, Windows SAPI).");
-    if (!o.local) {
-      process.stderr.write(`\x1b[2mspoke with your ${tool === "say" ? "system" : tool} voice — set OPENAI_API_KEY for OpenAI voices,\n` +
-        `  or \`aloud\` to hear a ChatGPT reply in a real ChatGPT voice.\x1b[0m\n`);
-    } else if (o.verbose) process.stderr.write(`[apiplan] spoke locally via ${tool}\n`);
-    return;
-  }
+    if (!tool) die(why ? `${why}\n  and no local voice is available either (macOS \`say\`, Linux \`spd-say\`/\`espeak\`, Windows SAPI).`
+                       : "no local voice available (macOS `say`, Linux `spd-say`/`espeak`, Windows SAPI).");
+    if (why) process.stderr.write(`\x1b[2m${why}\n  spoke with your ${tool === "say" ? "system" : tool} voice instead.\x1b[0m\n`);
+    else if (o.verbose) process.stderr.write(`[apiplan] spoke locally via ${tool}\n`);
+  };
+  if (o.local || !p.speak) { sayItHere(); return; }
   const fmt = o.audioFormat ?? "mp3";
   // Ask the BACKEND what it serves: a local neural server has its own voice names, and
   // validating those against OpenAI's static list rejects every one of them.
@@ -293,8 +288,13 @@ export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> 
   if (live.voices.length && !live.voices.includes(voice)) {
     die(`unknown voice '${voice}' for ${live.backend || "this backend"}.\n  available: ${live.voices.slice(0, 24).join(", ")}${live.voices.length > 24 ? ` … (${live.voices.length} total — \`apiplan voices\`)` : ""}`);
   }
-  const { bytes } = await p.speak({ text, voice, format: fmt });
-  deliverAudio(bytes, fmt, `voice ${voice}${live.backend && !live.backend.includes("api.openai") ? ` via ${live.backend}` : ""}`, o);
+  // The subscription path returns wav whatever was asked for — it hands back raw PCM
+  // and we add the header — so report the format actually produced, never a guess.
+  let out: { bytes: Uint8Array; contentType: string };
+  try { out = await p.speak({ text, voice, format: fmt }); }
+  catch (e: any) { sayItHere(e?.message ?? String(e)); return; }
+  const ext = out.contentType.includes("wav") ? "wav" : fmt;
+  deliverAudio(out.bytes, ext, `voice ${voice} via ${live.backend}`, o);
 }
 
 /**

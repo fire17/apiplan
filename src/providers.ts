@@ -65,6 +65,60 @@ export interface Provider {
 export type AloudOpts = { conversation?: string; message?: string; voice?: string; format?: string;
   /** Explicit opt-in to touching stored history at all. Never implied. */ last?: boolean };
 
+/** The voices the realtime endpoint serves (it names them itself when you send a bad one). */
+export const REALTIME_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"];
+
+/** PCM16 mono → a .wav file. 44 bytes of header is the whole "codec". */
+function wav(pcm: Uint8Array, rate = 24000): Uint8Array {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0); h.writeUInt32LE(36 + pcm.length, 4); h.write("WAVE", 8); h.write("fmt ", 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write("data", 36); h.writeUInt32LE(pcm.length, 40);
+  return new Uint8Array(Buffer.concat([h, Buffer.from(pcm)]));
+}
+
+/**
+ * Speak text through the realtime endpoint using the ChatGPT subscription token.
+ * One WebSocket, one response, PCM16 back. The model is told to read the text
+ * verbatim — it is a conversational model being used as a narrator, so the
+ * instruction matters.
+ */
+export function speakRealtime(c: Creds, o: SpeechOpts, timeoutMs = 120000): Promise<SpeechResult> {
+  const model = o.model || env("APIPLAN_REALTIME_MODEL", "gpt-realtime");
+  return new Promise((resolve, reject) => {
+    let ws: WebSocket;
+    // No OpenAI-Beta header: the beta shape is retired and answers beta_api_shape_disabled.
+    try { ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, { headers: { Authorization: `Bearer ${c.token}` } } as any); }
+    catch (e: any) { return reject(new Error(`realtime speech could not connect: ${e?.message ?? e}`)); }
+
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const done = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(timer); try { ws.close(); } catch {} ; fn(); };
+    const timer = setTimeout(() => done(() => reject(new Error("realtime speech timed out"))), timeoutMs);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", output_modalities: ["audio"],
+        audio: { output: { voice: o.voice, format: { type: "audio/pcm", rate: 24000 } } } } }));
+      ws.send(JSON.stringify({ type: "response.create", response: {
+        instructions: `Read the following text aloud, verbatim, and say nothing else — no greeting, no comment:\n\n${o.text}` } }));
+    };
+    ws.onmessage = (e: any) => {
+      let ev: any;
+      try { ev = JSON.parse(String(e.data)); } catch { return; }
+      if (typeof ev.type === "string" && ev.type.endsWith("audio.delta") && ev.delta) chunks.push(Buffer.from(ev.delta, "base64"));
+      else if (ev.type === "error") done(() => reject(new Error(`realtime speech refused: ${ev.error?.message ?? "unknown error"}`)));
+      else if (ev.type === "response.done") {
+        const pcm = Buffer.concat(chunks);
+        if (!pcm.length) return done(() => reject(new Error("realtime speech returned no audio")));
+        done(() => resolve({ bytes: wav(pcm), contentType: "audio/wav" }));
+      }
+    };
+    ws.onerror = () => done(() => reject(new Error("realtime speech connection failed")));
+    ws.onclose = (e: any) => done(() => reject(new Error(`realtime speech closed early (${e?.code ?? "?"}) ${String(e?.reason ?? "").slice(0, 120)}`)));
+  });
+}
+
 const env = (k: string, d: string) => (process.env[k]?.length ? process.env[k]! : d);
 
 // ─────────────────────────── Anthropic (Claude Code subscription) ───────────────────────────
@@ -282,7 +336,7 @@ export const openai: Provider = {
     }
   },
   canGenerateImages: true,
-  voices: ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"],
+  voices: REALTIME_VOICES,
   /**
    * Read-aloud — the ChatGPT product's own TTS, and the ONE speech path the
    * subscription really does cover. `GET /backend-api/synthesize` returns audio/aac
@@ -343,37 +397,26 @@ export const openai: Provider = {
     return { selected: j?.selected ?? "cove", voices: (j?.voices ?? []).map((v: any) => v.voice).filter(Boolean) };
   },
   /**
-   * Speech from arbitrary text. Measured on 2026-07-28: `/v1/audio/speech` accepts the
-   * subscription token but answers 429 "account is not active" (no API billing); the
-   * codex backend has no speech route (404); and Responses rejects `modalities` (400).
-   * So free-text speech needs a billed API key — while readAloud() above covers the
-   * subscription case — and this says so rather than pretending.
+   * Speech from arbitrary text, on the subscription — no API key, no conversation,
+   * nothing stored. The realtime endpoint accepts the ChatGPT OAuth token over a
+   * plain WebSocket (the GA shape: send no `OpenAI-Beta` header, or it answers
+   * `beta_api_shape_disabled`), and streams back raw PCM16 at 24 kHz, which needs a
+   * 44-byte WAV header and no codec at all.
+   *
+   * Measured 2026-08-02: `/v1/audio/speech` still refuses a subscription token (429
+   * "account is not active"), so the billed REST route is the fallback here, not the
+   * main path.
    */
   async speak(o: SpeechOpts): Promise<SpeechResult> {
-    // OpenAI's own speech endpoint, and nothing else. No local server is ever used
-    // unless the user points APIPLAN_TTS_BASE at one deliberately — a CLI that
-    // quietly answers from a different engine than the one you asked for is a liar.
-    //
-    // Measured 2026-07-28: the ChatGPT/Codex subscription does NOT cover speech.
-    // /v1/audio/speech returns 429 "account is not active" for a subscription token,
-    // the codex backend has no speech route (404), and Responses rejects `modalities`
-    // (400). So this needs a billed API key and says exactly that when there isn't one.
     const key = process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY;
-    const base = process.env.APIPLAN_TTS_BASE || env("APIPLAN_OPENAI_API_BASE", "https://api.openai.com");
-    const custom = !!process.env.APIPLAN_TTS_BASE;
-    if (!key && !custom) {
-      throw new Error(
-        "Speaking arbitrary text needs a billed API key — the ChatGPT/Codex subscription does not cover it.\n" +
-        "  measured: /v1/audio/speech → 429 'account is not active' with a subscription token;\n" +
-        "            the codex backend has no speech route (404).\n" +
-        "  → --aloud                               (ChatGPT read-aloud: real product voices, ON the\n" +
-        "                                           subscription — reads a message from your history)\n" +
-        "  → export OPENAI_API_KEY=sk-…            (uses api.openai.com, billed per character)\n" +
-        "  → or --local                            (operating-system voice, offline, robotic)"
-      );
+    const base = process.env.APIPLAN_TTS_BASE;
+    if (!base) {
+      try { return await speakRealtime(openai.creds(), o); }
+      catch (e) { if (!key) throw e; }        // with a key in hand, fall through and use it
     }
+    const url = base || env("APIPLAN_OPENAI_API_BASE", "https://api.openai.com");
     const model = o.model || env("APIPLAN_TTS_MODEL", "gpt-4o-mini-tts");
-    const res = await fetch(`${base}/v1/audio/speech`, {
+    const res = await fetch(`${url}/v1/audio/speech`, {
       method: "POST",
       headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
       body: JSON.stringify({ model, voice: o.voice, input: o.text, response_format: o.format, ...(o.speed ? { speed: o.speed } : {}) }),
@@ -381,13 +424,14 @@ export const openai: Provider = {
     if (!res.ok) {
       let detail = (await res.text()).slice(0, 300);
       try { detail = JSON.parse(detail)?.error?.message ?? detail; } catch {}
-      throw new Error(`speech failed (${res.status}) via ${base}: ${detail}`);
+      throw new Error(`speech failed (${res.status}) via ${url}: ${detail}`);
     }
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") || `audio/${o.format}` };
   },
   /** Voices the chosen backend actually serves (local server asked live, else OpenAI's). */
   async listVoices(): Promise<{ backend: string; voices: string[] }> {
     const base = process.env.APIPLAN_TTS_BASE;   // only when explicitly configured
+    if (!base) return { backend: "realtime (your ChatGPT subscription)", voices: REALTIME_VOICES };
     if (base) {
       try {
         const r = await fetch(`${base}/v1/audio/voices`);

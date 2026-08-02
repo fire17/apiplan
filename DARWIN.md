@@ -399,3 +399,36 @@ SRTP, Opus decode), which is a native dependency in a tool that currently has no
 it is written down here rather than half-built.
 
 **Degradation check:** 112 tests pass, up from 109; no budget relaxed.
+
+## Round 16 — fresh speech on the subscription, and no WebRTC after all
+
+Round 15 ended pointing at WebRTC as the route to speaking arbitrary text. The brief
+was "WebRTC, no payments", so the build started — and the first 60-second check killed
+the whole project, in the good way.
+
+The realtime **WebSocket** accepts the ChatGPT subscription token directly:
+
+| attempt | result |
+|---|---|
+| `wss://api.openai.com/v1/realtime` + `OpenAI-Beta: realtime=v1` | closed 4000 `beta_api_shape_disabled` |
+| **same URL, GA shape (no beta header)** | **`session.created`, model `gpt-realtime`** |
+| `wss://chatgpt.com/backend-api/codex/realtime` | no 101 |
+
+Sending `session.update` + `response.create` returns `response.output_audio.delta`
+frames of raw PCM16 at 24 kHz — 151,200 bytes, 3.1 s, played. So the deliverable is a
+plain WebSocket plus a 44-byte wav header: **no WebRTC, no ICE, no DTLS, no Opus, no
+native dependency, and no payment.** The dependency count stays at zero.
+
+Voices, named by the server when handed a bad one: `alloy ash ballad coral echo sage
+shimmer verse marin cedar`. Any language — Hebrew verified.
+
+`tts` now runs on the subscription by default, falls back to the billed REST route only
+if a key happens to be set, and to the OS voice (script-matched) if neither answers,
+saying which it used. `/v1/audio/speech` still refuses a subscription token (429
+"account is not active"), which is why it is the fallback and not the path.
+
+**The lesson, again:** round 15 wrote off a capability as "needs a native WebRTC stack"
+from one 400. One more probe down the same road found the answer was a WebSocket.
+Probe the adjacent thing before estimating the expensive thing.
+
+**Degradation check:** 114 tests pass, up from 112; no budget relaxed.
