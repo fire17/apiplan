@@ -34,10 +34,12 @@ MODEL
 
 MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech needs a key)
       --draw             draw the prompt${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|medium|high>
-      --aloud            ChatGPT read-aloud, real product voices. Reads only what you
-                         name: --last (newest reply) or --conversation/--message <id>
-      --speak            say your own text (needs OPENAI_API_KEY)   --local (OS voice, offline)
-      --voice <name>     apiplan voices lists both sets   --play   --format aac|mp3|wav
+      --open             open the image when it's done (imagine does this already)
+      --aloud            ChatGPT read-aloud in a real product voice — speaks your newest
+                         ChatGPT reply (--conversation/--message <id> to pick another)
+      --speak            say your own text: OpenAI voices with OPENAI_API_KEY set,
+                         otherwise your OS voice, which follows the text's language
+      --voice <name>     apiplan voices lists every one   --play   --format aac|mp3|wav
   -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
 
 INPUT

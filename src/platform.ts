@@ -199,9 +199,41 @@ end try`], { stderr: "ignore" });
  * fallback for `--local`, so a machine with no API key can still talk.
  * Returns the tool used, or null when the OS offers nothing.
  */
+/**
+ * The OS voice that can actually pronounce this text. `say` reads Hebrew with an
+ * English voice as gibberish, so the script the text is written in picks the voice —
+ * which is the difference between working multilingual speech and noise.
+ */
+export function localVoiceFor(text: string): string | null {
+  if (!IS_MAC) return null;               // only macOS exposes a stable named-voice list
+  const script: [RegExp, string[]][] = [
+    [/[\u0590-\u05FF]/, ["Carmit"]],                        // Hebrew
+    [/[\u0600-\u06FF]/, ["Majed", "Amira"]],                 // Arabic
+    [/[\u3040-\u30FF]/, ["Kyoko", "Otoya"]],                 // Japanese
+    [/[\uAC00-\uD7AF]/, ["Yuna"]],                          // Korean
+    [/[\u4E00-\u9FFF]/, ["Tingting", "Meijia"]],             // Chinese
+    [/[\u0400-\u04FF]/, ["Milena", "Katya"]],                // Cyrillic
+    [/[\u0900-\u097F]/, ["Lekha"]],                         // Devanagari
+    [/[\u0E00-\u0E7F]/, ["Kanya"]],                         // Thai
+  ];
+  let want: string[] | null = null;
+  for (const [re, names] of script) if (re.test(text)) { want = names; break; }
+  const have = new Set<string>();
+  try {
+    const r = Bun.spawnSync(["say", "-v", "?"], { stderr: "ignore" });
+    for (const line of (r.stdout?.toString() ?? "").split("\n")) {
+      const m = line.match(/^([^\s]+(?: [^\s]+)?)\s{2,}/);
+      if (m) have.add(m[1].trim());
+    }
+  } catch { return null; }
+  if (want) return want.find((n) => have.has(n)) ?? null;
+  return null;                            // Latin text: the system default is right
+}
+
 export function speakLocally(text: string): string | null {
+  const mac = localVoiceFor(text);
   const attempts: string[][] = IS_MAC
-    ? [["say", text]]
+    ? [mac ? ["say", "-v", mac, text] : ["say", text]]
     : IS_WIN
       ? [["powershell.exe", "-NoProfile", "-Command", `Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak(${JSON.stringify(text)})`]]
       : IS_WSL
@@ -214,6 +246,17 @@ export function speakLocally(text: string): string | null {
     if (r.exitCode === 0) return cmd[0];
   }
   return null;
+}
+
+/** Hand a file to the desktop to open however it likes. Returns the tool, or null. */
+export function openFile(path: string): string | null {
+  const cmd = IS_MAC ? ["open", path]
+    : IS_WIN ? ["cmd.exe", "/c", "start", "", path]
+    : IS_WSL ? ["wslview", path]
+    : ["xdg-open", path];
+  if (!whichSync(cmd[0])) return null;
+  const r = Bun.spawnSync(cmd, { stderr: "ignore", stdout: "ignore" });
+  return r.exitCode === 0 ? cmd[0] : null;
 }
 
 /** Play an audio file with the OS's default player. Returns the tool used, or null. */

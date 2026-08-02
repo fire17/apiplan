@@ -7,7 +7,7 @@
 //     skip both the credential read and the handshake
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
-import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, speakLocally, playAudio, IS_WIN } from "./platform.ts";
+import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, speakLocally, playAudio, openFile, IS_WIN } from "./platform.ts";
 import { models, resolve, type Model } from "./registry.ts";
 import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
 
@@ -43,7 +43,7 @@ export type Opts = CallOpts & {
   thinking?: number; systemFile?: string;
   /** non-text jobs */
   out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
-  aloud: boolean; conversation?: string; message?: string; last: boolean;
+  aloud: boolean; conversation?: string; message?: string; last: boolean; open: boolean;
 };
 
 /** Flags that consume the next argv item (so it is never mistaken for prompt text). */
@@ -61,7 +61,7 @@ export function parseArgs(argv: string[], model0?: string): Opts {
     model: model0, images: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
     dryRun: false, verbose: false, help: false, version: false,
     daemon: false, daemonStop: false, noDaemon: false,
-    speak: false, play: false, local: false, aloud: false, last: false,
+    speak: false, play: false, local: false, aloud: false, last: false, open: false,
   };
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -89,6 +89,7 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--voice": o.voice = val(); break;
       case "--format": o.audioFormat = val(); break;
       case "--play": o.play = true; break;
+      case "--open": o.open = true; break;
       case "--local": o.local = true; o.speak = true; break;
       case "--aloud": case "--read-aloud": o.aloud = true; o.speak = true; break;
       case "--last": o.last = true; o.aloud = true; o.speak = true; break;
@@ -208,7 +209,7 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
   }
   if (lastProgress && process.stderr.isTTY) process.stderr.write("\r\x1b[K");
   let imagePath: string | undefined;
-  if (imageB64) imagePath = saveImage(imageB64, o.out, revised);
+  if (imageB64) imagePath = saveImage(imageB64, o.out, revised, o.open);
   if (o.stream) process.stdout.write("\n");
   else if (text) process.stdout.write(text.replace(/\n?$/, "\n"));
   reportTiming();
@@ -249,7 +250,7 @@ export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void
  * Path goes to stdout when it is the whole answer, so `imagine … | xargs open` works;
  * the human-facing note goes to stderr so pipes stay clean.
  */
-export function saveImage(b64: string, out: string | undefined, revised: string): string {
+export function saveImage(b64: string, out: string | undefined, revised: string, open = false): string {
   const bytes = Buffer.from(b64, "base64");
   const ext = bytes[0] === 0x89 ? "png" : bytes[0] === 0xff ? "jpg" : bytes[0] === 0x52 ? "webp" : "png";
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "").replace("T", "-");
@@ -257,6 +258,10 @@ export function saveImage(b64: string, out: string | undefined, revised: string)
   writeFileSync(path, bytes);
   const kb = Math.round(bytes.length / 1024);
   process.stderr.write(`\x1b[2m${revised ? `prompt used: ${revised.slice(0, 120)}\n` : ""}\x1b[0mimage saved: ${path} (${kb}KB)\n`);
+  if (open) {
+    const tool = openFile(path);
+    if (!tool) process.stderr.write(`\x1b[2mno opener found — open ${path} yourself\x1b[0m\n`);
+  }
   return path;
 }
 
@@ -266,14 +271,20 @@ export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> 
   // other speech path it needs no prompt — the text comes from the conversation.
   if (o.aloud) return runAloud(m, o);
   if (!text.trim()) die("nothing to say — give me some text, or pipe it in.");
-  if (o.local) {
+  const p = providerFor(m);
+  // Speaking fresh text has exactly one requirement — a backend that can do it — so
+  // pick the best one available instead of making the user find out by failing. A key
+  // means real OpenAI voices; without one the OS voice still speaks, today, for free.
+  const keyed = !!(process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY || process.env.APIPLAN_TTS_BASE);
+  if (o.local || !keyed || !p.speak) {
     const tool = speakLocally(text);
     if (!tool) die("no local voice available (macOS `say`, Linux `spd-say`/`espeak`, Windows SAPI).");
-    if (o.verbose) process.stderr.write(`[apiplan] spoke locally via ${tool}\n`);
+    if (!o.local) {
+      process.stderr.write(`\x1b[2mspoke with your ${tool === "say" ? "system" : tool} voice — set OPENAI_API_KEY for OpenAI voices,\n` +
+        `  or \`aloud\` to hear a ChatGPT reply in a real ChatGPT voice.\x1b[0m\n`);
+    } else if (o.verbose) process.stderr.write(`[apiplan] spoke locally via ${tool}\n`);
     return;
   }
-  const p = providerFor(m);
-  if (!p.speak) die(`${p.label} offers no speech here — try --local for the operating system voice.`);
   const fmt = o.audioFormat ?? "mp3";
   // Ask the BACKEND what it serves: a local neural server has its own voice names, and
   // validating those against OpenAI's static list rejects every one of them.

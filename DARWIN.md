@@ -366,3 +366,36 @@ prompt you typed), `store: false`, and a per-call session id — no prior turns,
 retained. Two tests hold that shape.
 
 **Degradation check:** 109 tests pass, up from 97; no budget relaxed.
+
+## Round 15 — seamless, and the realtime discovery
+
+Three friction points removed: `imagine` now opens what it draws (`--open`), `aloud`
+needs no second flag to mean the obvious thing, and `tts` picks a backend instead of
+failing at you — a key gets OpenAI voices, no key still speaks, today, for free.
+
+The OS-voice fallback is language-aware, which is the difference between working
+multilingual speech and noise: `say` reads Hebrew in an English voice as gibberish, so
+the script the text is written in now picks the voice (Carmit, Majed, Kyoko, Tingting,
+Milena, …), falling back to the system default for Latin text.
+
+**Creating a conversation to speak fresh text: refused, with the reason.**
+`POST /backend-api/sentinel/chat-requirements` → 200, and the requirements say
+`turnstile: {"required": true}`. Creating a ChatGPT conversation means clearing a
+Cloudflare CAPTCHA. That is an anti-automation control, so it stays uncleared.
+
+**But the realtime endpoint takes the subscription token.** Probed by following its own
+error messages:
+
+| body | response |
+|---|---|
+| `{sdp}` | 400 `Field 'session' must be an object` |
+| `{session: {}, sdp}` | 400 `You must provide a model parameter` |
+| **`{session: {type:"realtime", model:"gpt-realtime"}, sdp}`** | **201 + a real SDP answer** |
+| `…audio.output.voice = "cove"` | 400 — voices are `alloy ash ballad coral echo sage …` |
+
+So fresh arbitrary text *can* be spoken on the subscription, through WebRTC voice mode —
+no conversation, no history, nothing stored. It needs a real WebRTC stack (ICE, DTLS,
+SRTP, Opus decode), which is a native dependency in a tool that currently has none, so
+it is written down here rather than half-built.
+
+**Degradation check:** 112 tests pass, up from 109; no budget relaxed.

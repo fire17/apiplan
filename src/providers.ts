@@ -303,20 +303,10 @@ export const openai: Provider = {
     let { conversation, message } = o;
     let spoke = "";
     if (!conversation || !message) {
-      // Reading stored history is never implicit. A speech command that silently
-      // reaches into whatever you last discussed with ChatGPT is a privacy surprise,
-      // so it happens only when you name the message or explicitly ask for --last.
-      if (!o.last) {
-        throw new Error(
-          "read-aloud speaks a message that already exists in your ChatGPT history, and it will not\n" +
-          "  go looking through that history unless you say so.\n" +
-          "  → --last                                 read my newest ChatGPT reply\n" +
-          "  → --conversation <id> --message <id>     read exactly this one\n" +
-          "  for speech from fresh text that touches no history at all:\n" +
-          "  → --local                                your operating system's voice, offline\n" +
-          "  → --speak with OPENAI_API_KEY set        OpenAI voices, billed per character"
-        );
-      }
+      // Newest conversation, newest assistant message in it. `aloud` names what it
+      // does, so needing a second flag to say "yes, the last one" was friction for
+      // nothing — but this is the ONLY path that reads stored history, and no other
+      // command in apiplan touches it.
       if (!conversation) {
         const list: any = await (await get("/backend-api/conversations?limit=1&offset=0")).json();
         conversation = list?.items?.[0]?.id;

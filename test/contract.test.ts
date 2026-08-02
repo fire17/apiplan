@@ -151,19 +151,17 @@ describe("read-aloud — the speech path the subscription really covers", () => 
     expect(o.aloud).toBe(true);
     expect(o.prompt).toEqual([]);        // the ids must not leak into the prompt
   });
-  test("history is never touched implicitly — bare --aloud refuses and explains", async () => {
-    try {
-      await openai.readAloud!({});
-      throw new Error("should have refused");
-    } catch (e: any) {
-      expect(e.message).toContain("will not");
-      expect(e.message).toContain("--last");
-      expect(e.message).toContain("--local");
-    }
+  test("bare --aloud just works — no second flag to confirm the obvious", () => {
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const fn = src.slice(src.indexOf("async readAloud"), src.indexOf("async aloudVoices"));
+    expect(fn).not.toContain("throw new Error(\n");   // no consent gate left in the path
+    expect(parseArgs(["--last"]).last).toBe(true);      // still accepted, just not required
   });
-  test("--last is the explicit opt-in", () => {
-    expect(parseArgs(["--last"]).last).toBe(true);
-    expect(parseArgs(["--aloud"]).last).toBe(false);
+  test("read-aloud is the only thing in apiplan that reads stored history", () => {
+    const eng = require("node:fs").readFileSync(new URL("../src/engine.ts", import.meta.url).pathname, "utf8");
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    expect(eng).not.toContain("/backend-api/conversations");
+    expect(src.split("/backend-api/conversation").length - 1).toBeLessThanOrEqual(3);
   });
   test("plain --speak stays free-text, not read-aloud", () => {
     expect(parseArgs(["--speak", "hello"]).aloud).toBe(false);
@@ -270,5 +268,26 @@ describe("upgrades gain new default commands", () => {
     C.remove(cfg, "opus-fast");
     expect(cfg.removed).toContain("opus-fast");
     expect(C.mergeDefaults(cfg)).not.toContain("opus-fast");
+  });
+});
+
+describe("making things is seamless", () => {
+  test("--open is a flag, and imagine bakes it in", () => {
+    expect(parseArgs(["--draw", "--open", "a cat"]).open).toBe(true);
+    const C = require("../src/commands.ts");
+    const imagine = C.defaults().find((c: any) => c.name === "imagine");
+    if (imagine) expect(imagine.flags).toEqual(["--draw", "--open"]);
+  });
+  test("aloud needs no flag beyond its own name", () => {
+    const C = require("../src/commands.ts");
+    const aloud = C.defaults().find((c: any) => c.name === "aloud");
+    if (aloud) expect(aloud.flags).toEqual(["--aloud", "--play"]);
+  });
+  test("the OS voice follows the script the text is written in", () => {
+    const { localVoiceFor } = require("../src/platform.ts");
+    const v = localVoiceFor("שלום עולם");
+    // Only assert on a machine that actually has the Hebrew voice installed.
+    if (v !== null) expect(v).toBe("Carmit");
+    expect(localVoiceFor("plain english")).toBe(null);   // system default is right
   });
 });

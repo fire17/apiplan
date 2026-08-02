@@ -66,10 +66,10 @@ export function defaults(): Command[] {
   const drawer = models().find((m) => PROVIDERS[m.provider].canGenerateImages);
   if (drawer) {
     const alias = aliasesFor(drawer)[0] ?? drawer.id;
-    add("imagine", alias, ["--draw"], "generate an image from a prompt");
+    add("imagine", alias, ["--draw", "--open"], "generate an image and open it");
     // Read-aloud is the speech path the subscription actually covers, so it earns a
     // command of its own rather than hiding behind a flag on `tts`.
-    add("aloud", alias, ["--aloud", "--play"], "ChatGPT read-aloud (--last for your newest reply)");
+    add("aloud", alias, ["--aloud", "--play"], "read your newest ChatGPT reply in a real ChatGPT voice");
     // `tts` is the portable name; `speak` is nicer but espeak-ng already owns it on
     // many machines, so it is offered only where the name is genuinely free.
     add("tts", alias, ["--speak", "--play"], "speak your own text (needs OPENAI_API_KEY; --local uses the OS voice)");
