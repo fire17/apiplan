@@ -34,18 +34,17 @@ MODEL
 
 MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech needs a key)
       --draw             draw the prompt${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|medium|high>
-      --open             open the image when it's done (imagine does this already)
-      --aloud            ChatGPT read-aloud in a real product voice — speaks your newest
-                         ChatGPT reply (--conversation/--message <id> to pick another)
-      --speak            say your own text: OpenAI voices with OPENAI_API_KEY set,
-                         otherwise your OS voice, which follows the text's language
-      --voice <name>     apiplan voices lists every one   --play   --format aac|mp3|wav
+      --open             open the image when it's done (imagine already does)
+      --aloud            read your newest ChatGPT reply in a real ChatGPT voice
+                         (--conversation/--message <id> picks another)
+      --speak            say your own text — OpenAI voices with OPENAI_API_KEY, else
+                         your OS voice, picked to match the text's language
+      --voice <name>     see apiplan voices   --play   --format aac|mp3|wav
   -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
 
 INPUT
   -i, --image <src>      file · http(s) URL · data: URI · - (stdin) · clipboard — repeatable
-  -s, --system <text>    system prompt / instructions
-      --system-file <f>  read the system prompt from a file
+  -s, --system <text>    system prompt   ·   --system-file <f>  read it from a file
       --chat             read a JSON messages array from stdin (multi-turn)
       --                 everything after this is literal prompt text
 
@@ -55,9 +54,8 @@ OUTPUT
       --json / --dry-run raw response · print the exact request without sending
   -v, --verbose          report first-token and total latency
 
-SPEED  the warm daemon caches your login and holds the connection open; it starts itself
-      --no-daemon        run this one call in-process    --daemon / --daemon-stop
-                         (APIPLAN_DAEMON=off disables it entirely)
+SPEED  the warm daemon caches your login + connection and starts itself
+      --no-daemon        one call in-process   --daemon / --daemon-stop   (APIPLAN_DAEMON=off)
 
   -h, --help             this help          ·  apiplan          manage every command
   -V, --version          print version      ·  apiplan models   list every model + alias
