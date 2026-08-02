@@ -114,12 +114,20 @@ allows plus streaming, for the quickest possible first token.
 ```sh
 imagine a lighthouse at dusk, watercolour      # draws it, then opens it
 imagine --size 1024x1536 --quality high -o cover.png a paperback cover
+imagine --raw a single red triangle on white   # your words, character for character
 
 aloud                                          # speaks your newest ChatGPT reply
 aloud --voice cove                             # in any ChatGPT product voice
 tts a short fresh sentence                     # your own text, spoken
 apiplan voices                                 # every voice, and what it costs
 ```
+
+By default the model rewrites your prompt before drawing — `a single red triangle on
+white` becomes *"A minimalist image with a single solid red equilateral triangle centred
+on a pure white background…"* — which is why the run prints `prompt used:`. That helps a
+terse prompt and ruins a precise one, so `--raw` turns it off and `--enhance` asks for it
+explicitly. To make either one your default, bake it into the command:
+`apiplan rm imagine && apiplan add imagine --model sol --flags "--draw --raw --open"`.
 
 `imagine` runs on the same Codex endpoint as everything else — no API key. So does
 `aloud`: it is ChatGPT's own **read-aloud**, in the real product voices

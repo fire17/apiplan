@@ -95,6 +95,26 @@ describe("image generation", () => {
     expect(b.body.tools[0]).toEqual({ type: "image_generation", size: "1024x1024", quality: "high" });
     expect(b.body.size).toBeUndefined();
   });
+  test("--raw pins the prompt: the model is told to copy it, not improve it", () => {
+    const b = build("sol", { genImage: true, rawPrompt: true });
+    expect(b.body.instructions).toContain("character for character");
+    expect(b.body.instructions).toContain("do not rewrite");
+    expect(b.body.input[0].content[0].text).toBe("hi");
+  });
+  test("--raw keeps the user's system prompt, it does not replace it", () => {
+    const b = build("sol", { genImage: true, rawPrompt: true, system: "be terse" });
+    expect(b.body.instructions.startsWith("be terse")).toBe(true);
+    expect(b.body.instructions).toContain("character for character");
+  });
+  test("enhancing stays the default — no pass-through instruction unless asked", () => {
+    expect(build("sol", { genImage: true }).body.instructions).toBe("");
+  });
+  test("--raw and --enhance are opposites, and both imply drawing", () => {
+    expect(parseArgs(["--raw", "a cat"]).rawPrompt).toBe(true);
+    expect(parseArgs(["--raw", "a cat"]).genImage).toBe(true);
+    expect(parseArgs(["--enhance", "a cat"]).rawPrompt).toBe(false);
+    expect(parseArgs(["--draw", "a cat"]).rawPrompt).toBeUndefined();
+  });
   test("no tool is added unless asked", () => {
     expect(build("sol").body.tools).toBeUndefined();
   });

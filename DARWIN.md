@@ -432,3 +432,25 @@ from one 400. One more probe down the same road found the answer was a WebSocket
 Probe the adjacent thing before estimating the expensive thing.
 
 **Degradation check:** 114 tests pass, up from 112; no budget relaxed.
+
+## Round 17 — who was rewriting the prompt
+
+`imagine` printed `prompt used:` with text nobody typed. The rewrite is not the image
+backend: the model owns the tool call, so it writes the `prompt` argument itself, and a
+terse instruction becomes a paragraph of style words.
+
+`--raw` sets instructions telling the model to copy the message character for character
+and add nothing; `--enhance` asks for the rewrite explicitly. Verified live on the same
+prompt, `a single red triangle on white`:
+
+| flag | `prompt used:` |
+|---|---|
+| `--raw` | `a single red triangle on white` |
+| `--enhance` | `A minimalist image with a single solid red equilateral triangle centered on a pure white background. Clean sharp edges, …` |
+
+Default stays `--enhance` — the rewrite genuinely helps a lazy prompt — and either can
+become the default for good by baking it into the command's flags. `--raw` appends to
+the user's `--system` rather than replacing it, which a test holds.
+
+**Degradation check:** 118 tests pass, up from 114. The help budget (B9, ≤48 lines) was
+paid for twice this round by compressing existing lines, never by raising the bar.

@@ -14,6 +14,8 @@ export type CallOpts = {
   showThinking?: boolean; fast?: boolean; oneM?: boolean; temperature?: number;
   /** Ask the model to draw: adds the provider's image-generation tool to the request. */
   genImage?: boolean; imageSize?: string; imageQuality?: string;
+  /** Send the drawing prompt through untouched instead of letting the model rewrite it. */
+  rawPrompt?: boolean;
 };
 
 /** Text-to-speech is a different shape from a chat call: one request, binary back. */
@@ -288,6 +290,16 @@ export const openai: Provider = {
     // Drawing runs as a built-in tool on the SAME subscription endpoint as chat —
     // verified live: the backend returns base64 in an image_generation_call.
     if (o.genImage) {
+      // The model — not the image backend — is what rewrites a drawing prompt: it
+      // decides the tool-call arguments, which is why `prompt used:` differs from what
+      // you typed. --raw removes that liberty; the default keeps it, because the
+      // rewrite genuinely helps a terse prompt.
+      if (o.rawPrompt) {
+        body.instructions = (o.system ? o.system + "\n\n" : "") +
+          "Call the image_generation tool exactly once. Its `prompt` argument MUST be the user's " +
+          "message copied character for character — do not rewrite, expand, translate, summarise, " +
+          "reorder, add style words, or add detail of any kind. Reply with no text.";
+      }
       const tool: any = { type: "image_generation" };
       if (o.imageSize) tool.size = o.imageSize;
       if (o.imageQuality) tool.quality = o.imageQuality;

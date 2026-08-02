@@ -83,6 +83,8 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "-i": case "--image": o.images.push(val()); break;
       case "-o": case "--out": o.out = val(); break;
       case "--draw": case "--gen-image": case "--image-out": o.genImage = true; break;
+      case "--raw": o.rawPrompt = true; o.genImage = true; break;
+      case "--enhance": o.rawPrompt = false; o.genImage = true; break;
       case "--size": o.imageSize = val(); break;
       case "--quality": o.imageQuality = val(); break;
       case "--speak": case "--say": o.speak = true; break;

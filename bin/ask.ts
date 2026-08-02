@@ -24,8 +24,7 @@ USAGE
 
 MODEL
   -m, --model <name>     family (opus → newest Opus) · explicit (opus48) · variant (sol) · full id
-  -e, --effort <level>   ${efforts}
-      --thinking off|N   turn reasoning off entirely (or set a legacy token budget)
+  -e, --effort <level>   ${efforts}   ·   --thinking off|N   no reasoning / token budget
       --loop <n>         self-refine n times before answering (default 1)
       --max-tokens <n>   cap the answer length
   -t, --temperature <f>  sampling temperature (legacy models only)
@@ -34,8 +33,9 @@ MODEL
 
 MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech needs a key)
       --draw             draw the prompt${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|medium|high>
+      --raw              draw exactly what you typed (default: the model improves it)
       --open             open the image when it's done (imagine already does)
-      --aloud            read your newest ChatGPT reply in a real ChatGPT voice
+      --aloud            read your newest ChatGPT reply in a ChatGPT voice
                          (--conversation/--message <id> picks another)
       --speak            say your own text in an OpenAI voice, on the subscription
                          (--local forces your OS voice, offline)
