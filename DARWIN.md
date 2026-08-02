@@ -322,3 +322,47 @@ removed — the end-to-end number is still printed every run.
 - `providers answering live` failed once transiently (1/2) immediately after the
   25-parallel test, then passed on retry — likely provider-side rate limiting. Not
   reproduced; noted rather than hidden.
+
+## Round 14 — the speech question, answered by measurement
+
+The brief was "make TTS work from the subscription". The honest answer needed probing
+rather than assuming, so every candidate route was called and its status recorded.
+
+| route | verdict |
+|---|---|
+| `POST api.openai.com/v1/audio/speech` | 429 `account is not active` — needs billing |
+| `POST /backend-api/codex/audio/speech` | 404 — no speech on the codex backend |
+| Responses `modalities: ["audio"]` | 400 |
+| `POST /backend-api/synthesize` | 405 — GET only |
+| `/backend-api/synthesize_stream`, `/audio/synthesize`, `/tts`, `/speech`, `/voice/synthesize` | 404 |
+| **`GET /backend-api/synthesize?conversation_id&message_id`** | **200 `audio/aac`** ✅ |
+| `GET /backend-api/settings/voices` | 200 — nine real ChatGPT voices |
+| `POST /backend-api/conversation` (to create text to speak) | 403, anti-automation sentinel |
+
+So the subscription *does* cover speech — as ChatGPT's **read-aloud**, which takes a
+stored message and no text parameter (`text`/`message`/`content`/`input`/`prompt`/`ssml`
+were each passed and each ignored — byte counts varied only by re-synthesis jitter).
+Putting fresh text into the account first means the web chat endpoint, which is behind
+a proof-of-work bot check. That line was not crossed; the CLI states the limit instead
+of faking a browser.
+
+**Shipped:** `aloud` (read-aloud, nine product voices, `apiplan voices`), and speech
+error text that names the three real options instead of one dead end.
+
+**Multilingual:** works untouched — a Hebrew assistant message synthesised to 26 s of
+correct audio in `maple`, `cove` and `juniper` with no configuration.
+
+**Two bugs this round surfaced, both fixed:**
+- *Upgrades could never gain a command.* `install` seeded `commands.json` only when it
+  was empty, so `imagine` (added in 0.3.0) would have reached no existing user, ever.
+  `mergeDefaults()` now tops up missing defaults, and `rm` records the removal so a
+  default deleted on purpose is never resurrected.
+- *Read-aloud reached into private history by default.* The first cut of `aloud` read
+  your newest ChatGPT reply with no prompting — a real privacy surprise. Touching stored
+  history is now explicit only: `--last`, or a named `--conversation`/`--message`.
+
+**Freshness, verified not assumed:** a drawing request carries one input block (the
+prompt you typed), `store: false`, and a per-call session id — no prior turns, nothing
+retained. Two tests hold that shape.
+
+**Degradation check:** 109 tests pass, up from 97; no budget relaxed.

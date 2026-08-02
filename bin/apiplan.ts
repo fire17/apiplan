@@ -73,6 +73,31 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
   return notes;
 }
 
+/**
+ * Speech has two distinct voice sets and the difference matters: read-aloud runs on
+ * the subscription with ChatGPT's product voices, free-text speech needs a billed key
+ * and uses OpenAI's API voices. Showing them together is what stops the confusion.
+ */
+async function cmdVoices() {
+  for (const p of Object.values(PROVIDERS)) {
+    if (p.aloudVoices) {
+      try {
+        const { selected, voices } = await p.aloudVoices();
+        process.stdout.write(`${bold("read-aloud")} ${dim(`— ${p.label} subscription, no API key  ·  --aloud`)}\n`);
+        process.stdout.write(`  ${voices.map((v) => (v === selected ? bold(v) + dim("*") : v)).join("  ")}\n`);
+        process.stdout.write(dim(`  * your ChatGPT default. Speaks a message already in your history.\n\n`));
+      } catch (e: any) { process.stdout.write(`${bold("read-aloud")} ${dim("— unavailable: " + (e?.message ?? e))}\n\n`); }
+    }
+  }
+  for (const p of Object.values(PROVIDERS)) {
+    if (!p.speak || !p.voices?.length) continue;
+    const keyed = !!(process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY);
+    process.stdout.write(`${bold("your own text")} ${dim(`— ${p.label} API${keyed ? ", key found" : ", needs OPENAI_API_KEY"}  ·  --speak`)}\n`);
+    process.stdout.write(`  ${p.voices.join("  ")}\n\n`);
+  }
+  process.stdout.write(`${bold("offline")} ${dim("— your operating system's own voice  ·  --local")}\n`);
+}
+
 // ── headless renderers ────────────────────────────────────────────────────────
 async function cmdStatus() {
   const alive = await daemonAlive();
@@ -313,6 +338,7 @@ USAGE
   apiplan status                 which providers am I connected to?
   apiplan models [provider]      every model + the aliases that reach it   ${dim("--refresh")}
   apiplan commands               every global command, and whether PATH finds it
+  apiplan voices                 every speech voice available to you, and from where
   apiplan install                create the default command set and put it on PATH
   apiplan add <name> --model <m> [--flags "…"]      make a new command
   apiplan rename <old> <new>     rename one
@@ -346,10 +372,16 @@ switch (sub) {
     break;
   }
   case "commands": case "ls": cmdCommands(); break;
+  case "voices": await cmdVoices(); break;
   case "install": {
     const cfg = C.load();
-    if (!cfg.commands.length) cfg.commands = C.defaults();
+    // Seed a fresh machine, and top up an existing one with defaults added since it
+    // was installed — otherwise an upgrade's new commands never reach anybody.
+    const fresh = !cfg.commands.length;
+    if (fresh) cfg.commands = C.defaults();
+    const gained = fresh ? [] : C.mergeDefaults(cfg);
     C.save(cfg);
+    if (gained.length) process.stdout.write(dim(`  new in this version: ${gained.join(" ")}\n`));
     reportSync(C.sync(cfg, { force: has("--force") }));
     break;
   }

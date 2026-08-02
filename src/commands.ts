@@ -6,7 +6,8 @@
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { STATE_DIR, defaultBinDir, readJson, writeJson, writeShim, removeShim, shadowsExisting, whichSync, isOurShim, IS_WIN } from "./platform.ts";
-import { resolve, models } from "./registry.ts";
+import { resolve, models, aliasesFor } from "./registry.ts";
+import { PROVIDERS } from "./providers.ts";
 
 export type Command = {
   name: string;
@@ -14,7 +15,9 @@ export type Command = {
   flags?: string[];       // baked-in flags, e.g. ["--effort","low","--stream"]
   note?: string;
 };
-export type Config = { version: 1; binDir?: string; runner?: string; commands: Command[] };
+export type Config = { version: 1; binDir?: string; runner?: string; commands: Command[];
+  /** Defaults the user removed on purpose — so an upgrade never resurrects them. */
+  removed?: string[] };
 
 const FILE = join(STATE_DIR, "commands.json");
 export const configPath = () => FILE;
@@ -58,7 +61,39 @@ export function defaults(): Command[] {
       add(m.variant, m.variant, undefined, m.label);
     }
   }
+  // Non-text jobs, named after what they do. Only offered by a provider that can:
+  // drawing runs on the OpenAI subscription; speech needs a billed key and says so.
+  const drawer = models().find((m) => PROVIDERS[m.provider].canGenerateImages);
+  if (drawer) {
+    const alias = aliasesFor(drawer)[0] ?? drawer.id;
+    add("imagine", alias, ["--draw"], "generate an image from a prompt");
+    // Read-aloud is the speech path the subscription actually covers, so it earns a
+    // command of its own rather than hiding behind a flag on `tts`.
+    add("aloud", alias, ["--aloud", "--play"], "ChatGPT read-aloud (--last for your newest reply)");
+    // `tts` is the portable name; `speak` is nicer but espeak-ng already owns it on
+    // many machines, so it is offered only where the name is genuinely free.
+    add("tts", alias, ["--speak", "--play"], "speak your own text (needs OPENAI_API_KEY; --local uses the OS voice)");
+    add("speak", alias, ["--speak", "--play"], "speak your own text (same as tts, where the name is free)");
+  }
   return out;
+}
+
+/**
+ * Add defaults this config has never seen, leaving everything the user has done alone.
+ * Without this an upgrade can add a capability (drawing, read-aloud) that no existing
+ * install ever gets a command for — the config was seeded once and frozen forever.
+ * A default the user deliberately removed stays removed: `removed` remembers it.
+ */
+export function mergeDefaults(c: Config): string[] {
+  const have = new Set(c.commands.map((x) => x.name));
+  const gone = new Set(c.removed ?? []);
+  const added: string[] = [];
+  for (const d of defaults()) {
+    if (have.has(d.name) || gone.has(d.name)) continue;
+    c.commands.push(d);
+    added.push(d.name);
+  }
+  return added;
 }
 
 export type SyncReport = { written: string[]; skipped: { name: string; why: string }[]; binDir: string };
@@ -107,6 +142,7 @@ export function remove(c: Config, name: string): { ok: boolean; why?: string; re
   const i = c.commands.findIndex((x) => x.name === name);
   if (i < 0) return { ok: false, why: `no command named '${name}'` };
   c.commands.splice(i, 1);
+  if (defaults().some((d) => d.name === name)) c.removed = [...new Set([...(c.removed ?? []), name])];
   return { ok: true, removed: removeShim(binDirOf(c), name) };
 }
 /**

@@ -194,6 +194,43 @@ end try`], { stderr: "ignore" });
   return null;
 }
 
+/**
+ * Speak text with whatever voice the operating system already has — the offline
+ * fallback for `--local`, so a machine with no API key can still talk.
+ * Returns the tool used, or null when the OS offers nothing.
+ */
+export function speakLocally(text: string): string | null {
+  const attempts: string[][] = IS_MAC
+    ? [["say", text]]
+    : IS_WIN
+      ? [["powershell.exe", "-NoProfile", "-Command", `Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak(${JSON.stringify(text)})`]]
+      : IS_WSL
+        ? [["powershell.exe", "-NoProfile", "-Command", `Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak(${JSON.stringify(text)})`],
+           ["spd-say", "-w", text], ["espeak", text]]
+        : [["spd-say", "-w", text], ["espeak", text], ["festival", "--tts"]];
+  for (const cmd of attempts) {
+    if (!whichSync(cmd[0])) continue;
+    const r = Bun.spawnSync(cmd, { stdin: cmd[0] === "festival" ? new TextEncoder().encode(text) : undefined, stderr: "ignore", stdout: "ignore" });
+    if (r.exitCode === 0) return cmd[0];
+  }
+  return null;
+}
+
+/** Play an audio file with the OS's default player. Returns the tool used, or null. */
+export function playAudio(path: string): string | null {
+  const attempts: string[][] = IS_MAC
+    ? [["afplay", path]]
+    : IS_WIN
+      ? [["powershell.exe", "-NoProfile", "-Command", `(New-Object Media.SoundPlayer ${JSON.stringify(path)}).PlaySync()`]]
+      : [["paplay", path], ["aplay", path], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path], ["mpv", "--no-video", path]];
+  for (const cmd of attempts) {
+    if (!whichSync(cmd[0])) continue;
+    const r = Bun.spawnSync(cmd, { stderr: "ignore", stdout: "ignore" });
+    if (r.exitCode === 0) return cmd[0];
+  }
+  return null;
+}
+
 /** Human-readable OS label for `apiplan doctor`. */
 export function osLabel(): string {
   return IS_WIN ? "Windows" : IS_MAC ? "macOS" : IS_WSL ? "WSL" : "Linux";

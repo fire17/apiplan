@@ -3,7 +3,7 @@
 // `opus`, `sonnet`, `gpt`, `sol`, and any custom command the user creates are all
 // thin shims around this file with a different --model (plus any baked-in flags).
 import { basename } from "node:path";
-import { parseArgs, buildTurns, callDirect, callViaDaemon, runDaemon, daemonStop, resolveModelOrDie, die, VERSION, type Opts } from "../src/engine.ts";
+import { parseArgs, buildTurns, callDirect, callViaDaemon, runDaemon, daemonStop, runSpeech, resolveModelOrDie, die, VERSION, type Opts } from "../src/engine.ts";
 import { models, aliasesFor } from "../src/registry.ts";
 import { providerFor } from "../src/providers.ts";
 import type { Model } from "../src/registry.ts";
@@ -32,6 +32,14 @@ MODEL
       --fast             Anthropic Fast Mode (Opus 4.7/4.8 — separate rate limit)
       --1m               enable the 1M-context beta for very large inputs
 
+MAKE THINGS (drawing + read-aloud run on the subscription; free-text speech needs a key)
+      --draw             draw the prompt${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|medium|high>
+      --aloud            ChatGPT read-aloud, real product voices. Reads only what you
+                         name: --last (newest reply) or --conversation/--message <id>
+      --speak            say your own text (needs OPENAI_API_KEY)   --local (OS voice, offline)
+      --voice <name>     apiplan voices lists both sets   --play   --format aac|mp3|wav
+  -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
+
 INPUT
   -i, --image <src>      file · http(s) URL · data: URI · - (stdin) · clipboard — repeatable
   -s, --system <text>    system prompt / instructions
@@ -45,12 +53,9 @@ OUTPUT
       --json / --dry-run raw response · print the exact request without sending
   -v, --verbose          report first-token and total latency
 
-SPEED
-  The warm daemon caches your login and keeps the connection to the provider open,
-  so repeat calls skip the handshake. It starts itself on first use.
-      --no-daemon        run this one call in-process
-      --daemon           run the daemon in the foreground
-      --daemon-stop      stop it            (APIPLAN_DAEMON=off disables it)
+SPEED  the warm daemon caches your login and holds the connection open; it starts itself
+      --no-daemon        run this one call in-process    --daemon / --daemon-stop
+                         (APIPLAN_DAEMON=off disables it entirely)
 
   -h, --help             this help          ·  apiplan          manage every command
   -V, --version          print version      ·  apiplan models   list every model + alias
@@ -76,9 +81,23 @@ if (o.help) {
 }
 
 const model = resolveModelOrDie(o.model);
+if (o.genImage && !providerFor(model).canGenerateImages) {
+  die(`${model.label} cannot generate images — use an OpenAI model (sol / gpt / luna / terra).`);
+}
 if (o.effort) {
   const ok = providerFor(model).efforts(model);
   if (!ok.includes(o.effort)) die(`effort '${o.effort}' is not available on ${model.label}; valid: ${ok.join(", ")}`);
+}
+
+// Speech is a different shape of job: no streaming, no daemon, binary out.
+if (o.speak) {
+  // --aloud reads a message that already exists in the account, so it takes no prompt
+  // and must not sit waiting on stdin for one.
+  const turns0 = o.aloud ? [] : await buildTurns(o);
+  const said = turns0.map((t) => t.text).filter(Boolean).join("\n");
+  try { await runSpeech(model, said, o); }
+  catch (e: any) { die(e?.message ?? String(e)); }
+  process.exit(0);
 }
 
 const turns = await buildTurns(o);

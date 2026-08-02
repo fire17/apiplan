@@ -109,6 +109,38 @@ opus --help                          # every flag, one screen
 `*-fast` twins (`opus-fast`, `sol-fast`, …) bake in the least reasoning the provider
 allows plus streaming, for the quickest possible first token.
 
+### Pictures and speech
+
+```sh
+imagine a lighthouse at dusk, watercolour      # draw — on the subscription
+imagine --size 1024x1536 --quality high -o cover.png a paperback cover
+
+aloud --last                                   # speak your newest ChatGPT reply
+aloud --last --voice cove                      # in any ChatGPT product voice
+apiplan voices                                 # every voice, and what it costs
+```
+
+`imagine` runs on the same Codex endpoint as everything else — no API key. So does
+`aloud`: it is ChatGPT's own **read-aloud**, in the real product voices
+(`maple juniper orbit fathom breeze ember glimmer vale cove`), and it reads any
+language the message is written in — Hebrew, Arabic, Japanese — with no setup.
+
+Nothing here reuses your history unless you ask. Every `imagine` call sends only the
+prompt you typed, with `store: false` and a fresh session id — no prior turns, nothing
+kept. Read-aloud never goes looking either: bare `aloud` explains itself and stops, and
+only `--last` or an explicit `--conversation/--message` pair reaches a stored message.
+
+Read-aloud speaks a message that already exists in your ChatGPT history, because
+that is exactly what the endpoint takes: `GET /backend-api/synthesize` accepts a
+`conversation_id` and a `message_id` and nothing else. Speaking *arbitrary* text is
+a different route that the subscription does not cover — `tts hello` says so and
+points at `OPENAI_API_KEY` (billed) or `--local` (your OS voice, offline).
+
+```sh
+aloud --conversation <id> --message <id>       # read a specific message
+tts --local a short offline test               # no account needed at all
+```
+
 ### Quotes, `?` and `*`
 
 Your shell — not this tool — is what eats `?` in `opus is this right?`. zsh needs one

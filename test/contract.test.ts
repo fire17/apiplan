@@ -85,6 +85,131 @@ describe("openai request", () => {
   });
 });
 
+describe("image generation", () => {
+  test("--draw adds the image tool to an OpenAI request", () => {
+    const b = build("sol", { genImage: true });
+    expect(b.body.tools).toEqual([{ type: "image_generation" }]);
+  });
+  test("size and quality reach the tool, not the top level", () => {
+    const b = build("sol", { genImage: true, imageSize: "1024x1024", imageQuality: "high" });
+    expect(b.body.tools[0]).toEqual({ type: "image_generation", size: "1024x1024", quality: "high" });
+    expect(b.body.size).toBeUndefined();
+  });
+  test("no tool is added unless asked", () => {
+    expect(build("sol").body.tools).toBeUndefined();
+  });
+  test("only the provider that can draw advertises it", () => {
+    expect(openai.canGenerateImages).toBe(true);
+    expect(anthropic.canGenerateImages).toBeUndefined();
+  });
+  test("the finished image is picked up from every shape the API sends it in", () => {
+    expect(openai.delta({ type: "response.image_generation_call.completed", result: "AAAA", revised_prompt: "a red circle" }))
+      .toEqual({ imageB64: "AAAA", revisedPrompt: "a red circle" });
+    expect(openai.delta({ type: "response.output_item.done", item: { type: "image_generation_call", result: "BBBB" } }))
+      .toEqual({ imageB64: "BBBB", revisedPrompt: undefined });
+    expect(openai.delta({ type: "response.completed", response: { output: [{ type: "image_generation_call", result: "CCCC" }] } }))
+      .toEqual({ imageB64: "CCCC", revisedPrompt: undefined });
+  });
+  test("drawing progress is reported, not silence", () => {
+    expect(openai.delta({ type: "response.image_generation_call.generating" }).progress).toBeTruthy();
+  });
+});
+
+describe("every generation is fresh — no conversation history is ever reused", () => {
+  test("a drawing request carries only this prompt, stores nothing", () => {
+    const b = build("sol", { genImage: true }, [{ role: "user", text: "a red circle" }]);
+    expect(b.body.store).toBe(false);
+    expect(b.body.input.length).toBe(1);
+    expect(b.body.input[0].content[0].text).toBe("a red circle");
+    expect(b.body.previous_response_id).toBeUndefined();
+    expect(b.body.conversation).toBeUndefined();
+  });
+  test("each call gets its own session id, so calls are never threaded together", () => {
+    const a = build("sol", { genImage: true }).headers.session_id;
+    const c2 = build("sol", { genImage: true }).headers.session_id;
+    expect(a).toBeTruthy();
+    expect(a).not.toBe(c2);
+  });
+});
+
+describe("read-aloud — the speech path the subscription really covers", () => {
+  test("only the provider with a ChatGPT account offers it", () => {
+    expect(typeof openai.readAloud).toBe("function");
+    expect(typeof openai.aloudVoices).toBe("function");
+    expect(anthropic.readAloud).toBeUndefined();
+  });
+  test("--aloud implies speech and needs no prompt", () => {
+    const o = parseArgs(["--aloud", "--play"]);
+    expect(o.aloud).toBe(true);
+    expect(o.speak).toBe(true);
+    expect(o.prompt).toEqual([]);
+  });
+  test("a specific message can be picked, and picking one implies --aloud", () => {
+    const o = parseArgs(["--conversation", "c-1", "--message", "m-1", "--voice", "maple"]);
+    expect(o.conversation).toBe("c-1");
+    expect(o.message).toBe("m-1");
+    expect(o.aloud).toBe(true);
+    expect(o.prompt).toEqual([]);        // the ids must not leak into the prompt
+  });
+  test("history is never touched implicitly — bare --aloud refuses and explains", async () => {
+    try {
+      await openai.readAloud!({});
+      throw new Error("should have refused");
+    } catch (e: any) {
+      expect(e.message).toContain("will not");
+      expect(e.message).toContain("--last");
+      expect(e.message).toContain("--local");
+    }
+  });
+  test("--last is the explicit opt-in", () => {
+    expect(parseArgs(["--last"]).last).toBe(true);
+    expect(parseArgs(["--aloud"]).last).toBe(false);
+  });
+  test("plain --speak stays free-text, not read-aloud", () => {
+    expect(parseArgs(["--speak", "hello"]).aloud).toBe(false);
+  });
+  test("the two voice sets are kept apart — product voices are asked for live", () => {
+    // ChatGPT's read-aloud voices (cove, maple, …) are not the API's (alloy, nova, …);
+    // hardcoding either list into the other is the bug this guards.
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    expect(src).toContain("/backend-api/settings/voices");
+    expect(openai.voices).not.toContain("cove");
+  });
+  test("read-aloud goes to the ChatGPT synthesize route, no API key in sight", () => {
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    const fn = src.slice(src.indexOf("async readAloud"), src.indexOf("async aloudVoices"));
+    expect(fn).toContain("/backend-api/synthesize?conversation_id=");
+    expect(fn).toContain("message_id=");
+    expect(fn).not.toContain("process.env.OPENAI_API_KEY");   // mentions it as advice, never reads one
+  });
+});
+
+describe("speech is OpenAI-only and honest about it", () => {
+  test("anthropic offers no speak() at all", () => {
+    expect(anthropic.speak).toBeUndefined();
+  });
+  test("without a key it explains that the subscription does not cover speech", async () => {
+    const prev = { a: process.env.OPENAI_API_KEY, b: process.env.APIPLAN_OPENAI_API_KEY, c: process.env.APIPLAN_TTS_BASE };
+    delete process.env.OPENAI_API_KEY; delete process.env.APIPLAN_OPENAI_API_KEY; delete process.env.APIPLAN_TTS_BASE;
+    try {
+      await openai.speak!({ text: "hi", voice: "alloy", format: "mp3" });
+      throw new Error("should have refused");
+    } catch (e: any) {
+      expect(e.message).toContain("does not cover it");
+      expect(e.message).toContain("OPENAI_API_KEY");
+    } finally {
+      if (prev.a) process.env.OPENAI_API_KEY = prev.a;
+      if (prev.b) process.env.APIPLAN_OPENAI_API_KEY = prev.b;
+      if (prev.c) process.env.APIPLAN_TTS_BASE = prev.c;
+    }
+  });
+  test("no local server is ever auto-detected — only an explicit APIPLAN_TTS_BASE", () => {
+    const src = require("node:fs").readFileSync(new URL("../src/providers.ts", import.meta.url).pathname, "utf8");
+    expect(src).not.toContain("findLocalSpeechServer");
+    expect(src).not.toMatch(/127\.0\.0\.1:88\d\d/);
+  });
+});
+
 describe("stream event mapping", () => {
   test("anthropic text, thinking, served model and errors", () => {
     expect(anthropic.delta({ type: "content_block_delta", delta: { type: "text_delta", text: "hi" } })).toEqual({ text: "hi" });
@@ -125,5 +250,25 @@ describe("argv: a bare sentence is the prompt", () => {
   test("punctuation inside a bare prompt survives parsing", () => {
     const o = parseArgs(["is", "this", "right?", "50%", "sure*"]);
     expect(o.prompt.join(" ")).toBe("is this right? 50% sure*");
+  });
+});
+
+describe("upgrades gain new default commands", () => {
+  test("mergeDefaults adds what is missing and leaves the user's own alone", () => {
+    const C = require("../src/commands.ts");
+    const cfg: any = { version: 1, commands: [{ name: "mine", model: "opus", flags: ["-e", "high"] }] };
+    const added = C.mergeDefaults(cfg);
+    expect(added.length).toBeGreaterThan(0);
+    expect(cfg.commands.find((x: any) => x.name === "mine").flags).toEqual(["-e", "high"]);
+    expect(C.mergeDefaults(cfg)).toEqual([]);          // idempotent
+  });
+  test("a default the user removed is never resurrected", () => {
+    const C = require("../src/commands.ts");
+    const cfg: any = { version: 1, commands: C.defaults() };
+    const victim = cfg.commands.find((x: any) => x.name === "opus-fast");
+    if (!victim) return;                                // platform without it
+    C.remove(cfg, "opus-fast");
+    expect(cfg.removed).toContain("opus-fast");
+    expect(C.mergeDefaults(cfg)).not.toContain("opus-fast");
   });
 });

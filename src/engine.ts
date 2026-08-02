@@ -5,14 +5,14 @@
 //   · nothing on the hot path touches the network except the one call itself
 //   · the daemon holds the token AND a kept-alive TLS connection, so repeat calls
 //     skip both the credential read and the handshake
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
-import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, IS_WIN } from "./platform.ts";
+import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, speakLocally, playAudio, IS_WIN } from "./platform.ts";
 import { models, resolve, type Model } from "./registry.ts";
 import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
 
 export const START = performance.now();
-export const VERSION = "0.2.3";
+export const VERSION = "0.3.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the
@@ -41,11 +41,15 @@ export type Opts = CallOpts & {
   dryRun: boolean; verbose: boolean; help: boolean; version: boolean;
   daemon: boolean; daemonStop: boolean; noDaemon: boolean;
   thinking?: number; systemFile?: string;
+  /** non-text jobs */
+  out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
+  aloud: boolean; conversation?: string; message?: string; last: boolean;
 };
 
 /** Flags that consume the next argv item (so it is never mistaken for prompt text). */
 const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
-  "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image"]);
+  "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image",
+  "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -57,6 +61,7 @@ export function parseArgs(argv: string[], model0?: string): Opts {
     model: model0, images: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
     dryRun: false, verbose: false, help: false, version: false,
     daemon: false, daemonStop: false, noDaemon: false,
+    speak: false, play: false, local: false, aloud: false, last: false,
   };
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -76,6 +81,19 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--thinking": { const v = val(); o.thinking = v === "off" ? 0 : +v; if (o.thinking <= 0) o.thinkOff = true; break; }
       case "--loop": o.loop = Math.max(1, +val() || 1); break;
       case "-i": case "--image": o.images.push(val()); break;
+      case "-o": case "--out": o.out = val(); break;
+      case "--draw": case "--gen-image": case "--image-out": o.genImage = true; break;
+      case "--size": o.imageSize = val(); break;
+      case "--quality": o.imageQuality = val(); break;
+      case "--speak": case "--say": o.speak = true; break;
+      case "--voice": o.voice = val(); break;
+      case "--format": o.audioFormat = val(); break;
+      case "--play": o.play = true; break;
+      case "--local": o.local = true; o.speak = true; break;
+      case "--aloud": case "--read-aloud": o.aloud = true; o.speak = true; break;
+      case "--last": o.last = true; o.aloud = true; o.speak = true; break;
+      case "--conversation": o.conversation = val(); o.aloud = true; o.speak = true; break;
+      case "--message": o.message = val(); o.aloud = true; o.speak = true; break;
       case "--stream": o.stream = true; break;
       case "--no-stream": o.stream = false; break;
       case "--chat": o.chat = true; break;
@@ -147,7 +165,7 @@ export function redact(o: any): any {
 }
 
 // ───────────────────────────── streaming ─────────────────────────────
-export type StreamResult = { text: string; ttft: number; served?: string };
+export type StreamResult = { text: string; ttft: number; served?: string; imagePath?: string };
 
 /** Consume an SSE body through the provider's event mapper. */
 export async function consume(p: Provider, body: ReadableStream<Uint8Array> | null, status: number, retryAfter: string | null, o: Opts): Promise<StreamResult> {
@@ -160,7 +178,7 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
   }
   const reader = body.getReader();
   const dec = new TextDecoder();
-  let buf = "", text = "", ttft = 0, served = "";
+  let buf = "", text = "", ttft = 0, served = "", imageB64 = "", revised = "", lastProgress = "";
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -177,16 +195,25 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
         const d = p.delta(ev);
         if (d.error) die(`stream error: ${d.error}`);
         if (d.served && !served) served = d.served;
+        if (d.imageB64) imageB64 = d.imageB64;
+        if (d.revisedPrompt) revised = d.revisedPrompt;
+        if (d.progress && d.progress !== lastProgress && process.stderr.isTTY) {
+          lastProgress = d.progress;                      // a drawing call is slow; show life
+          process.stderr.write(`\r\x1b[2m${d.progress}\x1b[0m\x1b[K`);
+        }
         if (d.text) { if (!ttft) ttft = performance.now() - START; text += d.text; if (o.stream) process.stdout.write(d.text); }
         if (d.reasoning && o.showThinking) process.stderr.write(d.reasoning);
       }
     }
   }
+  if (lastProgress && process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+  let imagePath: string | undefined;
+  if (imageB64) imagePath = saveImage(imageB64, o.out, revised);
   if (o.stream) process.stdout.write("\n");
   else if (text) process.stdout.write(text.replace(/\n?$/, "\n"));
   reportTiming();
   if (o.verbose) process.stderr.write(`[apiplan] ${served ? `served by ${served} · ` : ""}first token ${(ttft || 0).toFixed(0)}ms · total ${(performance.now() - START).toFixed(0)}ms\n`);
-  return { text, ttft, served };
+  return { text, ttft, served, imagePath };
 }
 function surface(status: number, msg: string, retryAfter?: string | null): never {
   if (status === 401 || status === 403) die(`auth rejected (${status}): ${msg}\n  → the login may be stale (run \`claude\` / \`codex\`), or the provider contract changed.`, 3);
@@ -215,6 +242,78 @@ export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void
     const r = await consume(p, res.body, res.status, res.headers.get("retry-after"), { ...o, stream: o.stream && last, verbose: o.verbose && last });
     if (!last) convo = [...convo, { role: "assistant", text: r.text }];
   }
+}
+
+/**
+ * Write a generated image next to the user, not into a temp dir they'll never find.
+ * Path goes to stdout when it is the whole answer, so `imagine … | xargs open` works;
+ * the human-facing note goes to stderr so pipes stay clean.
+ */
+export function saveImage(b64: string, out: string | undefined, revised: string): string {
+  const bytes = Buffer.from(b64, "base64");
+  const ext = bytes[0] === 0x89 ? "png" : bytes[0] === 0xff ? "jpg" : bytes[0] === 0x52 ? "webp" : "png";
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "").replace("T", "-");
+  const path = out ?? `apiplan-${stamp}.${ext}`;
+  writeFileSync(path, bytes);
+  const kb = Math.round(bytes.length / 1024);
+  process.stderr.write(`\x1b[2m${revised ? `prompt used: ${revised.slice(0, 120)}\n` : ""}\x1b[0mimage saved: ${path} (${kb}KB)\n`);
+  return path;
+}
+
+/** The speech path: one request, binary back — no SSE, no daemon. */
+export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> {
+  // Read-aloud speaks a message that already exists in the account, so unlike every
+  // other speech path it needs no prompt — the text comes from the conversation.
+  if (o.aloud) return runAloud(m, o);
+  if (!text.trim()) die("nothing to say — give me some text, or pipe it in.");
+  if (o.local) {
+    const tool = speakLocally(text);
+    if (!tool) die("no local voice available (macOS `say`, Linux `spd-say`/`espeak`, Windows SAPI).");
+    if (o.verbose) process.stderr.write(`[apiplan] spoke locally via ${tool}\n`);
+    return;
+  }
+  const p = providerFor(m);
+  if (!p.speak) die(`${p.label} offers no speech here — try --local for the operating system voice.`);
+  const fmt = o.audioFormat ?? "mp3";
+  // Ask the BACKEND what it serves: a local neural server has its own voice names, and
+  // validating those against OpenAI's static list rejects every one of them.
+  const live = p.listVoices ? await p.listVoices() : { backend: "", voices: p.voices ?? [] };
+  const voice = o.voice ?? (live.voices.includes("alloy") ? "alloy" : live.voices[0] ?? "alloy");
+  if (live.voices.length && !live.voices.includes(voice)) {
+    die(`unknown voice '${voice}' for ${live.backend || "this backend"}.\n  available: ${live.voices.slice(0, 24).join(", ")}${live.voices.length > 24 ? ` … (${live.voices.length} total — \`apiplan voices\`)` : ""}`);
+  }
+  const { bytes } = await p.speak({ text, voice, format: fmt });
+  deliverAudio(bytes, fmt, `voice ${voice}${live.backend && !live.backend.includes("api.openai") ? ` via ${live.backend}` : ""}`, o);
+}
+
+/**
+ * ChatGPT's own read-aloud, on the subscription. Speaks a message already in the
+ * account (newest reply by default) in the real product voices.
+ */
+async function runAloud(m: Model, o: Opts): Promise<void> {
+  const p = providerFor(m);
+  if (!p.readAloud) die(`${p.label} has no read-aloud — that is a ChatGPT feature (try an OpenAI model: sol / gpt).`);
+  const fmt = o.audioFormat ?? "aac";
+  if (o.voice && p.aloudVoices) {
+    const { voices } = await p.aloudVoices();
+    if (voices.length && !voices.includes(o.voice)) die(`unknown read-aloud voice '${o.voice}'.\n  available: ${voices.join(", ")}`);
+  }
+  const { bytes, spoke, voice } = await p.readAloud({ conversation: o.conversation, message: o.message, voice: o.voice, format: fmt, last: o.last });
+  if (spoke) process.stderr.write(`\x1b[2m“${spoke.slice(0, 140).replace(/\s+/g, " ")}${spoke.length > 140 ? "…" : ""}”\x1b[0m\n`);
+  deliverAudio(bytes, fmt, `ChatGPT voice ${voice}, on the subscription`, o);
+}
+
+/** Every speech path ends the same way: write it, optionally play it, print the path. */
+function deliverAudio(bytes: Uint8Array, fmt: string, note: string, o: Opts): void {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "").replace("T", "-");
+  const path = o.out ?? `apiplan-${stamp}.${fmt}`;
+  writeFileSync(path, bytes);
+  process.stderr.write(`audio saved: ${path} (${Math.round(bytes.length / 1024)}KB, ${note})\n`);
+  if (o.play) {
+    const tool = playAudio(path);
+    process.stderr.write(tool ? `\x1b[2mplayed with ${tool}\x1b[0m\n` : `\x1b[2mno audio player found — open ${path} yourself\x1b[0m\n`);
+  }
+  if (!process.stdout.isTTY) process.stdout.write(path + "\n");   // pipeable
 }
 
 // ───────────────────────────── warm daemon ─────────────────────────────
