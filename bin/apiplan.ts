@@ -348,6 +348,7 @@ USAGE
   apiplan doctor                 diagnose PATH, logins, daemon, shadowed names
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
+  apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
   apiplan path                   print the line that puts commands on your PATH
   apiplan shell-init [shell]     shell glue so ? and * in a prompt need no quotes
                                  ${dim(`add to your rc:  eval "$(apiplan shell-init)"`)}
@@ -452,6 +453,19 @@ switch (sub) {
     break;
   }
   case "doctor": await cmdDoctor(); break;
+  case "serve": {
+    const { serve } = await import("../src/api.ts");
+    const s = serve({ port: valOf("--port") ? Number(valOf("--port")) : undefined, host: valOf("--host") ?? undefined });
+    process.stdout.write(`${bold("apiplan api")} ${dim("v" + VERSION)} listening on ${key(s.url)}\n\n`);
+    process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
+    process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
+    process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
+    process.stdout.write(dim(`  GET  /v1/models · /health\n`));
+    process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
+    if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_API_KEY to require a key\n`));
+    await new Promise(() => {});
+    break;
+  }
   case "daemon": {
     if (argv[1] === "stop") process.stdout.write((await daemonStop()) ? "daemon stopped\n" : "daemon not running\n");
     else await runDaemon();

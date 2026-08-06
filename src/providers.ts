@@ -306,7 +306,10 @@ export const openai: Provider = {
       stream: true,
     };
     if (o.effort) body.reasoning = { effort: o.effort, ...(o.showThinking ? { summary: "auto" } : {}) };
-    if (o.maxTokens) body.max_output_tokens = o.maxTokens;
+    // No max_output_tokens: the codex backend rejects it outright with
+    // "Unsupported parameter: max_output_tokens" (400). Sending it broke every call
+    // that carried a length cap — including any API client that sets max_tokens by
+    // default, which is most of them.
     // Drawing runs as a built-in tool on the SAME subscription endpoint as chat —
     // verified live: the backend returns base64 in an image_generation_call.
     if (o.genImage) {

@@ -1,6 +1,6 @@
 {
   "name": "apiplan",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Call frontier models from your shell using the Claude Code and Codex subscriptions you already have — one command per model, pipeable, image-capable, with a warm daemon.",
   "license": "MIT",
   "author": "fire17",

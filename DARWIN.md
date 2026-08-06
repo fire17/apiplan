@@ -535,3 +535,42 @@ took a user asking "can we do emotions?" to notice that our own default forbade 
 
 **Degradation check:** 122 tests pass, up from 118; four new ones pin that a direction
 never leaks into the spoken words and that verbatim stays verbatim without `--as`.
+
+## Round 21 — the same models, in everyone else's shape
+
+`apiplan serve` puts an OpenAI- and Anthropic-shaped API on localhost, so any SDK, agent
+framework or app answers from the subscription by changing one base URL.
+
+The design decision that makes it worth having: **the dialect and the backend are
+independent.** The path decides the response shape, the `model` field decides who
+answers. `/v1/chat/completions` with `model: "opus"` returns Claude in OpenAI's format —
+which matters because most tooling speaks exactly one dialect, and this makes every model
+reachable from all of it.
+
+Built entirely from what was already exported — `build()`, `delta()`, `creds()`,
+`resolve()` — plus `Bun.serve`. No new dependency; the whole server is translation.
+
+`consume()` was deliberately NOT reused: it writes to stdout and calls `die()`, so a bad
+upstream response would have taken the server process down with it. A separate 25-line
+reader was the smaller and safer answer.
+
+**Two real bugs it surfaced:**
+- Anthropic answered with an *empty* string. `build()` leaves `stream` to the caller and
+  the CLI sets it at call time; without it Anthropic returns a plain JSON body, which the
+  SSE reader parsed as zero events. Silent, not an error.
+- **`--max-tokens` was broken on every OpenAI model** — and had been. The codex backend
+  rejects `max_output_tokens` outright (400 `Unsupported parameter`), so any call with a
+  length cap failed. Nobody noticed from the CLI because you rarely pass it; every API
+  client sets it by default, so the server hit it immediately. Fixed at the root by not
+  sending the parameter, and the CLI now says the flag is ignored there rather than
+  dropping it silently.
+
+**Verified with the real SDKs**, not curl: `openai` and `@anthropic-ai/sdk` installed
+fresh, both dialects, both directions (Claude through OpenAI's SDK, GPT through
+Anthropic's), streaming on both, plus `audio.speech.create` and `images.generate`.
+
+Loopback-bound by default, with an optional `APIPLAN_API_KEY` enforced on both vendors'
+auth headers — it hands out a subscription to anything that can reach it.
+
+**Degradation check:** 134 tests pass, up from 122; 12 new ones cover the dialect
+routing, both error envelopes, auth and the loopback default.

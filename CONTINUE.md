@@ -7,7 +7,7 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.5.0, honest)
+## Current state (v0.6.0, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
@@ -19,7 +19,7 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
 - Pipes both ways, `--chat` multi-turn (remembers across turns), images from file/URL/
   data:/stdin/clipboard, `--loop`, `--dry-run`, effort per provider-advertised levels.
 - 13 global commands installed in `~/.bun/bin`; `apiplan doctor` reports **all clear**.
-- 122 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
+- 134 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
 - **Making things, all on the subscription, no API key** (added 2026-08-02):
   `imagine` draws (image_generation tool on the same codex endpoint; `--raw` sends your
   prompt character-for-character, default `--enhance` lets the model rewrite it, which is
@@ -42,6 +42,12 @@ loopback-TCP daemon (including its 403 without a token) are tested — but no pr
 executed on either OS. **This is the single biggest open item.** The WSL box (`magic-wsl`)
 was reachable in Tailscale but SSH did not answer.
 
+- **`apiplan serve`** (added 2026-08-07): a local server speaking OpenAI's *and*
+  Anthropic's wire shapes, so any SDK/app can swap its base URL to localhost. Path picks
+  the response shape, `model` picks the backend — Claude via `/v1/chat/completions` works,
+  which is the point. Verified against the official `openai` and `@anthropic-ai/sdk`
+  packages, both directions, streaming included. Loopback-only by default.
+
 ## Layout
 
 ```
@@ -53,6 +59,7 @@ src/providers.ts  per-vendor credential/endpoint/request/stream behind one inter
 src/engine.ts     argv · images · SSE · warm daemon · self-timing
 src/platform.ts   every macOS/Linux/WSL/Windows difference, in one file
 src/commands.ts   ~/.apiplan/commands.json ⇄ the shims on PATH
+src/api.ts        the local OpenAI/Anthropic-shaped server (`apiplan serve`)
 test/ bench/      80 tests · the budget harness with regression detection
 ```
 

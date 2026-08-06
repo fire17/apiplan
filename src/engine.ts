@@ -12,7 +12,7 @@ import { models, resolve, type Model } from "./registry.ts";
 import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
 
 export const START = performance.now();
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the

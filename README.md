@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-122%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-134%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -264,6 +264,47 @@ eval "$(apiplan shell-init)"     # add to ~/.zshrc
 bash, cmd.exe and PowerShell already pass them through, and `apiplan shell-init` tells
 you so instead of adding aliases you don't need.
 
+## Point any SDK at localhost
+
+`apiplan serve` runs a local server that speaks **OpenAI's and Anthropic's wire shapes
+exactly**. Swap the base URL and existing code answers from your subscription — no key,
+no per-token bill, nothing else changed.
+
+```sh
+apiplan serve                    # http://127.0.0.1:8787
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(api_key="not-needed", base_url="http://127.0.0.1:8787/v1")
+client.chat.completions.create(model="opus", messages=[...])   # Claude, in OpenAI's shape
+```
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+```
+
+**The dialect and the backend are independent.** The path decides the response *shape*;
+the `model` field decides *who answers*. So `/v1/chat/completions` with `model: "opus"`
+gives you Claude in OpenAI's format — which matters because most tooling only speaks one
+dialect, and now every model reaches all of it.
+
+| endpoint | shape |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI chat, streaming and not |
+| `POST /v1/messages` | Anthropic messages, streaming and not |
+| `POST /v1/audio/speech` | OpenAI speech — `instructions` steers delivery, like `--as` |
+| `POST /v1/images/generations` | OpenAI images, `b64_json` |
+| `GET /v1/models` | both shapes; the caller's auth header picks which |
+
+Verified against the **official `openai` and `@anthropic-ai/sdk` packages**, both
+directions, streaming included — not just curl.
+
+It binds `127.0.0.1` only, because it hands out your subscription to anything that can
+reach it. Set `APIPLAN_API_KEY` to require a key (enforced on `Authorization` *and*
+`x-api-key`), `--port` / `--host` to move it.
+
 ## Make your own commands
 
 Commands are data, not code. `~/.apiplan/commands.json` is the source of truth and the
@@ -373,7 +414,7 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 122 tests: aliases, wire contracts, CLI, installer, platform layer
+bun test                  # 134 tests: aliases, wire contracts, CLI, installer, platform layer
 bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
 ```
 

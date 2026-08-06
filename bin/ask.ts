@@ -84,6 +84,10 @@ const model = resolveModelOrDie(o.model);
 if (o.genImage && !providerFor(model).canGenerateImages) {
   die(`${model.label} cannot generate images — use an OpenAI model (sol / gpt / luna / terra).`);
 }
+// Silently dropping a flag is worse than not having it: say so once, then continue.
+if (o.maxTokens && model.provider === "openai") {
+  process.stderr.write(`\x1b[2mnote: ${model.label} has no length cap — its endpoint rejects max_output_tokens, so --max-tokens is ignored.\x1b[0m\n`);
+}
 if (o.effort) {
   const ok = providerFor(model).efforts(model);
   if (!ok.includes(o.effort)) die(`effort '${o.effort}' is not available on ${model.label}; valid: ${ok.join(", ")}`);
