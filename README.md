@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-152%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-156%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -360,6 +360,10 @@ dialect, and now every model reaches all of it.
 | `POST /v1/audio/speech` | OpenAI speech — `instructions` steers delivery, like `--as` |
 | `POST /v1/images/generations` | OpenAI images, `b64_json` |
 | `GET /v1/models` | both shapes; the caller's auth header picks which |
+
+Every model is reachable from either shape, **including jimmy** — `model: "jimmy"` or
+`model: "llama3.1-8B"` on `/v1/chat/completions` or `/v1/messages`. It needs no
+credential, so it keeps answering through the API even when nothing is logged in.
 
 Verified against the **official `openai` and `@anthropic-ai/sdk` packages**, both
 directions, streaming included — not just curl.

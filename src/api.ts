@@ -9,6 +9,39 @@
 import { PROVIDERS, providerFor, speakRealtime, type Delta, type ImageRef, type Turn, type CallOpts } from "./providers.ts";
 import { models, resolve, type Model } from "./registry.ts";
 
+/**
+ * chatjimmy.ai is reachable here too, but it is not an apiplan *provider*: it needs no
+ * credential and streams raw text rather than SSE, so it lives as a special case in this
+ * file instead of distorting the Provider interface for one endpoint.
+ */
+const JIMMY_API = process.env.JIMMY_API ?? "https://chatjimmy.ai";
+const JIMMY_MODEL = process.env.JIMMY_MODEL ?? "llama3.1-8B";
+const JIMMY_ALIASES = new Set([JIMMY_MODEL.toLowerCase(), "jimmy", "chatjimmy"]);
+const JIMMY_STATS = /<\|stats\|>([\s\S]*?)<\|\/stats\|>/;
+const isJimmy = (name: unknown) => typeof name === "string" && JIMMY_ALIASES.has(name.toLowerCase());
+
+async function* runJimmy(turns: Turn[]): AsyncGenerator<Delta> {
+  const messages = turns.map((t) => ({ role: t.role, content: t.text }));
+  const res = await fetch(`${JIMMY_API}/api/chat`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages, chatOptions: { selectedModel: JIMMY_MODEL } }),
+  });
+  if (!res.ok || !res.body) throw new HttpError(res.status, (await res.text()).slice(0, 300));
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let raw = "", shown = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    raw += dec.decode(value, { stream: true });
+    // Hold back a tail that might be the start of the trailing telemetry sentinel.
+    const safe = raw.includes("<|stats|>") ? raw.slice(0, raw.indexOf("<|stats|>")) : raw.slice(0, Math.max(0, raw.length - 16));
+    if (safe.length > shown) { yield { text: safe.slice(shown) }; shown = safe.length; }
+  }
+  const full = raw.replace(JIMMY_STATS, "");
+  if (full.length > shown) yield { text: full.slice(shown) };
+}
+
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 
@@ -154,24 +187,27 @@ function streamResponse(gen: () => AsyncGenerator<string>): Response {
 }
 
 async function openaiChat(body: any): Promise<Response> {
-  const m = pick(body?.model);
+  const jimmy = isJimmy(body?.model);
+  const m = jimmy ? null : pick(body?.model);
   const { turns, system } = fromOpenAI(body);
   const o = optsFrom(body, system);
+  const gen = () => (jimmy ? runJimmy(turns) : run(m!, turns, o));
+  const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = rid("chatcmpl"), created = now();
 
   if (!body?.stream) {
     let text = "";
-    for await (const d of run(m, turns, o)) text += d.text ?? "";
+    for await (const d of gen()) text += d.text ?? "";
     return json({
-      id, object: "chat.completion", created, model: m.id,
+      id, object: "chat.completion", created, model: id0,
       choices: [{ index: 0, message: { role: "assistant", content: text }, logprobs: null, finish_reason: "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   }
   return streamResponse(async function* () {
-    const head = { id, object: "chat.completion.chunk", created, model: m.id };
+    const head = { id, object: "chat.completion.chunk", created, model: id0 };
     yield sse({ ...head, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
-    for await (const d of run(m, turns, o)) {
+    for await (const d of gen()) {
       if (d.text) yield sse({ ...head, choices: [{ index: 0, delta: { content: d.text }, finish_reason: null }] });
     }
     yield sse({ ...head, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
@@ -180,26 +216,29 @@ async function openaiChat(body: any): Promise<Response> {
 }
 
 async function anthropicMessages(body: any): Promise<Response> {
-  const m = pick(body?.model);
+  const jimmy = isJimmy(body?.model);
+  const m = jimmy ? null : pick(body?.model);
   const { turns, system } = fromAnthropic(body);
   const o = optsFrom(body, system);
+  const gen = () => (jimmy ? runJimmy(turns) : run(m!, turns, o));
+  const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = rid("msg");
 
   if (!body?.stream) {
     let text = "";
-    for await (const d of run(m, turns, o)) text += d.text ?? "";
+    for await (const d of gen()) text += d.text ?? "";
     return json({
-      id, type: "message", role: "assistant", model: m.id,
+      id, type: "message", role: "assistant", model: id0,
       content: [{ type: "text", text }],
       stop_reason: "end_turn", stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 },
     });
   }
   return streamResponse(async function* () {
-    const msg = { id, type: "message", role: "assistant", model: m.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } };
+    const msg = { id, type: "message", role: "assistant", model: id0, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } };
     yield sse({ type: "message_start", message: msg }, "message_start");
     yield sse({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, "content_block_start");
-    for await (const d of run(m, turns, o)) {
+    for await (const d of gen()) {
       if (d.text) yield sse({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: d.text } }, "content_block_delta");
     }
     yield sse({ type: "content_block_stop", index: 0 }, "content_block_stop");
@@ -210,7 +249,7 @@ async function anthropicMessages(body: any): Promise<Response> {
 
 /** Both vendors serve GET /v1/models; the shapes differ, so answer by dialect. */
 function listModels(dialect: "openai" | "anthropic"): Response {
-  const all = models();
+  const all = [...models(), { id: JIMMY_MODEL, label: `${JIMMY_MODEL} on chatjimmy.ai`, provider: "jimmy" } as any];
   if (dialect === "anthropic") {
     return json({ data: all.map((m) => ({ type: "model", id: m.id, display_name: m.label, created_at: new Date(0).toISOString() })), has_more: false, first_id: all[0]?.id ?? null, last_id: all.at(-1)?.id ?? null });
   }

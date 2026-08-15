@@ -153,3 +153,30 @@ describe("chat mode opens only when there is a human at the terminal", () => {
     }
   });
 });
+
+describe("chatjimmy is reachable through both dialects too", () => {
+  test("it is advertised in the model list", async () => {
+    const j: any = await (await fetch(base + "/v1/models")).json();
+    const jimmy = j.data.find((m: any) => m.owned_by === "jimmy");
+    expect(jimmy).toBeTruthy();
+    expect(jimmy.id).toBe("llama3.1-8B");
+  });
+  test("the alias and the wire id both route there, and are not treated as unknown models", () => {
+    const src = readSrc("api.ts");
+    expect(src).toContain('"jimmy"');
+    expect(src).toContain('"chatjimmy"');
+    // It must bypass pick(), which only knows credentialed providers.
+    expect(src).toContain("const jimmy = isJimmy(body?.model)");
+  });
+  test("its telemetry sentinel never leaks into an API response", () => {
+    const src = readSrc("api.ts");
+    const fn = src.slice(src.indexOf("async function* runJimmy"), src.indexOf("const now ="));
+    expect(fn).toContain("<|stats|>");        // held back while streaming
+    expect(fn).toContain("JIMMY_STATS");      // and stripped from the final text
+  });
+  test("it needs no credential, so it works when nothing is logged in", () => {
+    const fn = readSrc("api.ts");
+    const body = fn.slice(fn.indexOf("async function* runJimmy"), fn.indexOf("const now ="));
+    expect(body).not.toContain("creds()");
+  });
+});
