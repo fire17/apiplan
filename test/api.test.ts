@@ -5,6 +5,9 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 import { serve } from "../src/api.ts";
 
+const readSrc = (name: string) =>
+  require("node:fs").readFileSync(new URL(`../src/${name}`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
+
 let base = "";
 let stop = () => {};
 beforeAll(() => {
@@ -121,5 +124,32 @@ describe("optional-value flags don't swallow the next flag", () => {
     // --flags carries values that legitimately start with "-", so it must NOT use optVal
     expect(src).toContain('valOf("--flags")');
     expect(src).not.toContain('optVal("--flags")');
+  });
+});
+
+describe("chat mode opens only when there is a human at the terminal", () => {
+  test("the chat backend contract is what both CLIs implement", async () => {
+    const { chat } = await import("../src/chat.ts");
+    expect(typeof chat).toBe("function");
+    const src = readSrc("chat.ts");
+    // A chat needs scrollback and copy-paste, so it must never take the alternate screen.
+    expect(src).not.toContain("?1049h");
+    expect(src).toContain('from "node:readline"');   // stdlib, so zero-deps survives
+  });
+  test("both entry points fall back to the old error when not a TTY", () => {
+    for (const f of ["ask.ts", "jimmy.ts"]) {
+      const src = require("node:fs").readFileSync(new URL(`../bin/${f}`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
+      expect(src).toContain("process.stdin.isTTY && process.stdout.isTTY");
+      expect(src).toContain("no prompt");
+    }
+  });
+  test("a failed turn is dropped from history rather than poisoning later turns", () => {
+    expect(readSrc("chat.ts")).toContain("turns.pop()");
+  });
+  test("every slash command in the help actually exists", () => {
+    const src = readSrc("chat.ts");
+    for (const c of ["clear", "system", "retry", "copy", "help", "exit"]) {
+      expect(src).toContain(`case "${c}"`);
+    }
   });
 });

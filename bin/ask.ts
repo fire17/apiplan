@@ -106,6 +106,17 @@ if (o.speak) {
 
 const turns = await buildTurns(o);
 if (!turns.length) {
+  // No prompt and a real terminal means you want to talk, not to be told off.
+  // Piped/scripted use still gets the help + error, so nothing automated changes.
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    const { chat } = await import("../src/chat.ts");
+    const { streamReply } = await import("../src/engine.ts");
+    await chat({
+      label: `${model.label}  (${model.id})`,
+      send: (t, onText, signal) => streamReply(model, t.map((x) => ({ role: x.role, text: x.content })), o, onText, signal),
+    }, { system: o.system });
+    process.exit(0);
+  }
   process.stdout.write(help(invoked, model) + "\n");
   die("no prompt — type it after the command, or pipe it in.", 1);
 }

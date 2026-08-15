@@ -153,6 +153,38 @@ function readStdin(): Promise<string> {
 const piped = await readStdin();
 const prompt = [words.join(" "), piped.trim()].filter(Boolean).join("\n\n");
 if (!prompt) {
+  // A bare `jimmy` on a real terminal opens a conversation; scripts still get the error.
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    const { chat } = await import("../src/chat.ts");
+    let lastStats: any = null;
+    await chat({
+      label: `${MODEL} on chatjimmy.ai`,
+      note: () => lastStats ? `${Math.round(lastStats.decode_rate)} tok/s · server TTFT ${(lastStats.ttft * 1000).toFixed(2)}ms` : undefined,
+      async send(turns, onText, signal) {
+        const body = JSON.stringify({ messages: turns, chatOptions: { selectedModel: MODEL } });
+        const r = (await viaDaemon(body)) ?? (await fetch(`${API}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body, signal }));
+        if (!r.ok || !r.body) throw new Error(`${API} answered ${r.status}: ${(await r.text()).slice(0, 200)}`);
+        const rd = r.body.getReader(), d = new TextDecoder();
+        let raw = "", shown = 0;
+        while (true) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          if (signal.aborted) { rd.cancel().catch(() => {}); break; }
+          raw += d.decode(value, { stream: true });
+          // Print only what is certainly not part of the trailing stats sentinel.
+          const safe = raw.includes("<|stats|>") ? raw.slice(0, raw.indexOf("<|stats|>")) : raw.slice(0, Math.max(0, raw.length - 16));
+          if (safe.length > shown) { onText(safe.slice(shown)); shown = safe.length; }
+        }
+        const m2 = raw.match(STATS);
+        lastStats = null;
+        try { lastStats = m2 ? JSON.parse(m2[1]) : null; } catch {}
+        const full = raw.replace(STATS, "");
+        if (full.length > shown) onText(full.slice(shown));
+        return full;
+      },
+    }, { system });
+    process.exit(0);
+  }
   process.stderr.write("jimmy: no prompt — type it after the command, or pipe it in.\n");
   process.exit(1);
 }

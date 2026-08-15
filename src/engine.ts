@@ -231,6 +231,44 @@ function surface(status: number, msg: string, retryAfter?: string | null): never
 // ───────────────────────────── the call ─────────────────────────────
 const REFINE = "Review your previous answer, correct any mistakes, and output only the improved final answer.";
 
+/**
+ * One streamed reply, delivered through a callback instead of stdout — what the
+ * interactive chat needs. Kept separate from callDirect(), which owns the CLI's
+ * printing, timing and exit behaviour and would fight a REPL for the terminal.
+ */
+export async function streamReply(
+  m: Model, turns: Turn[], o: Opts, onText: (t: string) => void, signal?: AbortSignal,
+): Promise<string> {
+  const p = providerFor(m);
+  const b = p.build(m, turns, o, p.creds());
+  const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }), signal });
+  if (!res.ok || !res.body) {
+    let detail = (await res.text()).slice(0, 300);
+    try { const j = JSON.parse(detail); detail = j?.error?.message ?? detail; } catch {}
+    throw new Error(`${m.label} answered ${res.status}: ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", all = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let ev: any; try { ev = JSON.parse(payload); } catch { continue }
+      const d = p.delta(ev);
+      if (d.error) throw new Error(d.error);
+      if (d.text) { all += d.text; onText(d.text); }
+    }
+  }
+  return all;
+}
+
 export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void> {
   const p = providerFor(m);
   const creds = o.dryRun ? { token: "<token>", account: "<account>", source: "dry-run" } : p.creds();

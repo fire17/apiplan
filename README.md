@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-134%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-152%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -168,6 +168,35 @@ opus --help                          # every flag, one screen
 
 `*-fast` twins (`opus-fast`, `sol-fast`, …) bake in the least reasoning the provider
 allows plus streaming, for the quickest possible first token.
+
+### Just type the command to chat
+
+Run any of them with no prompt and you get a conversation instead of an error:
+
+```console
+$ opus
+Claude Opus 5  (claude-opus-5) · /help for commands, /exit to leave
+
+› my name is Tami, remember it
+Got it — your name is Tami.
+
+› what is my name?
+Your name is Tami.
+```
+
+```
+/clear      forget the conversation so far
+/system …   set a system prompt for the rest of the session
+/retry      ask again, same prompt
+/copy       copy the last reply to the clipboard
+/exit       leave  (Ctrl-D, or Ctrl-C twice)
+```
+
+Ctrl-C stops a reply mid-stream without leaving the session. It streams **inline**
+rather than taking over the screen, so scrollback, selection and copy-paste all keep
+working — and it is built on `node:readline`, so history and line editing come from the
+standard library and the zero-dependency promise survives. Piped or scripted use is
+unchanged: no TTY still means the old help-and-exit.
 
 ### Pictures and speech
 
