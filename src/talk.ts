@@ -20,6 +20,9 @@ export type TalkOpts = {
   /** Let your voice cut the model off mid-sentence. Needs headphones — on speakers the
    *  model hears itself through the microphone and interrupts itself forever. */
   barge?: boolean;
+  /** Phrases that end the call. When your transcribed turn contains one (as a whole
+   *  word), the model says a short goodbye and the conversation closes. Default off. */
+  hangup?: string[];
   onEvent?: (kind: "you" | "model" | "info", text: string) => void;
 };
 
@@ -46,6 +49,17 @@ export async function talk(o: TalkOpts = {}): Promise<void> {
     if (replyTimer) { clearTimeout(replyTimer); replyTimer = null; }
     if (pendingReply) { say("model", pendingReply); pendingReply = null; }
   };
+
+  // A whole-word match against the hangup phrases, punctuation-insensitive, so "Okay,
+  // bye!" ends the call but "goodbyes are hard" (contains "goodbye"? no — word boundary)
+  // and "combine" (contains "bye"? no — word boundary) do not.
+  const hangupWords = (o.hangup ?? []).map((p) => p.toLowerCase().trim()).filter(Boolean);
+  const isHangup = (text: string) => {
+    const norm = ` ${text.toLowerCase().replace(/[^a-z ]+/g, " ").replace(/\s+/g, " ").trim()} `;
+    return hangupWords.some((p) => norm.includes(` ${p} `));
+  };
+  let closing = false;
+  let firstAudioReported = false;
 
   let greeted = false;
   // Audio arrives far faster than it plays, so "the model stopped generating" is NOT
@@ -154,10 +168,24 @@ export async function talk(o: TalkOpts = {}): Promise<void> {
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
           flushReply();
+          if (!closing && ev.transcript && isHangup(ev.transcript)) {
+            closing = true;
+            say("info", "heard a goodbye — closing after the reply");
+            // Let it sign off in its own voice, then the response.done below hangs up.
+            ws.send(JSON.stringify({ type: "response.create",
+              response: { instructions: "The person is ending the call. Say a brief, warm goodbye in one short sentence and nothing else." } }));
+          }
           break;
         case "response.output_audio.delta":
         case "response.audio.delta":
           if (ev.delta) {
+            // First audible byte: report latency from an externally-supplied start
+            // stamp (LX_T0_MS), so a launcher can measure call → first spoken word.
+            if (!firstAudioReported) {
+              firstAudioReported = true;
+              const t0 = Number(process.env.LX_T0_MS);
+              if (t0 > 0) say("info", `first word in ${Date.now() - t0}ms`);
+            }
             speaking = true;
             if (!player) startPlayer();
             // flush(): Bun's stdin is a buffered sink, so without it the audio sits in
@@ -177,6 +205,10 @@ export async function talk(o: TalkOpts = {}): Promise<void> {
         case "response.done":
           speaking = false;
           endPlayer();
+          if (closing) {
+            // Give the queued goodbye audio time to drain out of the speaker, then hang up.
+            setTimeout(() => { say("info", "goodbye — call ended"); close(); resolve(); }, Math.max(0, playingUntil - Date.now()) + 400);
+          }
           break;
         case "error":
           say("info", `error: ${ev.error?.message ?? "unknown"}`);

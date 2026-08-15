@@ -484,6 +484,7 @@ switch (sub) {
         direction: personaFrom(),
         greet: optVal("--greet"),
         barge: has("--barge"),
+        hangup: has("--no-bye") ? [] : (valOf("--bye")?.split(",").map((s) => s.trim()).filter(Boolean) ?? ["bye", "goodbye", "good bye"]),
         onEvent: (kind, text) => process.stdout.write(`  ${label[kind]} ${kind === "info" ? dim(text) : text}\n`),
       });
     } catch (e: any) { die(e?.message ?? String(e)); }
