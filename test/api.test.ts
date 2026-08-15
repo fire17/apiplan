@@ -99,3 +99,27 @@ describe("it binds loopback unless told otherwise", () => {
     expect(src).not.toContain('"0.0.0.0"');
   });
 });
+
+describe("optional-value flags don't swallow the next flag", () => {
+  test("--greet bare is true; --greet <text> is that text; --greet --voice x is still true", () => {
+    // The real bug: `--greet --voice cedar` made the greeting instruction the literal
+    // string "--voice", which overrode the persona for the opening line.
+    const optVal = (argv: string[], f: string) => {
+      const i = argv.indexOf(f);
+      if (i < 0) return undefined;
+      const v = argv[i + 1];
+      return v === undefined || v.startsWith("-") ? true : v;
+    };
+    expect(optVal(["--greet"], "--greet")).toBe(true);
+    expect(optVal(["--greet", "--voice", "cedar"], "--greet")).toBe(true);
+    expect(optVal(["--greet", "open warmly"], "--greet")).toBe("open warmly");
+    expect(optVal(["--voice", "cedar"], "--greet")).toBeUndefined();
+  });
+  test("the shipped CLI uses optVal for --greet, and plain valOf elsewhere", () => {
+    const src = require("node:fs").readFileSync(new URL("../bin/apiplan.ts", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
+    expect(src).toContain('optVal("--greet")');
+    // --flags carries values that legitimately start with "-", so it must NOT use optVal
+    expect(src).toContain('valOf("--flags")');
+    expect(src).not.toContain('optVal("--flags")');
+  });
+});

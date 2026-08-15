@@ -248,6 +248,31 @@ export function speakLocally(text: string): string | null {
   return null;
 }
 
+/**
+ * Live microphone capture as raw PCM16 on stdout, and raw PCM16 playback on stdin.
+ * ffmpeg is the one dependency that already exists on machines doing audio work, and
+ * it is the only cross-platform way to reach a microphone without a native module —
+ * so both are ffmpeg/ffplay argv, and the OS difference is only the input driver.
+ */
+export function micCommand(rate = 24000): string[] | null {
+  if (!whichSync("ffmpeg")) return null;
+  const src = IS_MAC ? ["-f", "avfoundation", "-i", ":default"]
+    : IS_WIN ? ["-f", "dshow", "-i", "audio=default"]
+    : ["-f", "pulse", "-i", "default"];            // Linux/WSL: PulseAudio or PipeWire's shim
+  return ["ffmpeg", "-hide_banner", "-loglevel", "error", ...src,
+    "-ac", "1", "-ar", String(rate), "-f", "s16le", "-"];
+}
+export function speakerCommand(rate = 24000): string[] | null {
+  if (!whichSync("ffplay")) return null;
+  // -ch_layout, NOT -ac: `-ac` is an ffmpeg option and ffplay rejects it outright
+  // ("Option not found"), exiting instantly — which sounds exactly like silence.
+  // -autoexit: one player per reply, so it drains and exits when that reply's stdin
+  // closes. A single long-lived player is alive but silent after the first turn — raw
+  // PCM has no timestamps, so the gaps between turns drift its clock.
+  return ["ffplay", "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
+    "-f", "s16le", "-ar", String(rate), "-ch_layout", "mono", "-i", "-"];
+}
+
 /** Hand a file to the desktop to open however it likes. Returns the tool, or null. */
 export function openFile(path: string): string | null {
   const cmd = IS_MAC ? ["open", path]

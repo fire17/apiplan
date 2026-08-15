@@ -349,6 +349,7 @@ USAGE
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
+  apiplan talk [--voice v]       speak with the model out loud, both ways
   apiplan path                   print the line that puts commands on your PATH
   apiplan shell-init [shell]     shell glue so ? and * in a prompt need no quotes
                                  ${dim(`add to your rc:  eval "$(apiplan shell-init)"`)}
@@ -363,6 +364,19 @@ const argv = process.argv.slice(2);
 const sub = argv[0];
 const has = (f: string) => argv.includes(f);
 const valOf = (f: string) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
+/**
+ * For flags that may be used bare OR with a value (--greet, --greet "open warmly").
+ * The next token counts as the value only when it isn't another flag — otherwise
+ * `--greet --voice cedar` reads "--voice" as the greeting text, which is exactly how a
+ * persona got silently overridden. Values that legitimately begin with "-" (a flag
+ * string like "-e low --stream") still work through plain valOf.
+ */
+const optVal = (f: string) => {
+  const i = argv.indexOf(f);
+  if (i < 0) return undefined;
+  const v = argv[i + 1];
+  return v === undefined || v.startsWith("-") ? true : v;
+};
 
 switch (sub) {
   case undefined: await tui(); break;
@@ -453,6 +467,28 @@ switch (sub) {
     break;
   }
   case "doctor": await cmdDoctor(); break;
+  case "talk": case "converse": {
+    const { talk } = await import("../src/talk.ts");
+    // A persona long enough to be worth writing belongs in a file, not in argv.
+    const personaFrom = () => {
+      const f = valOf("--as-file") ?? valOf("--persona");
+      const inline = valOf("--as") ?? valOf("--direction");
+      const fromFile = f ? require("node:fs").readFileSync(f, "utf8").trim() : "";
+      return [fromFile, inline].filter(Boolean).join("\n\n") || undefined;
+    };
+    const label = { you: key("you  "), model: ok("model"), info: dim("·    ") };
+    try {
+      await talk({
+        voice: valOf("--voice") ?? undefined,
+        model: valOf("--model") ?? undefined,
+        direction: personaFrom(),
+        greet: optVal("--greet"),
+        barge: has("--barge"),
+        onEvent: (kind, text) => process.stdout.write(`  ${label[kind]} ${kind === "info" ? dim(text) : text}\n`),
+      });
+    } catch (e: any) { die(e?.message ?? String(e)); }
+    break;
+  }
   case "serve": {
     const { serve } = await import("../src/api.ts");
     const s = serve({ port: valOf("--port") ? Number(valOf("--port")) : undefined, host: valOf("--host") ?? undefined });

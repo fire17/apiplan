@@ -112,6 +112,11 @@ export function sync(c: Config, opts: { force?: boolean; only?: string[] } = {})
   // `apiplan` itself is always present, so a broken install can always be repaired
   // with the same tool that manages everything else.
   if (!opts.only) written.push(...writeShim(binDir, "apiplan", runner, join(import.meta.dir, "..", "bin", "apiplan.ts"), []));
+  // `jimmy` has its own entry point rather than a --model shim: chatjimmy.ai needs no
+  // credential and streams raw text, so it shares none of the provider plumbing.
+  if (!opts.only && !shadowsExisting("jimmy", binDir)) {
+    written.push(...writeShim(binDir, "jimmy", runner, join(import.meta.dir, "..", "bin", "jimmy.ts"), []));
+  }
   for (const cmd of c.commands) {
     if (opts.only && !opts.only.includes(cmd.name)) continue;
     const clash = shadowsExisting(cmd.name, binDir);
@@ -152,7 +157,9 @@ export function remove(c: Config, name: string): { ok: boolean; why?: string; re
  */
 export function orphans(c: Config): string[] {
   const binDir = binDirOf(c);
-  const keep = new Set<string>(["apiplan", ...c.commands.map((x) => x.name)]);
+  // apiplan and jimmy have their own entry points and are never in commands.json,
+  // so without naming them here prune would treat them as leftovers and delete them.
+  const keep = new Set<string>(["apiplan", "jimmy", ...c.commands.map((x) => x.name)]);
   const out: string[] = [];
   try {
     for (const f of require("node:fs").readdirSync(binDir) as string[]) {

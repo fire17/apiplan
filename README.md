@@ -264,6 +264,40 @@ eval "$(apiplan shell-init)"     # add to ~/.zshrc
 bash, cmd.exe and PowerShell already pass them through, and `apiplan shell-init` tells
 you so instead of adding aliases you don't need.
 
+## jimmy — a model that runs in silicon
+
+`chatjimmy.ai` is [Taalas](https://taalas.com)' demo of a model cast into hardware rather
+than run on a GPU. It is startlingly fast, it needs no account, and `jimmy` puts it in
+your shell:
+
+```sh
+jimmy is 91 prime
+cat error.log | jimmy what is failing here
+jimmy --stats how many moons does saturn have
+```
+
+```console
+$ jimmy --stats what is 17 times 23
+17 × 23 = 391
+17697 tok/s decode · 15914 tok/s prefill · server TTFT 1.13ms · 26 tokens
+```
+
+At 1 ms to first token the model is never the slow part — **the TLS handshake is**. So
+`jimmy` keeps a warm connection the same way the rest of apiplan does, which is the whole
+difference between the two numbers below:
+
+| | first byte |
+|---|---|
+| cold (new TLS handshake) | ~490 ms |
+| warm (connection held open) | **~180 ms** |
+
+The remaining ~170 ms is the round trip to their server; their own telemetry reports 15 ms
+of it. That part is physics, not code.
+
+`--stats` prints their speed numbers to stderr so stdout stays pipeable. No key, no
+account. `JIMMY_API` / `JIMMY_MODEL` point it elsewhere; `JIMMY_DAEMON=off` disables the
+warm holder.
+
 ## Point any SDK at localhost
 
 `apiplan serve` runs a local server that speaks **OpenAI's and Anthropic's wire shapes
