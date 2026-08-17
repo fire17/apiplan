@@ -235,7 +235,12 @@ function dictateOpenAI(o: DictateOpts): Promise<string> {
               // and the rejection kills the whole session.update — so 24 kHz, always.
               format: { type: "audio/pcm", rate: OAI_RATE },
               transcription: { model: stt, ...(o.lang ? { language: o.lang } : {}) },
-              turn_detection: { type: "server_vad", threshold: 0.65, prefix_padding_ms: 300, silence_duration_ms: 700, create_response: false, interrupt_response: false },
+              // The transcription of an utterance only STARTS once server_vad closes it —
+              // deltas then burst out all at once. There are no word-live interims on this
+              // endpoint, so the one speed knob is how fast an utterance closes: 500ms of
+              // silence (down from 700) settles noticeably sooner without splitting words.
+              // APIPLAN_STT_MODEL=gpt-4o-mini-transcribe trades a little accuracy for speed.
+              turn_detection: { type: "server_vad", threshold: 0.65, prefix_padding_ms: 300, silence_duration_ms: 500, create_response: false, interrupt_response: false },
             },
           },
         },
