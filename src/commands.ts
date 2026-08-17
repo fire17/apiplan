@@ -75,6 +75,14 @@ export function defaults(): Command[] {
     add("tts", alias, ["--speak", "--play"], "speak any text on the subscription (--aloud reads a ChatGPT reply)");
     add("speak", alias, ["--speak", "--play"], "same as tts, where the name is free");
   }
+  // Dictation — the microphone types. The model alias only picks whose subscription
+  // transcribes (the STT engine is the provider's own, not a chat model): `dictation`
+  // rides the Claude Code login over the same streaming socket ccvoice dictates
+  // through; `dictation-gpt` rides the ChatGPT login over the realtime socket.
+  const claude = models().find((m) => m.provider === "anthropic");
+  if (claude) add("dictation", aliasesFor(claude)[0] ?? claude.id, ["--dictate"], "speak → text, on the Claude subscription");
+  const gpt = models().find((m) => m.provider === "openai");
+  if (gpt) add("dictation-gpt", aliasesFor(gpt)[0] ?? gpt.id, ["--dictate"], "speak → text, on the ChatGPT subscription");
   return out;
 }
 

@@ -45,13 +45,14 @@ export type Opts = CallOpts & {
   out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
   aloud: boolean; conversation?: string; message?: string; last: boolean; open: boolean;
   direction?: string; directionFile?: string;
+  dictate: boolean; lang?: string; silenceStop?: number;
 };
 
 /** Flags that consume the next argv item (so it is never mistaken for prompt text). */
 const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
   "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image",
   "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message",
-  "--as", "--style", "--emotion", "--direction", "--as-file"]);
+  "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -63,7 +64,7 @@ export function parseArgs(argv: string[], model0?: string): Opts {
     model: model0, images: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
     dryRun: false, verbose: false, help: false, version: false,
     daemon: false, daemonStop: false, noDaemon: false,
-    speak: false, play: false, local: false, aloud: false, last: false, open: false,
+    speak: false, play: false, local: false, aloud: false, last: false, open: false, dictate: false,
   };
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -98,6 +99,9 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--open": o.open = true; break;
       case "--local": o.local = true; o.speak = true; break;
       case "--aloud": case "--read-aloud": o.aloud = true; o.speak = true; break;
+      case "--dictate": case "--stt": o.dictate = true; break;
+      case "--lang": case "--language": o.lang = val(); break;
+      case "--silence-stop": o.silenceStop = Number(val()) || 0; break;
       case "--last": o.last = true; o.aloud = true; o.speak = true; break;
       case "--conversation": o.conversation = val(); o.aloud = true; o.speak = true; break;
       case "--message": o.message = val(); o.aloud = true; o.speak = true; break;
@@ -357,6 +361,33 @@ async function runAloud(m: Model, o: Opts): Promise<void> {
   const { bytes, spoke, voice } = await p.readAloud({ conversation: o.conversation, message: o.message, voice: o.voice, format: fmt, last: o.last });
   if (spoke) process.stderr.write(`\x1b[2m“${spoke.slice(0, 140).replace(/\s+/g, " ")}${spoke.length > 140 ? "…" : ""}”\x1b[0m\n`);
   deliverAudio(bytes, fmt, `ChatGPT voice ${voice}, on the subscription`, o);
+}
+
+/**
+ * Dictation: microphone → subscription STT → text on stdout. The live transcript
+ * paints one stderr line while you speak; stdout gets ONLY the final text, so
+ * `dictation | pbcopy` and `msg=$(dictation)` behave like any Unix tool.
+ */
+export async function runDictation(m: Model, o: Opts): Promise<void> {
+  const { dictate } = await import("./dictation.ts");
+  const tty = process.stderr.isTTY;
+  const width = () => (process.stderr.columns ?? 80) - 2;
+  const paint = (text: string, dim: boolean) => {
+    if (!tty) return;
+    const w = width();
+    const t = text.length > w ? "…" + text.slice(-(w - 1)) : text;
+    process.stderr.write(`\r\x1b[2K${dim ? "\x1b[2m" : ""}${t}\x1b[0m`);
+  };
+  const text = await dictate({
+    provider: m.provider, lang: o.lang, silenceStop: o.silenceStop,
+    onEvent: (kind, t) => {
+      if (kind === "info") { if (tty) process.stderr.write(`\r\x1b[2K\x1b[2m[${t}]\x1b[0m\n`); }
+      else paint(t, kind === "interim");
+    },
+  });
+  if (tty) process.stderr.write("\r\x1b[2K");
+  if (!text) die("heard nothing — is the microphone working? (macOS: check the terminal's mic permission)");
+  process.stdout.write(text + "\n");
 }
 
 /** Every speech path ends the same way: write it, optionally play it, print the path. */

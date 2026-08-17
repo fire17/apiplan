@@ -3,7 +3,7 @@
 // `opus`, `sonnet`, `gpt`, `sol`, and any custom command the user creates are all
 // thin shims around this file with a different --model (plus any baked-in flags).
 import { basename } from "node:path";
-import { parseArgs, buildTurns, callDirect, callViaDaemon, runDaemon, daemonStop, runSpeech, resolveModelOrDie, die, VERSION, type Opts } from "../src/engine.ts";
+import { parseArgs, buildTurns, callDirect, callViaDaemon, runDaemon, daemonStop, runSpeech, runDictation, resolveModelOrDie, die, VERSION, type Opts } from "../src/engine.ts";
 import { models, aliasesFor } from "../src/registry.ts";
 import { providerFor } from "../src/providers.ts";
 import type { Model } from "../src/registry.ts";
@@ -34,9 +34,9 @@ MODEL
 MAKE THINGS (all of it on your subscription — no API key)
       --draw             draw it${m && !p?.canGenerateImages ? " (not on " + m.label + ")" : ""}   --size <WxH>  --quality <low|med|high>  --open
       --raw              draw exactly what you typed (default: the model improves it)
-      --aloud            read your newest ChatGPT reply in a ChatGPT voice
-                         (--conversation/--message <id> picks another)
+      --aloud            read your newest ChatGPT reply aloud (--conversation/--message <id>)
       --speak            say your own text in an OpenAI voice, on the subscription
+      --dictate          the mic types: live transcript, final text on stdout · Enter ends it · --lang en|he|… · --silence-stop <secs>
       --as <direction>   HOW to say it: "excited, laughing" · "whisper" · "furious" ·
                          "slowly, heartbroken" · any character (--as-file <f>; --local)
       --voice <name>     see apiplan voices   --play   --format aac|mp3|wav
@@ -91,6 +91,13 @@ if (o.maxTokens && model.provider === "openai") {
 if (o.effort) {
   const ok = providerFor(model).efforts(model);
   if (!ok.includes(o.effort)) die(`effort '${o.effort}' is not available on ${model.label}; valid: ${ok.join(", ")}`);
+}
+
+// Dictation is the reverse of speech: microphone in, text out, no prompt at all.
+if (o.dictate) {
+  try { await runDictation(model, o); }
+  catch (e: any) { die(e?.message ?? String(e)); }
+  process.exit(0);
 }
 
 // Speech is a different shape of job: no streaming, no daemon, binary out.
