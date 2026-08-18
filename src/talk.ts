@@ -172,6 +172,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let curResponseId: string | null = null;   // response currently generating
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
   let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
+  let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
   // response.create we send, cleared on response.created / response.done / cancel. Without it,
@@ -394,10 +395,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // response.create weighs the whole conversation; with a pending user question the
         // model HIJACKS the injected line to answer the conversation instead (observed live:
         // MIND lines replaced by freelanced replies). Out-of-band responses see ONLY the
-        // instructions, so the MIND's words cannot be pulled off course. The history item
-        // right before keeps the conversation aware the line was said (one answer, no repeats).
-        try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
-          type: "message", role: "assistant", content: [{ type: "output_text", text }] } })); } catch {}
+        // instructions, so the MIND's words cannot be pulled off course.
+        // The history item is added AFTER the line is spoken (response.done) — inserting it
+        // BEFORE made the model treat the line as already-said and freelance a follow-up
+        // (observed live: generic closers instead of the MIND's words).
+        pendingMindHistory = text;
         ws.send(JSON.stringify({ type: "response.create", response: { conversation: "none", instructions: verbatim } }));
         awaitingResponse = true;
       }
@@ -658,6 +660,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           speaking = false;
           responseActive = false;
           awaitingResponse = false;
+          // Now that the out-of-band MIND line has actually been spoken, record it in the
+          // conversation so the mouth knows it was said (one answer, no repeats). Doing this
+          // BEFORE speaking made the model skip the line as already-said.
+          if (mindResponse && pendingMindHistory) {
+            try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+              type: "message", role: "assistant", content: [{ type: "output_text", text: pendingMindHistory }] } })); } catch {}
+            pendingMindHistory = "";
+          }
           endPlayer();
           // Graceful injects wait for PLAYBACK to finish, not just generation. endPlayer lets
           // ffplay keep draining its buffer for `playingUntil - now`; firing the next
