@@ -53,6 +53,11 @@ export type TalkOpts = {
    *  accumulate and an uncaughtException rethrow would take the whole daemon down. */
   manageSignals?: boolean;
   onEvent?: (kind: "you" | "model" | "info", text: string) => void;
+  /** Inbound control channel: a file that other processes (e.g. a set_monitor watcher)
+   *  append `{text, mode}` lines to. Each becomes context spoken INTO the live call —
+   *  mode "graceful" waits for the current sentence to finish, "interrupt" barges in.
+   *  Defaults to `<logFile>.inject`; also exported as APIPLAN_TALK_INJECT for tools. */
+  injectFile?: string;
 };
 
 export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
@@ -79,6 +84,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   };
   const emit = o.onEvent ?? (() => {});
   const say = (kind: "you" | "model" | "info", text: string) => { emit(kind, text); rec({ ev: kind, text }); };
+
+  // Inbound control channel — where injected context (monitor reports, mid-call context)
+  // is read from. Exported in the env so an in-process tool (set_monitor) knows where a
+  // background watcher should append its triggers.
+  const injectPath = o.injectFile || process.env.APIPLAN_TALK_INJECT || (logPath ? logPath + ".inject" : "");
+  if (injectPath) process.env.APIPLAN_TALK_INJECT = injectPath;
 
   const ws = o.socket ?? openRealtime(c.token, model);
   rec({ ev: "info", text: `talk start model=${model} voice=${o.voice || "cedar"}${o.socket ? " (parked socket)" : ""}${o.tools?.length ? ` tools=${o.tools.length}` : ""}` });
@@ -266,6 +277,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }
       say("info", o.greet ? "connecting — it will speak first. Ctrl-C to stop." : "listening — speak, and it answers. Ctrl-C to stop.");
       micLoop();
+      startInjectLoop();
       // Keepalive pings (defense): keeps NAT/proxy paths warm during long one-sided
       // stretches. No terminate-on-silence rule — the server legitimately sends nothing
       // while idle (measured 199s of healthy silence), so silence is not death here.
@@ -323,11 +335,76 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       } catch (err: any) {
         output = `The tool could not run: ${String(err?.message ?? err).slice(0, 200)}`;
       }
-      rec({ ev: "info", text: `tool ${item.name} → ${output.length} chars` });
+      // Preview the result in the sidecar (not just its length) so the operator watching
+      // the call can SEE what a tool did — e.g. the exact command a set_monitor armed.
+      rec({ ev: "info", text: `tool ${item.name} → ${output.slice(0, 200).replace(/\s+/g, " ")}` });
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output } }));
       if (!closing) ws.send(JSON.stringify({ type: "response.create" }));
     };
+
+    // ── Inbound context injection ────────────────────────────────────────────────
+    // Other processes (a set_monitor watcher, a mid-call context push) append {text,mode}
+    // lines to injectPath. Each is spoken INTO the live call: mode "graceful" waits for the
+    // current sentence to finish; "interrupt" barges in so the model answers on it at once.
+    const injectQueue: string[] = [];
+    let injectOff = 0;
+    const sendInjected = (text: string) => {
+      if (closed || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type: "conversation.item.create",
+        item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
+      if (!closing) ws.send(JSON.stringify({ type: "response.create" }));
+      say("info", "injected context");
+    };
+    // Cancel + truncate the response in flight (shared shape with the speech_started barge).
+    const bargeNow = () => {
+      if (!responseActive) return;
+      try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+      responseActive = false;
+      if (curResponseId) cancelledResponses.add(curResponseId);
+      if (curItemId) {
+        const heardMs = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
+        try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {}
+      }
+      stopPlayer(); speaking = false; playingUntil = 0;
+    };
+    const injectContext = (text: string, mode: string) => {
+      // Never fire response.create while one is active — the server rejects it
+      // ("conversation_already_has_active_response"). If nothing is speaking, say it now.
+      // Otherwise queue it: graceful waits for the sentence to end; interrupt cancels the
+      // current response so its response.done arrives at once and the queue flushes then.
+      if (!responseActive) { sendInjected(text); return; }
+      if (mode === "interrupt") bargeNow();
+      injectQueue.push(text);
+    };
+    const flushInjectQueue = () => { while (injectQueue.length && !responseActive) sendInjected(injectQueue.shift()!); };
+    function startInjectLoop() {
+      if (!injectPath) return;
+      try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
+      const tick = async () => {
+        if (closed) return;
+        try {
+          const f = Bun.file(injectPath);
+          if (await f.exists()) {
+            const size = f.size;
+            if (injectOff > size) injectOff = 0;              // file replaced/truncated
+            if (size > injectOff) {
+              const chunk = await f.slice(injectOff, size).text();
+              const cut = chunk.lastIndexOf("\n");
+              if (cut >= 0) {
+                injectOff += Buffer.byteLength(chunk.slice(0, cut + 1), "utf8");
+                for (const ln of chunk.slice(0, cut).split("\n")) {
+                  const s = ln.trim(); if (!s) continue;
+                  try { const j = JSON.parse(s); if (j.text) injectContext(String(j.text), String(j.mode || "graceful")); } catch {}
+                }
+              }
+            }
+          }
+        } catch {}
+        if (!closed) setTimeout(tick, 150);
+      };
+      setTimeout(tick, 150);
+    }
 
     ws.onmessage = (e: any) => {
       let ev: any;
@@ -455,6 +532,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.done":
           speaking = false;
           responseActive = false;
+          flushInjectQueue();     // a monitor report held during the sentence now speaks
           endPlayer();
           if (closing) {
             // Give the queued goodbye audio time to drain out of the speaker, then hang up.
