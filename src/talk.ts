@@ -397,7 +397,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // instructions, so the MIND's words cannot be pulled off course. The history item
         // right before keeps the conversation aware the line was said (one answer, no repeats).
         try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
-          type: "message", role: "assistant", content: [{ type: "text", text }] } })); } catch {}
+          type: "message", role: "assistant", content: [{ type: "output_text", text }] } })); } catch {}
         ws.send(JSON.stringify({ type: "response.create", response: { conversation: "none", instructions: verbatim } }));
         awaitingResponse = true;
       }
@@ -431,7 +431,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // ("conversation_already_has_active_response"). If nothing is speaking, say it now.
       // Otherwise queue it: graceful waits for the sentence to end; interrupt cancels the
       // current response so its response.done arrives at once and the queue flushes then.
-      if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
+      // MIND PRIORITY — code-enforced handoff (fire17's law, 2026-08-18: "the code needs
+      // to enforce this... seamless for the agentic agents"): if the mouth's OWN auto-reply
+      // is mid-flight when a MIND line arrives, it is superseded INSTANTLY — cancelled,
+      // truncated, audio cut — whatever the mode. Graceful pacing applies only between the
+      // MIND's own lines, never to keep a freelancing mouth on air over the MIND.
+      if (responseActive && !mindResponse) bargeNow();
+      else if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
       if (!responseActive && !awaitingResponse && chunks.length) sendInjected(chunks.shift()!);
       injectQueue.push(...chunks);
     };
