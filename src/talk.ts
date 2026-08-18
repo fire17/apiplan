@@ -179,6 +179,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // reordering the injected reports. (Root cause of the inject-ordering backlog.)
   let awaitingResponse = false;
   let micMuted = false;                        // when true, mic frames are dropped (not sent to the model)
+  // suppressAuto: when true, the mouth may NOT answer on its own — any VAD auto-response is
+  // cancelled the instant it starts, so the mouth speaks ONLY injected (MIND) lines. The MIND
+  // flips this LIVE via an inject {"autospeak":true|false} — instant open/close of the mouth.
+  // Default from env (APIPLAN_VAD_CREATE_RESPONSE=0 → start closed); otherwise open so the mouth
+  // gives its quick opener before the MIND takes over with the truth.
+  let suppressAuto = process.env.APIPLAN_VAD_CREATE_RESPONSE === "0";
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -433,6 +439,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (typeof j.mute === "boolean") {   // mic mute toggle — stop/resume sending mic audio to the model
                       micMuted = j.mute;
                       say("info", micMuted ? "mic muted" : "mic unmuted");
+                    } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
+                      suppressAuto = !j.autospeak;
+                      say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
                   } catch {}
                 }
@@ -480,6 +489,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "response.created":
           curResponseId = ev.response?.id ?? null;
+          // Mouthpiece mode: if the model started a response we did NOT initiate (awaitingResponse
+          // is false → it's a VAD auto-reply to the user's/ambient speech, not an injected line),
+          // cancel it at once so the mouth stays a pure mouthpiece for the MIND. Belt-and-suspenders
+          // with turn_detection.create_response:false (which the API may ignore).
+          if (suppressAuto && !awaitingResponse) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
+            responseActive = false;
+            break;
+          }
           responseActive = true;
           awaitingResponse = false;   // the send we were awaiting has now materialized
           break;
