@@ -405,13 +405,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       stopPlayer(); speaking = false; playingUntil = 0;
     };
     const injectContext = (text: string, mode: string) => {
+      // Long texts get COMPRESSED by the model even under the verbatim wrapper (observed
+      // live: a 4-sentence update spoken as a one-line summary). Sentence-split into short
+      // chunks — each short chunk delivers verbatim, and the serialized queue speaks them
+      // back-to-back in order, so long updates arrive intact instead of summarized.
+      const chunks: string[] = [];
+      let buf = "";
+      for (const s of text.split(/(?<=[.!?…])\s+/)) {
+        if (buf && buf.length + s.length > 200) { chunks.push(buf); buf = s; }
+        else buf = buf ? `${buf} ${s}` : s;
+      }
+      if (buf) chunks.push(buf);
       // Never fire response.create while one is active — the server rejects it
       // ("conversation_already_has_active_response"). If nothing is speaking, say it now.
       // Otherwise queue it: graceful waits for the sentence to end; interrupt cancels the
       // current response so its response.done arrives at once and the queue flushes then.
-      if (!responseActive && !awaitingResponse) { sendInjected(text); return; }
-      if (mode === "interrupt") bargeNow();
-      injectQueue.push(text);
+      if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
+      if (!responseActive && !awaitingResponse && chunks.length) sendInjected(chunks.shift()!);
+      injectQueue.push(...chunks);
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
