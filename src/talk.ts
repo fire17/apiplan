@@ -442,6 +442,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
                       suppressAuto = !j.autospeak;
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
+                    } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
+                      say("info", "pong");
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
                   } catch {}
                 }
