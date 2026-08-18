@@ -165,6 +165,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // and ghost audio plays after the interrupt.
   let curResponseId: string | null = null;   // response currently generating
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
+  // responseActive only flips true on the SERVER's response.created echo, which lags our
+  // response.create send. awaitingResponse bridges that gap: set true synchronously at every
+  // response.create we send, cleared on response.created / response.done / cancel. Without it,
+  // two injects (or an inject + a queue flush) fired in the same tick both see !responseActive
+  // and both send response.create — the server rejects all but the first, silently dropping or
+  // reordering the injected reports. (Root cause of the inject-ordering backlog.)
+  let awaitingResponse = false;
   let micMuted = false;                        // when true, mic frames are dropped (not sent to the model)
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
@@ -272,6 +279,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           greeted = true;
           const gi = greetInstructions();
           ws.send(JSON.stringify({ type: "response.create", ...(gi ? { response: { instructions: gi } } : {}) }));
+          awaitingResponse = true;
         }
       } else {
         ws.send(JSON.stringify({
@@ -351,7 +359,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       rec({ ev: "info", text: `tool ${item.name} → ${output.slice(0, 200).replace(/\s+/g, " ")}` });
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output } }));
-      if (!closing) ws.send(JSON.stringify({ type: "response.create" }));
+      if (!closing) { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
     };
 
     // ── Inbound context injection ────────────────────────────────────────────────
@@ -364,14 +372,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // Drive the assistant's OWN next response with these instructions, so the injected
       // context is SPOKEN in its voice — not posted as a user message it merely reacts to.
-      if (!closing) ws.send(JSON.stringify({ type: "response.create", response: { instructions: text } }));
+      if (!closing) { ws.send(JSON.stringify({ type: "response.create", response: { instructions: text } })); awaitingResponse = true; }
       say("info", "injected context");
     };
     // Cancel + truncate the response in flight (shared shape with the speech_started barge).
     const bargeNow = () => {
       if (!responseActive) return;
       try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-      responseActive = false;
+      responseActive = false; awaitingResponse = false;
       if (curResponseId) cancelledResponses.add(curResponseId);
       if (curItemId) {
         const heardMs = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
@@ -384,11 +392,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // ("conversation_already_has_active_response"). If nothing is speaking, say it now.
       // Otherwise queue it: graceful waits for the sentence to end; interrupt cancels the
       // current response so its response.done arrives at once and the queue flushes then.
-      if (!responseActive) { sendInjected(text); return; }
+      if (!responseActive && !awaitingResponse) { sendInjected(text); return; }
       if (mode === "interrupt") bargeNow();
       injectQueue.push(text);
     };
-    const flushInjectQueue = () => { while (injectQueue.length && !responseActive) sendInjected(injectQueue.shift()!); };
+    // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
+    // and the next item waits for that response's response.done — the queue stays serialized and
+    // ordered instead of firing every item at once (which the server would reject all-but-first).
+    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse) sendInjected(injectQueue.shift()!); };
     function startInjectLoop() {
       if (!injectPath) return;
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
@@ -458,11 +469,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             greeted = true;
             ws.send(JSON.stringify({ type: "response.create",
               ...(typeof o.greet === "string" ? { response: { instructions: o.greet } } : {}) }));
+            awaitingResponse = true;
           }
           break;
         case "response.created":
           curResponseId = ev.response?.id ?? null;
           responseActive = true;
+          awaitingResponse = false;   // the send we were awaiting has now materialized
           break;
         case "response.output_item.added":
           // The assistant message whose audio is about to play — barge-in truncates THIS.
@@ -479,7 +492,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // "response_cancel_not_active" error for nothing.
           if (speaking && o.barge && responseActive) {
             ws.send(JSON.stringify({ type: "response.cancel" }));
-            responseActive = false;
+            responseActive = false; awaitingResponse = false;
             if (curResponseId) cancelledResponses.add(curResponseId);
             if (curItemId) {
               const heardMs = itemFirstDeltaAt
@@ -505,6 +518,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // Let it sign off in its own voice, then the response.done below hangs up.
             ws.send(JSON.stringify({ type: "response.create",
               response: { instructions: "The person is ending the call. Say a brief, warm goodbye in one short sentence and nothing else." } }));
+            awaitingResponse = true;
           }
           break;
         case "conversation.item.input_audio_transcription.failed":
@@ -554,8 +568,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.done":
           speaking = false;
           responseActive = false;
-          flushInjectQueue();     // a monitor report held during the sentence now speaks
+          awaitingResponse = false;
           endPlayer();
+          // Graceful injects wait for PLAYBACK to finish, not just generation. endPlayer lets
+          // ffplay keep draining its buffer for `playingUntil - now`; firing the next
+          // response.create now would spawn a second player over that tail — two voices at once.
+          // Delay the flush until the buffer has drained so the injected reply starts clean.
+          if (injectQueue.length) setTimeout(flushInjectQueue, Math.max(0, playingUntil - Date.now()));
           if (closing) {
             // Give the queued goodbye audio time to drain out of the speaker, then hang up.
             setTimeout(() => { say("info", "goodbye — call ended"); done({ reason: "hangup" }); }, Math.max(0, playingUntil - Date.now()) + 400);
