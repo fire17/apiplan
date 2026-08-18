@@ -165,6 +165,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // and ghost audio plays after the interrupt.
   let curResponseId: string | null = null;   // response currently generating
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
+  let micMuted = false;                        // when true, mic frames are dropped (not sent to the model)
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -322,6 +323,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         while (true) {
           const { done: rdone, value } = await reader.read();
           if (rdone) break;
+          if (micMuted) continue;                              // muted: drop mic frames so the model never hears them
           if (stillAudible() && !o.barge) continue;
           if (ws.readyState !== WebSocket.OPEN) break;
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
@@ -411,6 +413,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", instructions: String(j.session) } }));
                         say("info", "persona updated live");
                       }
+                    } else if (typeof j.mute === "boolean") {   // mic mute toggle — stop/resume sending mic audio to the model
+                      micMuted = j.mute;
+                      say("info", micMuted ? "mic muted" : "mic unmuted");
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
                   } catch {}
                 }
