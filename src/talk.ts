@@ -171,6 +171,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // and ghost audio plays after the interrupt.
   let curResponseId: string | null = null;   // response currently generating
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
+  let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
   // response.create we send, cleared on response.created / response.done / cancel. Without it,
@@ -384,7 +385,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // Drive the assistant's OWN next response with these instructions, so the injected
       // context is SPOKEN in its voice — not posted as a user message it merely reacts to.
-      if (!closing) { ws.send(JSON.stringify({ type: "response.create", response: { instructions: text } })); awaitingResponse = true; }
+      // The verbatim wrapper is mechanical: without it the model treats the text as a topic
+      // and may paraphrase or even TRANSLATE it (observed live: an English inject spoken as
+      // Spanish). Injected words are the MIND's words — deliver them exactly.
+      const verbatim = `Say the following to the user now, word for word, in the exact language it is written in. Do not translate, do not paraphrase, do not add or omit anything:\n${text}`;
+      if (!closing) { ws.send(JSON.stringify({ type: "response.create", response: { instructions: verbatim } })); awaitingResponse = true; }
       say("info", "injected context");
     };
     // Cancel + truncate the response in flight (shared shape with the speech_started barge).
@@ -495,13 +500,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // is false → it's a VAD auto-reply to the user's/ambient speech, not an injected line),
           // cancel it at once so the mouth stays a pure mouthpiece for the MIND. Belt-and-suspenders
           // with turn_detection.create_response:false (which the API may ignore).
-          if (suppressAuto && !awaitingResponse) {
-            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-            if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
-            responseActive = false;
-            break;
+          // Noise gate — MECHANISTIC anti-ramble, not persona. Ambient noise false-triggers
+          // VAD, gets mis-transcribed, and the model answers it with irrelevant questions.
+          // Real speech is never this short; the hangup guard uses the same signal (>=400ms).
+          // Any auto-response born from a sub-threshold blip is cancelled before it speaks.
+          {
+            const minSpeech = Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500;
+            const noiseBlip = lastSpeechMs > 0 && lastSpeechMs < minSpeech;
+            if (!awaitingResponse && (suppressAuto || noiseBlip)) {
+              try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+              if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
+              responseActive = false;
+              if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
+              break;
+            }
           }
           responseActive = true;
+          mindResponse = awaitingResponse;   // if we sent this response.create, it's the MIND speaking
           awaitingResponse = false;   // the send we were awaiting has now materialized
           break;
         case "response.output_item.added":
@@ -537,6 +552,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
+          // Noise gate, layer 2 — MECHANISTIC. Long ambient noise (>= minSpeech, so it passed
+          // the blip gate) transcribes to an EMPTY string; a VAD auto-reply born from it is a
+          // ramble at nothing. Cancel it the moment the empty transcript lands — but never a
+          // MIND-initiated response (mindResponse), which owes nothing to this user turn.
+          if (!ev.transcript?.trim() && responseActive && !mindResponse && !awaitingResponse && !closing) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) cancelledResponses.add(curResponseId);
+            responseActive = false;
+            say("info", "empty-transcript auto-reply cancelled (noise, not speech)");
+          }
           flushReply();
           // Hangup is irreversible — require REAL speech behind it, not a noise hallucination.
           if (!closing && ev.transcript && isHangup(ev.transcript) && lastSpeechMs >= 400) {
