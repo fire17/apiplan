@@ -1,0 +1,3 @@
+{"t":1787010581984,"ev":"info","text":"talk start model=gpt-realtime voice=cedar"}
+{"t":1787010581989,"ev":"info","text":"connection failed"}
+{"t":1787010581989,"ev":"info","text":"socket closed (1006)"}

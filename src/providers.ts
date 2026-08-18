@@ -107,12 +107,26 @@ function perform(o: SpeechOpts): string {
  * verbatim — it is a conversational model being used as a narrator, so the
  * instruction matters.
  */
+/**
+ * The ONE place a realtime WebSocket is opened. Both the narrator (speakRealtime) and the
+ * conversation (talk.ts) go through here, so any transport fix — reconnect, keepalive,
+ * headers — lands on every caller instead of half of them.
+ * `perMessageDeflate:false`: the payload is base64 PCM, which is incompressible; deflate
+ * only burns CPU and holds context memory (honored by Bun ≥1.3.14, ignored harmlessly before).
+ * No OpenAI-Beta header: the beta shape is retired and answers beta_api_shape_disabled.
+ */
+export function openRealtime(token: string, model = env("APIPLAN_REALTIME_MODEL", "gpt-realtime")): WebSocket {
+  return new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
+    { headers: { Authorization: `Bearer ${token}` }, perMessageDeflate: false } as any,
+  );
+}
+
 export function speakRealtime(c: Creds, o: SpeechOpts, timeoutMs = 120000): Promise<SpeechResult> {
   const model = o.model || env("APIPLAN_REALTIME_MODEL", "gpt-realtime");
   return new Promise((resolve, reject) => {
     let ws: WebSocket;
-    // No OpenAI-Beta header: the beta shape is retired and answers beta_api_shape_disabled.
-    try { ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, { headers: { Authorization: `Bearer ${c.token}` } } as any); }
+    try { ws = openRealtime(c.token, model); }
     catch (e: any) { return reject(new Error(`realtime speech could not connect: ${e?.message ?? e}`)); }
 
     const chunks: Buffer[] = [];

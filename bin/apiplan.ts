@@ -350,6 +350,8 @@ USAGE
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
   apiplan talk [--voice v]       speak with the model out loud, both ways
+                                 ${dim("uses the warm daemon when one is up (~half the latency);")}
+                                 ${dim("--direct forces the in-process path · --park pre-warms it")}
   apiplan path                   print the line that puts commands on your PATH
   apiplan shell-init [shell]     shell glue so ? and * in a prompt need no quotes
                                  ${dim(`add to your rc:  eval "$(apiplan shell-init)"`)}
@@ -377,6 +379,23 @@ const optVal = (f: string) => {
   const v = argv[i + 1];
   return v === undefined || v.startsWith("-") ? true : v;
 };
+
+/**
+ * Start a daemon that will hold a warm realtime socket, and DON'T wait for it. Parking
+ * is opt-in at daemon boot (`APIPLAN_TALK_PARK`) because most daemon lifetimes only ever
+ * serve text calls and have no business holding an open voice session — but a daemon
+ * spawned by `talk` exists precisely to hold one, so it is armed from birth. This call
+ * goes direct regardless; the NEXT one finds the socket already connected and configured.
+ */
+function spawnTalkDaemon() {
+  try {
+    const p = Bun.spawn([process.execPath, import.meta.path, "daemon"], {
+      env: { ...process.env, APIPLAN_TALK_PARK: "on" },
+      stdin: "ignore", stdout: "ignore", stderr: "ignore",
+    });
+    p.unref();
+  } catch {}
+}
 
 switch (sub) {
   case undefined: await tui(); break;
@@ -468,7 +487,6 @@ switch (sub) {
   }
   case "doctor": await cmdDoctor(); break;
   case "talk": case "converse": {
-    const { talk } = await import("../src/talk.ts");
     // A persona long enough to be worth writing belongs in a file, not in argv.
     const personaFrom = () => {
       const f = valOf("--as-file") ?? valOf("--persona");
@@ -477,16 +495,60 @@ switch (sub) {
       return [fromFile, inline].filter(Boolean).join("\n\n") || undefined;
     };
     const label = { you: key("you  "), model: ok("model"), info: dim("·    ") };
+    const render = (kind: "you" | "model" | "info", text: string) =>
+      process.stdout.write(`  ${label[kind]} ${kind === "info" ? dim(text) : text}\n`);
+    // --tools <module>: a JS/TS module exporting { tools, onTool } (e.g. live-explain's
+    // lx_tools.mjs). Only names present in `tools` are ever dispatched — talk() enforces
+    // the allow-list; onTool is the module's own code, never shell/eval here.
+    let toolset: { tools?: any[]; onTool?: any } = {};
+    const toolsPath = valOf("--tools");
+    if (toolsPath) {
+      try {
+        const m: any = await import(require("node:path").resolve(toolsPath));
+        toolset = { tools: m.tools ?? m.default?.tools, onTool: m.onTool ?? m.default?.onTool };
+        if (!toolset.tools?.length || typeof toolset.onTool !== "function") throw new Error("module must export `tools` (array) and `onTool` (function)");
+      } catch (e: any) { process.stderr.write(dim(`  · tools module failed to load (${e?.message ?? e}) — continuing without tools\n`)); toolset = {}; }
+    }
+    const req = {
+      voice: valOf("--voice") ?? undefined,
+      model: valOf("--model") ?? undefined,
+      direction: personaFrom(),
+      greet: optVal("--greet"),
+      barge: has("--barge"),
+      hangup: has("--no-bye") ? [] : (valOf("--bye")?.split(",").map((s) => s.trim()).filter(Boolean) ?? ["bye", "goodbye", "good bye"]),
+      logFile: valOf("--log") ?? undefined,
+      tools: toolset.tools,
+      onTool: toolset.onTool,
+    };
+
+    // `--park` arms the warm socket and leaves: it is the "make the NEXT call fast" verb,
+    // useful before a demo and as the bench harness's setup step.
+    if (has("--park")) {
+      const { daemonParkStatus } = await import("../src/talk-daemon.ts");
+      if (!(await daemonAlive())) { spawnTalkDaemon(); await Bun.sleep(600); }
+      // The status probe alone does not park; ask the daemon to park by restarting it
+      // with parking on, which is what spawnTalkDaemon() already sets.
+      let st = await daemonParkStatus();
+      for (let i = 0; i < 20 && st && st.state !== "ready"; i++) { await Bun.sleep(400); st = await daemonParkStatus(); }
+      process.stdout.write(st ? JSON.stringify(st, null, 2) + "\n" : "daemon not reachable\n");
+      break;
+    }
+
+    // The daemon holds a pre-connected, pre-configured realtime socket and owns ffmpeg /
+    // ffplay, so the fast path is: hand it the request and render the transcript it
+    // streams back. `--direct` forces the in-process path — the original behaviour, and
+    // the control arm when measuring what the daemon is actually worth.
+    if (!has("--direct") && (process.env.APIPLAN_DAEMON ?? "auto") !== "off") {
+      const { talkViaDaemon } = await import("../src/talk-daemon.ts");
+      try { if (await talkViaDaemon(req, render)) break; } catch { /* fall through to direct */ }
+      // Nothing was listening. Start one for next time — the same rule the text path
+      // follows: a cold start must never be SLOWER than having no daemon at all.
+      spawnTalkDaemon();
+    }
+
+    const { talk } = await import("../src/talk.ts");
     try {
-      await talk({
-        voice: valOf("--voice") ?? undefined,
-        model: valOf("--model") ?? undefined,
-        direction: personaFrom(),
-        greet: optVal("--greet"),
-        barge: has("--barge"),
-        hangup: has("--no-bye") ? [] : (valOf("--bye")?.split(",").map((s) => s.trim()).filter(Boolean) ?? ["bye", "goodbye", "good bye"]),
-        onEvent: (kind, text) => process.stdout.write(`  ${label[kind]} ${kind === "info" ? dim(text) : text}\n`),
-      });
+      await talk({ ...req, onEvent: render });
     } catch (e: any) { die(e?.message ?? String(e)); }
     break;
   }

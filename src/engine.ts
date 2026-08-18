@@ -434,6 +434,19 @@ export async function daemonStop(): Promise<boolean> {
   return !!r?.ok;
 }
 
+/**
+ * The talk daemon is loaded LAZILY, never as a top-level import: importing it pulls in
+ * the realtime/voice stack and (lazily) provider credentials, and engine.ts is also the
+ * hot path for plain text calls, where every millisecond of module init is charged to
+ * the user. Memoised in a module-level handle rather than re-`await import()`ing at each
+ * use so that bye() — which must stay synchronous — can tell whether the park was ever
+ * armed and only then close it.
+ */
+let td: typeof import("./talk-daemon.ts") | null = null;
+async function talkDaemon(): Promise<typeof import("./talk-daemon.ts")> {
+  return (td ??= await import("./talk-daemon.ts"));
+}
+
 export async function runDaemon(): Promise<void> {
   if (await daemonAlive()) { process.stderr.write("apiplan daemon already running\n"); return; }
   ensureDir(STATE_DIR);
@@ -459,6 +472,18 @@ export async function runDaemon(): Promise<void> {
     }
     if (u.pathname === "/health") return new Response(VERSION);
     if (u.pathname === "/stop") { queueMicrotask(() => process.exit(0)); return new Response("bye"); }
+    if (u.pathname === "/talk" && req.method === "POST") {
+      // Same guard as /call: a thin CLI from another build must not be served by this
+      // daemon — its streaming line contract may have changed underneath it.
+      const cv = req.headers.get("x-apiplan-version");
+      if (cv && cv !== VERSION) return new Response(`version mismatch: daemon ${VERSION}, client ${cv}`, { status: 409 });
+      return (await talkDaemon()).handleTalk(req);
+    }
+    if (u.pathname === "/talk/status") {
+      // Built by hand rather than with Response.json: nothing else in this file relies
+      // on it, and the /call error path already spells the JSON response out this way.
+      return new Response(JSON.stringify((await talkDaemon()).parkStatus()), { headers: { "content-type": "application/json" } });
+    }
     if (u.pathname === "/call" && req.method === "POST") {
       // A client from a different build must not be served by this one: the request
       // contract may have changed. Tell it to replace us instead of answering wrongly.
@@ -498,8 +523,18 @@ export async function runDaemon(): Promise<void> {
   const warm = async () => {
     for (const p of Object.values(PROVIDERS)) {
       if (!p.probe().connected) continue;
-      const host = p.id === "anthropic" ? "https://api.anthropic.com/v1/models" : "https://chatgpt.com";
-      try { await fetch(host, { method: p.id === "anthropic" ? "GET" : "HEAD" }); } catch {}
+      const hosts: [string, string][] = p.id === "anthropic"
+        ? [["https://api.anthropic.com/v1/models", "GET"]]
+        // api.openai.com is the host the realtime WebSocket resolves and handshakes
+        // against, so keeping its DNS/TLS path hot shaves the handshake off a call that
+        // finds the park cold. Deliberately a SMALL win, not the main event: TLS is only
+        // ~15ms of the ~1200ms cold `apiplan talk` — the parked session is what buys the
+        // other ~900ms. Unauthenticated HEAD on purpose: establishing the path needs no
+        // credentials, and sending them to a probe endpoint would leak them for nothing.
+        : [["https://chatgpt.com", "HEAD"], ["https://api.openai.com/", "HEAD"]];
+      for (const [host, method] of hosts) {
+        try { await fetch(host, { method }); } catch {}
+      }
     }
   };
   warm();
@@ -510,10 +545,25 @@ export async function runDaemon(): Promise<void> {
   const where = IPC.kind === "unix" ? IPC.path : `127.0.0.1:${server.port}`;
   process.stderr.write(`apiplan daemon listening on ${where} (warm+keepalive ${ka}ms, idle-exit ${Math.round(idle / 60_000)}m)\n`);
 
+  // Parking holds an OpenAI realtime session open, so it is opt-in at boot: most daemon
+  // lifetimes serve only text calls and should not hold a voice session. The first
+  // `apiplan talk` arms it, and it re-parks after every call (see talk-daemon.ts).
+  if (/^(1|on|true|yes)$/i.test(process.env.APIPLAN_TALK_PARK ?? "")) {
+    talkDaemon().then((m) => m.armPark("daemon boot")).catch(() => {});
+  }
+
   // Serve until told to stop. Without this the function returns, the caller exits,
   // and the daemon dies the instant it was born — which silently turned the warm
   // path into a 2s penalty (every call re-spawned it). See DARWIN.md round 1.
-  const bye = () => { if (IPC.kind === "unix") { try { unlinkSync(IPC.path); } catch {} } process.exit(0); };
+  // A parked realtime socket dropped on process exit leaves the server side waiting on a
+  // session that will never speak again, so close it politely first. Guarded on the
+  // memoised handle: when no talk ever ran the module was never loaded, and awaiting an
+  // import inside a signal handler would delay (or, if it threw, block) the exit.
+  const bye = () => {
+    if (td) { try { td.shutdownPark(); } catch {} }
+    if (IPC.kind === "unix") { try { unlinkSync(IPC.path); } catch {} }
+    process.exit(0);
+  };
   process.on("SIGINT", bye);
   process.on("SIGTERM", bye);
   await new Promise<never>(() => {});
