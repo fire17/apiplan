@@ -119,6 +119,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       type: "server_vad", threshold: 0.65, prefix_padding_ms: 300,
       silence_duration_ms: Number(process.env.APIPLAN_VAD_SILENCE_MS) || 1100,
       ...(process.env.APIPLAN_IDLE_TIMEOUT_MS ? { idle_timeout_ms: Number(process.env.APIPLAN_IDLE_TIMEOUT_MS) } : {}),
+      // create_response:false → the server still detects turns and TRANSCRIBES your speech,
+      // but never auto-generates a reply. The model then speaks ONLY when something sends an
+      // explicit response.create (i.e. an injected line). This is "mouthpiece" mode: a live
+      // agent (the MIND) hears you via the transcript and answers through the voice, while the
+      // realtime model itself stays silent — and it can't echo-loop on its own audio/noise.
+      ...(process.env.APIPLAN_VAD_CREATE_RESPONSE === "0" ? { create_response: false } : {}),
     },
   };
 
