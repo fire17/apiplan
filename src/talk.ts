@@ -389,7 +389,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // and may paraphrase or even TRANSLATE it (observed live: an English inject spoken as
       // Spanish). Injected words are the MIND's words — deliver them exactly.
       const verbatim = `Say the following to the user now, word for word, in the exact language it is written in. Do not translate, do not paraphrase, do not add or omit anything:\n${text}`;
-      if (!closing) { ws.send(JSON.stringify({ type: "response.create", response: { instructions: verbatim } })); awaitingResponse = true; }
+      if (!closing) {
+        // OUT-OF-BAND response (conversation: "none") — mechanistic, not persona. A normal
+        // response.create weighs the whole conversation; with a pending user question the
+        // model HIJACKS the injected line to answer the conversation instead (observed live:
+        // MIND lines replaced by freelanced replies). Out-of-band responses see ONLY the
+        // instructions, so the MIND's words cannot be pulled off course. The history item
+        // right before keeps the conversation aware the line was said (one answer, no repeats).
+        try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+          type: "message", role: "assistant", content: [{ type: "text", text }] } })); } catch {}
+        ws.send(JSON.stringify({ type: "response.create", response: { conversation: "none", instructions: verbatim } }));
+        awaitingResponse = true;
+      }
       say("info", "injected context");
     };
     // Cancel + truncate the response in flight (shared shape with the speech_started barge).
@@ -460,6 +471,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
                     } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
                       say("info", "pong");
+                    } else if (j.context) {
+                      // SILENT context preload (fire17's design, 2026-08-18): push state into the
+                      // conversation as a system note WITHOUT triggering any speech — the model's
+                      // very next answer already knows it, before the human even asks. This is how
+                      // the MIND keeps the mouth in sync continuously, not just at launch.
+                      ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+                        type: "message", role: "system",
+                        content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: ${String(j.context)}` }] } }));
+                      say("info", "context preloaded (silent)");
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
                   } catch {}
                 }
