@@ -39,7 +39,8 @@ export type TalkOpts = {
   tools?: Array<Record<string, unknown>>;
   /** Executes one declared tool. talk() itself never runs shell/eval — whatever this
    *  does is the caller's code, and only names present in `tools` reach it. */
-  onTool?: (name: string, args: Record<string, unknown>) => Promise<string> | string;
+  // May return a string, or a structured value that is JSON-serialized before it reaches the model.
+  onTool?: (name: string, args: Record<string, unknown>) => Promise<unknown> | unknown;
   /** A pre-opened realtime WebSocket owned by the caller (the warm daemon's parked
    *  socket). May already be OPEN — talk() must not wait for onopen in that case. */
   socket?: WebSocket;
@@ -145,6 +146,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // in-flight deltas — otherwise the model's context contains words the user never heard,
   // and ghost audio plays after the interrupt.
   let curResponseId: string | null = null;   // response currently generating
+  let responseActive = false;                 // a response is mid-generation (safe to cancel)
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -314,7 +316,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       let output: string;
       try {
         const args = item.arguments ? JSON.parse(item.arguments) : {};
-        output = String(await o.onTool!(item.name, args));
+        const raw = await o.onTool!(item.name, args);
+        // Handlers may return a string OR a structured object (JSON tool output is
+        // common). String(obj) is "[object Object]" — serialize non-strings instead.
+        output = typeof raw === "string" ? raw : JSON.stringify(raw);
       } catch (err: any) {
         output = `The tool could not run: ${String(err?.message ?? err).slice(0, 200)}`;
       }
@@ -328,9 +333,22 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       let ev: any;
       try { ev = JSON.parse(String(e.data)); } catch { return }
       if (!connected) { connected = true; if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; } }
-      // Log every server event except the audio-delta firehose (bytes + volume).
-      if (ev.type !== "response.output_audio.delta" && ev.type !== "response.audio.delta") {
+      // Log every server event except the audio firehose (bytes) and the transcript
+      // deltas (logged below WITH their text, for the live word-by-word monitor).
+      if (ev.type !== "response.output_audio.delta" && ev.type !== "response.audio.delta"
+          && ev.type !== "response.output_audio_transcript.delta" && ev.type !== "response.audio_transcript.delta"
+          && ev.type !== "conversation.item.input_audio_transcription.delta") {
         rec({ ws: ev.type, ...(ev.error ? { error: ev.error?.code ?? ev.error?.message } : {}) });
+      }
+      // Word-by-word transcript deltas → sidecar, so a monitor can render speech as it lands.
+      switch (ev.type) {
+        case "response.output_audio_transcript.delta":
+        case "response.audio_transcript.delta":
+          if (ev.delta) rec({ ev: "model_delta", text: ev.delta });
+          break;
+        case "conversation.item.input_audio_transcription.delta":
+          if (ev.delta) rec({ ev: "you_delta", text: ev.delta });
+          break;
       }
       switch (ev.type) {
         case "session.updated":
@@ -345,6 +363,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "response.created":
           curResponseId = ev.response?.id ?? null;
+          responseActive = true;
           break;
         case "response.output_item.added":
           // The assistant message whose audio is about to play — barge-in truncates THIS.
@@ -356,8 +375,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // actually heard, and drop the cancelled response's still-in-flight deltas —
           // otherwise the model's context keeps words the user never heard, and ghost
           // audio plays after the interrupt.
-          if (speaking && o.barge) {
+          // Only cancel a response that is genuinely still generating — speaking can lag
+          // response.done by one event, and cancelling a finished response draws a
+          // "response_cancel_not_active" error for nothing.
+          if (speaking && o.barge && responseActive) {
             ws.send(JSON.stringify({ type: "response.cancel" }));
+            responseActive = false;
             if (curResponseId) cancelledResponses.add(curResponseId);
             if (curItemId) {
               const heardMs = itemFirstDeltaAt
@@ -431,6 +454,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "response.done":
           speaking = false;
+          responseActive = false;
           endPlayer();
           if (closing) {
             // Give the queued goodbye audio time to drain out of the speaker, then hang up.
@@ -438,6 +462,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "error":
+          // A cancel that lost the race with response.done is expected during barge-in,
+          // not a call failure — log it quietly and don't mark the call errored.
+          if (ev.error?.code === "response_cancel_not_active") {
+            rec({ ev: "info", text: "cancel raced response.done (harmless)" });
+            break;
+          }
           say("info", `error: ${ev.error?.message ?? "unknown"}`);
           if (!result) result = { reason: "error", detail: ev.error?.code ?? ev.error?.message };
           break;

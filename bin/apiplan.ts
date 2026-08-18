@@ -525,6 +525,9 @@ switch (sub) {
     // useful before a demo and as the bench harness's setup step.
     if (has("--park")) {
       const { daemonParkStatus } = await import("../src/talk-daemon.ts");
+      // A daemon that answers /health but not /talk/status is a stale-code daemon from
+      // before park support — stop it so a fresh, park-capable one takes its place.
+      if ((await daemonAlive()) && !(await daemonParkStatus())) { await daemonStop(); await Bun.sleep(300); }
       if (!(await daemonAlive())) { spawnTalkDaemon(); await Bun.sleep(600); }
       // The status probe alone does not park; ask the daemon to park by restarting it
       // with parking on, which is what spawnTalkDaemon() already sets.
