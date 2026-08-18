@@ -424,6 +424,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // ready — no dead air, no overlap. Unconditional: the mouth's audio outlives its response,
         // so checking responseActive alone let the MIND play over the mouth's tail.
         silenceMouth();
+        // A breath before the MIND speaks — the hard cut straight into MIND audio read as
+        // "חד וטיפה מורגש" (sharp) to fire17's ear. A short silence cushion makes the
+        // takeover land like a natural turn-take. Tune by ear via APIPLAN_MIND_CUSHION_MS.
+        const cushion = Number(process.env.APIPLAN_MIND_CUSHION_MS) || 180;
+        await new Promise((res) => setTimeout(res, cushion));
+        if (closed) { mindBusy = false; return; }
         const f = `/tmp/apiplan-mind-${Date.now()}.wav`;
         await Bun.write(f, r.bytes);
         const ms = ((r.bytes.length - 44) / 2 / RATE) * 1000;
