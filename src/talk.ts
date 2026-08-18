@@ -111,8 +111,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     noise_reduction: { type: o.barge ? "near_field" : "far_field" },
     // 0.5 was low enough that room noise opened a turn, and Whisper answers near-silence
     // with a canned hallucination. A higher bar plus a longer pause needs actual speech.
-    // idle_timeout_ms lets the server notice a walked-away user instead of burning session.
-    turn_detection: { type: "server_vad", threshold: 0.65, prefix_padding_ms: 300, silence_duration_ms: 800, idle_timeout_ms: 15000 },
+    // silence_duration_ms is how long you must pause before it decides you're done and
+    // replies — too low and it jumps in mid-thought. Raise the default and let it be tuned.
+    // idle_timeout_ms makes the model SELF-PROMPT after silence ("still there?") — off by
+    // default (it nags), opt in with APIPLAN_IDLE_TIMEOUT_MS to notice a walked-away user.
+    turn_detection: {
+      type: "server_vad", threshold: 0.65, prefix_padding_ms: 300,
+      silence_duration_ms: Number(process.env.APIPLAN_VAD_SILENCE_MS) || 1100,
+      ...(process.env.APIPLAN_IDLE_TIMEOUT_MS ? { idle_timeout_ms: Number(process.env.APIPLAN_IDLE_TIMEOUT_MS) } : {}),
+    },
   };
 
   // Whisper finishes transcribing your turn AFTER the model has already answered, so
@@ -197,9 +204,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try { player?.stdin?.end?.(); } catch {}
     player = null;                 // the next reply spawns a fresh one, with a fresh clock
   };
-  /** Barge-in: kill it mid-word, discarding whatever is still queued. */
+  /** Barge-in: kill it mid-word, discarding whatever is still queued. SIGKILL, not TERM —
+   *  ffplay has audio buffered ahead, and on TERM it keeps draining that buffer for a beat,
+   *  which is exactly the "two voices at once" overlap when an injection interrupts. */
   const stopPlayer = () => {
-    try { player?.kill(); } catch {}
+    try { player?.kill(9); } catch {}
     player = null;
   };
   // Note: the player is spawned lazily on the first audio byte (below), NOT pre-spawned —
@@ -351,9 +360,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let injectOff = 0;
     const sendInjected = (text: string) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({ type: "conversation.item.create",
-        item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
-      if (!closing) ws.send(JSON.stringify({ type: "response.create" }));
+      // Drive the assistant's OWN next response with these instructions, so the injected
+      // context is SPOKEN in its voice — not posted as a user message it merely reacts to.
+      if (!closing) ws.send(JSON.stringify({ type: "response.create", response: { instructions: text } }));
       say("info", "injected context");
     };
     // Cancel + truncate the response in flight (shared shape with the speech_started barge).
@@ -395,7 +404,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 injectOff += Buffer.byteLength(chunk.slice(0, cut + 1), "utf8");
                 for (const ln of chunk.slice(0, cut).split("\n")) {
                   const s = ln.trim(); if (!s) continue;
-                  try { const j = JSON.parse(s); if (j.text) injectContext(String(j.text), String(j.mode || "graceful")); } catch {}
+                  try {
+                    const j = JSON.parse(s);
+                    if (j.session) {           // live persona/context swap — no reconnect
+                      if (!closed && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", instructions: String(j.session) } }));
+                        say("info", "persona updated live");
+                      }
+                    } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
+                  } catch {}
                 }
               }
             }
