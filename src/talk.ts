@@ -223,18 +223,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }, 700);
     }
   };
+  // Players that were handed off by endPlayer() and are STILL AUDIBLE while they drain.
+  // Without this set they were unreachable: endPlayer() nulled `player`, so a later
+  // stopPlayer() killed nothing and the mouth's tail kept playing UNDER the MIND's voice —
+  // the residual "still there was more" overlap. (fire17, 2026-08-18.)
+  const draining = new Set<any>();
   /** End of a reply: close stdin so the player drains what is queued, then exits. */
   const endPlayer = () => {
     try { player?.stdin?.flush?.(); } catch {}
     try { player?.stdin?.end?.(); } catch {}
+    if (player) {                  // still audible until the buffer runs out — keep it killable
+      const p = player;
+      draining.add(p);
+      try { p.exited.then(() => draining.delete(p)); } catch { draining.delete(p); }
+    }
     player = null;                 // the next reply spawns a fresh one, with a fresh clock
   };
   /** Barge-in: kill it mid-word, discarding whatever is still queued. SIGKILL, not TERM —
    *  ffplay has audio buffered ahead, and on TERM it keeps draining that buffer for a beat,
-   *  which is exactly the "two voices at once" overlap when an injection interrupts. */
+   *  which is exactly the "two voices at once" overlap when an injection interrupts.
+   *  Kills the DRAINING players too — a finished-generating reply is still coming out of the
+   *  speaker, and that tail is what the MIND used to talk over. */
   const stopPlayer = () => {
+    const hadLive = !!player;
     try { player?.kill(9); } catch {}
     player = null;
+    const n = draining.size;
+    for (const p of draining) { try { p.kill(9); } catch {} }
+    draining.clear();
+    // Evidence in the log that the mouth was actually silenced — `n` is the tail that used to
+    // keep playing under the MIND's voice (unreachable before the draining set existed).
+    if (hadLive || n) say("info", `mouth silenced (live=${hadLive ? 1 : 0} draining-tail=${n})`);
   };
   // Note: the player is spawned lazily on the first audio byte (below), NOT pre-spawned —
   // ffplay with -autoexit on a still-empty stdin exits immediately (code 123). The
@@ -401,9 +420,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       const mindVoice = process.env.APIPLAN_MIND_VOICE || "ash";
       speakRealtime(c, { text, voice: mindVoice }, 60000).then(async (r) => {
         if (closed) { mindBusy = false; return; }
-        // MIND priority (code-enforced handoff): cut any mouth reply mid-air right as the
-        // MIND's audio is ready — no dead air, no overlap.
-        if (responseActive && !mindResponse) bargeNow();
+        // MIND priority (code-enforced handoff): silence the mouth right as the MIND's audio is
+        // ready — no dead air, no overlap. Unconditional: the mouth's audio outlives its response,
+        // so checking responseActive alone let the MIND play over the mouth's tail.
+        silenceMouth();
         const f = `/tmp/apiplan-mind-${Date.now()}.wav`;
         await Bun.write(f, r.bytes);
         const ms = ((r.bytes.length - 44) / 2 / RATE) * 1000;
@@ -426,6 +446,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         mindBusy = false;
         if (closing || ws.readyState !== WebSocket.OPEN) return;
         pendingMindHistory = text;
+        silenceMouth();   // fallback path speaks THROUGH the mouth — still must not overlap its tail
         const verbatim = `Say the following to the user now, word for word, in the exact language it is written in. Do not translate, do not paraphrase, do not add or omit anything:\n${text}`;
         ws.send(JSON.stringify({ type: "response.create", response: { conversation: "none", instructions: verbatim } }));
         awaitingResponse = true;
@@ -444,6 +465,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       stopPlayer(); speaking = false; playingUntil = 0;
       // A voice barge also silences the MIND's narrator audio (it has its own player).
       if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; mindBusy = false; }
+    };
+    // THE MOUTH IS SILENCED BY CODE WHENEVER THE MIND IS ABOUT TO SPEAK (fire17's law,
+    // 2026-08-18: "כשהמוח מדבר זה חייב להשתיק מיידית מבחינת קוד את הפה" — and the MIND's voice
+    // must never come over the mouth's). bargeNow() ALONE IS NOT ENOUGH: it early-returns when
+    // !responseActive, but the mouth's AUDIO OUTLIVES ITS RESPONSE (audio arrives far faster than
+    // it plays — see the playingUntil note above), so a MIND line starting just after response.done
+    // used to play ON TOP of the mouth's tail. This kills the mouth's audio unconditionally, and
+    // additionally cancels/truncates the response when one is still generating. No agent has to
+    // know any of this — the code enforces it on every MIND utterance.
+    const silenceMouth = () => {
+      if (responseActive && !mindResponse) bargeNow();       // still generating: cancel + truncate + stop
+      else { stopPlayer(); speaking = false; playingUntil = 0; }   // done generating, still AUDIBLE: kill the tail
     };
     const injectContext = (text: string, mode: string) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
@@ -561,7 +594,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           {
             const minSpeech = Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500;
             const noiseBlip = lastSpeechMs > 0 && lastSpeechMs < minSpeech;
-            if (!awaitingResponse && (suppressAuto || noiseBlip)) {
+            // mindBusy: while the MIND has audio in flight the mouth is FORBIDDEN to start a
+            // response of its own — otherwise a VAD auto-reply talks over the MIND (two voices).
+            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responseActive = false;
