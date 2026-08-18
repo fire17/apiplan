@@ -4,9 +4,10 @@
 //
 // Turn-taking is the server's job: `server_vad` means OpenAI decides when you stopped
 // talking, so there is no push-to-talk and no silence heuristic of our own to get wrong.
-import { openai, openRealtime } from "./providers.ts";
+import { openai, openRealtime, speakRealtime } from "./providers.ts";
 import { micCommand, speakerCommand, ensureDir } from "./platform.ts";
 import { dirname } from "node:path";
+import { unlinkSync } from "node:fs";
 
 const RATE = 24000;
 
@@ -173,6 +174,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
   let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
   let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
+  let mindBusy = false;                       // a MIND narrator line is generating or playing (serializes the queue)
+  let mindPlayer: any = null;                 // the MIND voice's own ffplay child (killed on barge/exit)
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
   // response.create we send, cleared on response.created / response.done / cancel. Without it,
@@ -250,6 +253,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try { m?.kill(); } catch {}
     if (m) setTimeout(() => { try { m.kill(9); } catch {} }, 500);   // escalate if ffmpeg ignores TERM
     stopPlayer();
+    if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; }
     try { logw?.flush?.(); } catch {}
   };
   // Clean up the child ffmpeg/ffplay on EVERY exit path, not just Ctrl-C: a leftover
@@ -384,26 +388,48 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let injectOff = 0;
     const sendInjected = (text: string) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
-      // Drive the assistant's OWN next response with these instructions, so the injected
-      // context is SPOKEN in its voice — not posted as a user message it merely reacts to.
-      // The verbatim wrapper is mechanical: without it the model treats the text as a topic
-      // and may paraphrase or even TRANSLATE it (observed live: an English inject spoken as
-      // Spanish). Injected words are the MIND's words — deliver them exactly.
-      const verbatim = `Say the following to the user now, word for word, in the exact language it is written in. Do not translate, do not paraphrase, do not add or omit anything:\n${text}`;
-      if (!closing) {
-        // OUT-OF-BAND response (conversation: "none") — mechanistic, not persona. A normal
-        // response.create weighs the whole conversation; with a pending user question the
-        // model HIJACKS the injected line to answer the conversation instead (observed live:
-        // MIND lines replaced by freelanced replies). Out-of-band responses see ONLY the
-        // instructions, so the MIND's words cannot be pulled off course.
-        // The history item is added AFTER the line is spoken (response.done) — inserting it
-        // BEFORE made the model treat the line as already-said and freelance a follow-up
-        // (observed live: generic closers instead of the MIND's words).
+      // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
+      // conversational model with "say this word for word" instructions proved FLAKY: it
+      // paraphrased, translated (English→Spanish live), summarized long lines, and with a
+      // pending user question freelanced replies instead. So MIND lines no longer go through
+      // the mouth's model at all: a dedicated narrator connection (speakRealtime — the same
+      // engine as `apiplan speak`) renders the exact words as audio in a DISTINCT voice
+      // (APIPLAN_MIND_VOICE, default "ash"), and we play it directly. The mouth cannot
+      // reword what it never speaks — and the human hears by ear which tier is talking.
+      say("info", "injected context");
+      mindBusy = true;
+      const mindVoice = process.env.APIPLAN_MIND_VOICE || "ash";
+      speakRealtime(c, { text, voice: mindVoice }, 60000).then(async (r) => {
+        if (closed) { mindBusy = false; return; }
+        // MIND priority (code-enforced handoff): cut any mouth reply mid-air right as the
+        // MIND's audio is ready — no dead air, no overlap.
+        if (responseActive && !mindResponse) bargeNow();
+        const f = `/tmp/apiplan-mind-${Date.now()}.wav`;
+        await Bun.write(f, r.bytes);
+        const ms = ((r.bytes.length - 44) / 2 / RATE) * 1000;
+        playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
+        mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", f],
+          { stdout: "ignore", stderr: "ignore" });
+        say("model", text);   // the exact words now audible — the monitor/GUI see the true line
+        mindPlayer.exited.then(() => {
+          mindPlayer = null; mindBusy = false;
+          try { unlinkSync(f); } catch {}
+          // Record the line in the mouth's conversation so it KNOWS it was said (one
+          // answer, no repeats) — safe now, because the mouth never renders this item.
+          try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+            type: "message", role: "assistant", content: [{ type: "output_text", text }] } })); } catch {}
+          flushInjectQueue();
+        });
+      }).catch(() => {
+        // Narrator unreachable → legacy best-effort path: out-of-band verbatim instruction
+        // on the mouth's own socket (may paraphrase — better than silence).
+        mindBusy = false;
+        if (closing || ws.readyState !== WebSocket.OPEN) return;
         pendingMindHistory = text;
+        const verbatim = `Say the following to the user now, word for word, in the exact language it is written in. Do not translate, do not paraphrase, do not add or omit anything:\n${text}`;
         ws.send(JSON.stringify({ type: "response.create", response: { conversation: "none", instructions: verbatim } }));
         awaitingResponse = true;
-      }
-      say("info", "injected context");
+      });
     };
     // Cancel + truncate the response in flight (shared shape with the speech_started barge).
     const bargeNow = () => {
@@ -416,37 +442,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {}
       }
       stopPlayer(); speaking = false; playingUntil = 0;
+      // A voice barge also silences the MIND's narrator audio (it has its own player).
+      if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; mindBusy = false; }
     };
     const injectContext = (text: string, mode: string) => {
-      // Long texts get COMPRESSED by the model even under the verbatim wrapper (observed
-      // live: a 4-sentence update spoken as a one-line summary). Sentence-split into short
-      // chunks — each short chunk delivers verbatim, and the serialized queue speaks them
-      // back-to-back in order, so long updates arrive intact instead of summarized.
-      const chunks: string[] = [];
-      let buf = "";
-      for (const s of text.split(/(?<=[.!?…])\s+/)) {
-        if (buf && buf.length + s.length > 200) { chunks.push(buf); buf = s; }
-        else buf = buf ? `${buf} ${s}` : s;
-      }
-      if (buf) chunks.push(buf);
-      // Never fire response.create while one is active — the server rejects it
-      // ("conversation_already_has_active_response"). If nothing is speaking, say it now.
-      // Otherwise queue it: graceful waits for the sentence to end; interrupt cancels the
-      // current response so its response.done arrives at once and the queue flushes then.
-      // MIND PRIORITY — code-enforced handoff (fire17's law, 2026-08-18: "the code needs
-      // to enforce this... seamless for the agentic agents"): if the mouth's OWN auto-reply
-      // is mid-flight when a MIND line arrives, it is superseded INSTANTLY — cancelled,
-      // truncated, audio cut — whatever the mode. Graceful pacing applies only between the
-      // MIND's own lines, never to keep a freelancing mouth on air over the MIND.
-      if (responseActive && !mindResponse) bargeNow();
-      else if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
-      if (!responseActive && !awaitingResponse && chunks.length) sendInjected(chunks.shift()!);
-      injectQueue.push(...chunks);
+      // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
+      // by construction (the chunk-splitting workaround existed only because the mouth's
+      // model summarized long instruction-driven lines).
+      // MIND PRIORITY — code-enforced handoff (fire17's law, 2026-08-18, reconfirmed in
+      // Hebrew: "כשהמוח מדבר זה חייב להשתיק מיידית מבחינת קוד את הפה"): interrupt mode cuts
+      // the mouth NOW; graceful lets the current sentence land — and either way the moment
+      // the MIND's audio is ready, sendInjected barges any mouth reply still on the air.
+      // No agent has to know any of this; the code does it.
+      if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
+      if (!responseActive && !awaitingResponse && !mindBusy) { sendInjected(text); return; }
+      injectQueue.push(text);
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
     // ordered instead of firing every item at once (which the server would reject all-but-first).
-    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse) sendInjected(injectQueue.shift()!); };
+    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy) sendInjected(injectQueue.shift()!); };
     function startInjectLoop() {
       if (!injectPath) return;
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
