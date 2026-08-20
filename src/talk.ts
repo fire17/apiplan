@@ -203,6 +203,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // (= the user-turn boundary per fire17), on mute flips, and at a 10-minute failsafe;
   // segments that never rise above the silence floor are deleted. APIPLAN_ARCHIVE=0 off.
   const archOn = process.env.APIPLAN_ARCHIVE !== "0";
+  // Privacy switch (fire17, voice, 2026-08-20): archive_mode "always" (default) keeps
+  // every frame even while muted; "caps-only" archives only what the model can hear.
+  // Read live from settings.json (2s cache) so the dashboard toggle applies instantly.
+  let archMode = "always"; let archModeAt = 0;
+  const archAllowed = () => {
+    const now = Date.now();
+    if (now - archModeAt > 2000) {
+      archModeAt = now;
+      try { archMode = JSON.parse(fs.readFileSync(`${process.env.HOME}/.livemind/settings.json`, "utf8")).archive_mode || "always"; }
+      catch { archMode = "always"; }
+    }
+    return archMode !== "caps-only" || !micMuted;
+  };
   const archDir = `${process.env.HOME}/.livemind/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
   let archFd = -1; let archBytes = 0; let archPeak = 0; let archN = 0; let archPath = "";
   let archLastResp = "";
@@ -226,7 +239,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     archBytes = 0; archPeak = 0; archPath = "";
   };
   const archWrite = (frame: Uint8Array) => {
-    if (!archOn) return;
+    if (!archOn || !archAllowed()) return;
     try {
       if (archFd < 0) {
         fs.mkdirSync(archDir, { recursive: true });
