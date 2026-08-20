@@ -1259,6 +1259,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           responseActive = true;
           mindResponse = awaitingResponse;   // if we sent this response.create, it's the MIND speaking
+          if (!awaitingResponse) pendingMouthReply = false;   // a REAL covering auto-reply is now active — the supersede is genuine (see speech_started note)
           awaitingResponse = false;   // the send we were awaiting has now materialized
           break;
         case "response.output_item.added":
@@ -1274,7 +1275,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
-          pendingMouthReply = false;   // a NEW turn supersedes a held reply — its own VAD auto-reply covers him
+          // Supersede fix (EVA's 17:01 question, proven real): the held-reply clear used to
+          // happen HERE, at speech_started — before the turn's duration is even knowable. A
+          // noise blip (<minSpeech, frequent at VAD 500) would clear the hold and then its own
+          // cancelled auto-reply never re-held (the !noiseBlip guard) — his ONLY pending answer
+          // silently dropped: "הוא לא מגיב לי" cause #2, independent of E128. The hold now
+          // survives until a REAL covering reply materializes (cleared in response.created when
+          // a live auto-reply goes active) or the release at mind-audio end fires.
           // Barge-in done RIGHT (R7): cancel generation, tell the server how much was
           // actually heard, and drop the cancelled response's still-in-flight deltas —
           // otherwise the model's context keeps words the user never heard, and ghost
