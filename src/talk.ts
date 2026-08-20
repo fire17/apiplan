@@ -237,6 +237,49 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let lastSpeechStopAt = 0;   // sustained-silence gate: MIND may speak only after ~2.5s of real quiet
 
   let greeted = false;
+  // ── PRESENCE-GATED OPENING (LM_GREET) ─ call 31599, 2026-08-20 ──────────────────
+  // WHY THIS IS AN ENGINE KNOB AND NOT PERSONA TEXT (the MIND's finding, measured live):
+  // the opening line is not the model's idea. The ENGINE sends a `response.create` at
+  // connect — the parked-socket path in onOpen, the fresh path in `session.updated` — so
+  // the model is executing an explicit request to speak. No instruction inside the persona
+  // or now.txt ("do not greet", "stay silent") can cancel a response the engine itself
+  // asked for: the text is read AS the direction for that opening line, never as a veto of
+  // it. On 31599 the no-greet direction was in context and the mouth still opened the call.
+  // Muting the audio would not be the fix either — a muted greeting still burns a response,
+  // still enters the transcript, and still leaks into the mic as an echo turn. So the gate
+  // has to sit on EMISSION, which is exactly what these modes move (never WHAT is sent):
+  //   presence (DEFAULT, his design) — nothing is emitted at connect. A one-shot opener is
+  //     ARMED and fires only after the FIRST you-turn that arrives UNFLAGGED by the echo
+  //     belts, so the mouth's first words always land on a proven listener. A restart into
+  //     an empty room then costs nothing, no empty-room speech enters the human record, and
+  //     31599's greeting-echo race becomes UNREACHABLE: with no connect-time emission there
+  //     is no greeting audio to bounce back through the speakers as a you-turn at all.
+  //   1 / legacy / on / connect — greet at connect, byte-for-byte as before. The escape
+  //     hatch for an ATTENDED restart, where somebody is already sitting there listening.
+  //   0 / off — never greet; the opener is disarmed too.
+  //
+  // WHY PRESENCE IS THE DEFAULT AND NOT JUST A KNOB (decided 2026-08-20, W36 verify).
+  // The original filing asked only for a knob ("needs an engine knob (e.g. LM_GREET=0 /
+  // config flag) so restarts while he is away stay silent"); the MIND then UPGRADED that
+  // ask with a fold order, and the fold order is the authority here — his words verbatim:
+  //   "the opening line should WAIT for an unflagged you-turn instead of assuming a
+  //    listener; then the restart costs nothing, no empty-room speech enters the human
+  //    record, and the greeting-echo race from 31599 becomes unreachable."
+  // A knob defaulting to speak-first still speaks into an empty room on every unattended
+  // restart, and the launcher does NOT export LM_GREET today — so a default of `legacy`
+  // would mean the fold order never actually runs. Hence: presence is the default AND the
+  // fallback for any unrecognised value (silence is the fail-safe), legacy is the explicit
+  // attended-restart escape hatch, and the connect say-info below is LOUD about which mode
+  // is live so no launcher is ever surprised by a mouth that opens — or one that does not.
+  // HONEST SCOPE of the legacy invariant: legacy is byte-identical to ec768e4 in its CONNECT
+  // EMISSION only. The half-duplex belt also refuses to resend the greeting's overlap window
+  // in legacy mode (that is defect 1's fix, by design) — same greeting on the wire, one less
+  // echo door behind it.
+  const greetMode = (process.env.LM_GREET ?? "presence").trim().toLowerCase();
+  const GREET_LEGACY = greetMode === "1" || greetMode === "legacy" || greetMode === "on" || greetMode === "true" || greetMode === "connect";
+  const GREET_OFF = greetMode === "0" || greetMode === "off" || greetMode === "false";
+  const GREET_PRESENCE = !GREET_LEGACY && !GREET_OFF;
+  let openerArmed = false;      // presence mode: an opening line is owed, waiting for HIM
   // Audio arrives far faster than it plays, so "the model stopped generating" is NOT
   // "the speaker stopped making noise". Muting on generation-end reopened the mic while
   // seconds of reply were still coming out of the speaker — which the mic then captured
@@ -395,6 +438,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // gives its quick opener before the MIND takes over with the truth.
   let suppressAuto = process.env.APIPLAN_VAD_CREATE_RESPONSE === "0";
   let lastSuppressEchoAt = 0;   // throttle for the suppressed-auto-reply visibility echo
+  let lastEmptyRoomAt = 0;      // same, for the empty-room cancel (a parked session self-prompts every ~15s)
+  let lastOpenerHeldAt = 0;     // same, for the held-opener notice (it re-arms on every turn while the mouth is closed)
   // ECHO-DEDUPE BELT (EVA integrity finding 2026-08-20: three ev:"you" turns were the
   // system's OWN sentences re-heard through the speakers — one even survived the 2000
   // loudness bar at high volume, leak/speech margin is only ~1.15x). Recent spoken texts
@@ -676,20 +721,51 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const greetInstructions = () =>
       [o.direction, typeof o.greet === "string" ? o.greet : ""].filter(Boolean).join("\n\n");
 
+    /** Emit the opening line. The payload is EXACTLY what each path has always sent — a
+     *  parked socket carries the persona in response.instructions (so the daemon's parked
+     *  session stays generic), a fresh connect already has the persona live in the session
+     *  and carries only a one-off direction — so LM_GREET moves WHEN it is sent, never what.
+     *  One-shot by construction: `greeted` and `openerArmed` both close here. */
+    const sendGreeting = (why?: string) => {
+      if (greeted || closed || closing || ws.readyState !== WebSocket.OPEN) return;
+      greeted = true; openerArmed = false;
+      const gi = o.skipSessionUpdate ? greetInstructions() : (typeof o.greet === "string" ? o.greet : "");
+      ws.send(JSON.stringify({ type: "response.create", ...(gi ? { response: { instructions: gi } } : {}) }));
+      awaitingResponse = true;
+      if (why) say("info", why);
+    };
+
     const onOpen = () => {
       if (o.skipSessionUpdate) {
         // Parked socket: session.updated will never arrive, so nothing may be gated on it.
         // Tools are per-call: merge them in with a minimal update that touches NOTHING
         // else (partial session.update merges; the observed abort was from resending
         // turn_detection MID-RESPONSE, which this is not — no response is in flight yet).
-        if (o.tools?.length) {
-          ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", tools: o.tools, tool_choice: "auto" } }));
+        // PARKED-SOCKET PERSONA (W36 verify, HIGH). The persona/direction is deliberately kept
+        // OUT of the park's own session config so the daemon's parked session stays generic —
+        // it has always travelled on the CONNECT GREETING instead (greetInstructions(), below).
+        // Under presence/off there IS no connect greeting, so that carrier is gone: without
+        // this, every warm-socket call answers him in the default assistant voice for its whole
+        // life, and under LM_GREET=0 by construction forever. The fix rides the per-call
+        // session.update that already exists here — the park is generic until a call claims it,
+        // and this update is that claim — so the persona is in force BEFORE his first turn can
+        // be answered. The ONE case excluded is the one that still HAS a carrier — legacy WITH a
+        // greeting — so its connect emission stays byte-identical to ec768e4; a legacy call with
+        // no greeting has no carrier either and gets the persona here too. When the presence
+        // opener does fire later it still sends greetInstructions() (persona + greet) as
+        // response.instructions: same text, and an override rather than an append, so the two
+        // carriers cannot drift into two different personas.
+        const parkPersona = !(GREET_LEGACY && o.greet) && o.direction ? o.direction : "";
+        if (parkPersona || o.tools?.length) {
+          ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
+            ...(parkPersona ? { instructions: parkPersona } : {}),
+            ...(o.tools?.length ? { tools: o.tools, tool_choice: "auto" } : {}) } }));
+          if (parkPersona) say("info", `persona carried into the warm session (${parkPersona.length} chars) — no connect greeting to carry it (GREET MODE ${!o.greet ? "NONE" : GREET_OFF ? "OFF" : "PRESENCE"})`,
+            { park_persona: true, chars: parkPersona.length });
         }
         if (o.greet && !greeted) {
-          greeted = true;
-          const gi = greetInstructions();
-          ws.send(JSON.stringify({ type: "response.create", ...(gi ? { response: { instructions: gi } } : {}) }));
-          awaitingResponse = true;
+          if (GREET_LEGACY) sendGreeting();
+          else if (GREET_PRESENCE) openerArmed = true;   // held until his first unflagged turn
         }
       } else {
         ws.send(JSON.stringify({
@@ -703,7 +779,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           },
         }));
       }
-      say("info", o.greet ? "connecting — it will speak first. Ctrl-C to stop." : "listening — speak, and it answers. Ctrl-C to stop.");
+      // The mode is ANNOUNCED: under presence/off the mouth is silent at connect by design,
+      // and a silence nobody can tell from a dead mouth is how an outage runs undetected.
+      // LOUD by policy (W36): presence is the DEFAULT and the launcher does not export
+      // LM_GREET, so the line states the active mode, whether it came from the env or from
+      // the default, and the one-word escape hatch back to speak-first. A silent mouth must
+      // never be indistinguishable from a dead one — or from a mode nobody chose.
+      const greetSrc = process.env.LM_GREET ? `LM_GREET=${greetMode}` : "LM_GREET unset → presence DEFAULT";
+      const greetModeName = !o.greet ? "none" : GREET_LEGACY ? "legacy" : GREET_OFF ? "off" : "presence";
+      say("info", !o.greet ? `listening — speak, and it answers. GREET MODE: NONE (no greeting requested for this call; ${greetSrc}). Ctrl-C to stop.`
+        : GREET_LEGACY ? `GREET MODE: LEGACY (${greetSrc}) — connecting, and it SPEAKS FIRST at connect, listener or not. Ctrl-C to stop.`
+        : GREET_OFF ? `GREET MODE: OFF (${greetSrc}) — it NEVER opens; the mouth still answers when you speak. LM_GREET=presence to restore the held opening, LM_GREET=1 to speak first. Ctrl-C to stop.`
+        : `GREET MODE: PRESENCE (${greetSrc}) — NOTHING is said at connect; the opening line is held and released by your first words. LM_GREET=1 for the old speak-first behaviour, LM_GREET=0 for never. Ctrl-C to stop.`,
+        { greet_mode: greetModeName, greet_env: process.env.LM_GREET ?? null, greet_default: !process.env.LM_GREET });
       micLoop();
       startInjectLoop();
       // Keepalive pings (defense): keeps NAT/proxy paths warm during long one-sided
@@ -1492,11 +1580,52 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // so removing both belts at once is not something to do blind; LIVEMIND_HALF_DUPLEX=all
             // closes that door too (unless the mouth barge has self-disarmed — then recovery is
             // the only belt left and stays open), and the 099e723 TEETH stay armed either way.
-            const hdBlock = HD_ON && !bargeOn && (ovSrc === "mind" || (HD_MODE === "all" && mouthBargeArmed));
+            // THE GREETING DOOR (call 31599, 2026-08-20 — the mouth's FIRST utterance came back as
+            // a you-turn). The duck was NOT the gap: playingUntil arms on the greeting's first
+            // audio delta through the same queueAudio bookkeeping as every other reply, and that
+            // call's own log shows 8683ms of mic ducked during it. The leak was THIS door — the
+            // window was labelled "mouth", HD_MODE is "mind", so 8.6s of pure speaker leak was
+            // resent, transcribed at sim 0.98, and the server built a reply off it before the
+            // belts could delete the item. `!speechStartedAt` = the human has not spoken ONCE in
+            // this call, so nothing recovery could be carrying exists yet and the window is our
+            // own opening line by construction. It is the same class the gate already closes: the
+            // mouth-barge belt is disarmed for a greeting anyway (`!mindResponse`), exactly as it
+            // is for a MIND line. TRADE, stated honestly: words he speaks OVER the greeting reach
+            // the archive and this log line but not the model — he says them again to a mouth that
+            // is now listening. Nothing of his is ever deleted, and the moment he has spoken once
+            // this condition is false forever: normal mouth-window recovery is untouched.
+            const hdPreTurn = !speechStartedAt;
+            const hdBlock = HD_ON && !bargeOn && (ovSrc === "mind" || hdPreTurn || (HD_MODE === "all" && mouthBargeArmed));
             const hdSecs = (ovEnd - ovStart) / 2 / RATE;
             if (hdBlock) {
-              if (hdSecs >= 0.4) say("info", `half-duplex: ${ovSrc || "playback"} overlap window NOT resent (${hdSecs.toFixed(1)}s — archived only, never fed back to the model)`,
-                { half_duplex_no_resend: true, src: ovSrc || "playback", window_s: Number(hdSecs.toFixed(2)) });
+              // PHANTOM-CUT ACCOUNTING (W36 verify). A GENUINE barge over the greeting leaves a
+              // mouth-barge record whose ONLY carrier is this window: the barge deliberately leaves
+              // the overlap window ARMED because "recovery is the only path carrying his opening
+              // words". Refusing the resend here means the MOUTH_BARGE_CONFIRM timer sees no new
+              // speech_started and no new resend — so a cut we refused ON PURPOSE reads as an
+              // unconfirmed phantom: his record is discarded, and two of those DISARM the
+              // mouth-barge belt for the rest of the call. A window blocked by policy is accounted
+              // for, not a phantom. The record survives for the three-way resume when he says those
+              // words again (he must — they never reached the model), and the belt stays armed.
+              const mbAcct = hdPreTurn && mouthBarge && mouthBarge.confirmed === null && mouthBarge.at >= ovAt ? mouthBarge : null;
+              // The verdict is EVIDENCE, so it breaks the streak too (W38 verify): setting
+              // `confirmed` makes the MOUTH_BARGE_CONFIRM timer early-return above the line that
+              // resets `mouthBargeUnconfirmed`, so a cut we confirmed BY POLICY used to leave the
+              // counter standing — two refused-then-accounted cuts plus one later phantom would
+              // DISARM the belt on a streak a genuine cut had already broken.
+              if (mbAcct) { mbAcct.confirmed = true; mouthBargeUnconfirmed = 0; }
+              if (hdSecs >= 0.4) say("info", `half-duplex: ${hdPreTurn && ovSrc !== "mind" ? "greeting (no user turn yet)" : ovSrc || "playback"} overlap window NOT resent (${hdSecs.toFixed(1)}s — archived only, never fed back to the model)${mbAcct ? ` — the mouth cut inside it (${mbAcct.heardMs}ms heard) is ACCOUNTED: refused on purpose, not a phantom` : ""}`,
+                // SACRED ADDRESSABILITY (W36 verify). "Archived only" is not enough on a belt
+                // that suppresses words which were never transcribed: without a name, his
+                // over-the-greeting words are an anonymous byte range inside a rolling segment,
+                // with no you-turn, no transcript and nothing an operator can feed back. The
+                // record therefore CARRIES the evidence — the segment path, the window's data
+                // byte offsets (data bytes: the WAV header's 44 sit before them, exactly as
+                // recoverOverlap reads them) and the wall clock it opened at — so the window is
+                // findable forever and replayable verbatim on demand via {"audio": <file>}.
+                { half_duplex_no_resend: true, src: ovSrc || "playback", pre_first_turn: hdPreTurn || undefined, window_s: Number(hdSecs.toFixed(2)),
+                  mouth_cut_accounted: mbAcct ? true : undefined, mouth_cut_heard_ms: mbAcct ? mbAcct.heardMs : undefined,
+                  archive: ovPath, start_byte: ovStart, end_byte: ovEnd, at: ovAt });
             } else if (Date.now() - ovAt < 30000) {            // a stale window is not a live turn (mute gaps, long stalls)
               recovering = true;
               recoverOverlap(ovPath, ovStart, ovEnd);          // async; never blocks the mic pump
@@ -1652,7 +1781,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // MOUTH FIRST (fire17, 2026-08-20: "עכשיו נראה שהפה לא עונה לי"): a user turn
           // whose auto-reply was cancelled only because MIND audio was on the air gets
           // its reply NOW, before any more MIND lines flow.
-          if (pendingMouthReply && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+          // BELT (W38 verify): a hold may NEVER discharge into an empty room. The hold site now
+          // excludes emptyRoom, but a stale flag set before this belt existed — or by any future
+          // path — would speak to nobody here, where no cancel branch can re-judge it (the
+          // response.create below carries awaitingResponse). Same predicate as `emptyRoom`
+          // itself (`!GREET_LEGACY && speechStartedAt === 0`), so LEGACY is byte-identical: an
+          // attended restart has a listener by definition.
+          if (pendingMouthReply && !(!GREET_LEGACY && speechStartedAt === 0)
+              && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
             say("info", "mouth reply released (was held behind mind audio)");
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
           }
@@ -1853,7 +1989,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.audio_transcript.delta":
           // mouthChars counts what the clamp throws away, so the barge split can be taken
           // against the WHOLE reply instead of the last 2000 chars of it.
-          if (ev.delta) { rec({ ev: "model_delta", text: ev.delta }); mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
+          // A CANCELLED response still streams its transcript. Its audio deltas are already
+          // dropped below (cancelledResponses), so those words never left the speakers — and the
+          // one thing that must not happen is mouthBuf learning them: mouthBuf becomes the `model`
+          // line the MIND reads, the echo-dedupe corpus, and mouth_last in the state file. Call
+          // 31599: an auto-reply cancelled at birth on the recovery path still printed "Exactly,"
+          // as a spoken turn — that is what the MIND saw and filed as "it spoke" — and
+          // response.done then taught rememberSpoken a word the mouth never said. Logged either
+          // way, tagged `cancelled`, so forensics lose nothing. Same rule closes a second hole:
+          // after a mouth barge the trim at `mouthBuf = said.slice(0, heardChars)` used to be
+          // re-grown by the deltas still in flight; now it stands.
+          if (ev.delta) {
+            const dead = cancelledResponses.has(ev.response_id ?? curResponseId ?? "");
+            rec({ ev: "model_delta", text: ev.delta, ...(dead ? { cancelled: true } : {}) });
+            if (!dead) { mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
+          }
           break;
         case "conversation.item.input_audio_transcription.delta":
           // A transcription delta IS voice: a quiet talker under the peak bar must never let
@@ -1868,10 +2018,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // would be in the default assistant persona rather than yours. (Parked sockets
           // never reach here — their greeting fires from the open path.)
           if (o.greet && !greeted && !o.skipSessionUpdate) {
-            greeted = true;
-            ws.send(JSON.stringify({ type: "response.create",
-              ...(typeof o.greet === "string" ? { response: { instructions: o.greet } } : {}) }));
-            awaitingResponse = true;
+            if (GREET_LEGACY) sendGreeting();
+            // Presence mode ARMS here rather than at open for the same reason legacy SENDS
+            // here: before session.updated the persona is not live, so an opener fired
+            // earlier would speak in the default assistant voice.
+            else if (GREET_PRESENCE) openerArmed = true;
           }
           break;
         case "response.created":
@@ -1895,12 +2046,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // echo lands ~300ms AFTER the server has already created the reply, so the belt has
             // to be able to reach forward one turn — that is this flag's whole job.
             const selfEcho = Date.now() < echoHoldUntil;
-            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho)) {
+            // EMPTY ROOM (presence doctrine, 31599). Before ANY human speech has been heard on
+            // this call, an auto-response the engine did not ask for is the mouth talking to
+            // nobody — the server's own idle self-prompt (idle_timeout_ms, which the daemon's
+            // parked session sets) is the live path for exactly that. Under LM_GREET=presence/0
+            // it is the same empty-room speech the opening gate exists to prevent, so it dies at
+            // birth too. Every engine-initiated line (greeting, opener, MIND inject, resume,
+            // held-reply release) carries awaitingResponse and is untouched, and a genuine turn
+            // of his always sets speechStartedAt before its reply is created — so his own answer
+            // can never be caught here. LM_GREET=1 keeps the old behaviour: an attended restart
+            // has a listener by definition.
+            const emptyRoom = !GREET_LEGACY && speechStartedAt === 0;
+            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
               if (selfEcho && !suppressAuto && !noiseBlip) say("info", "auto-reply cancelled at birth — self-echo hold", { echo_suppressed: true, echo_hold: true });
+              // THROTTLED like the suppressAuto notice below it, and for the same reason (W36
+              // verify): the daemon parks with turn_detection.idle_timeout_ms=15000, so an empty
+              // room self-prompts every ~15s — ~120 cancels across a 30-minute absence. The
+              // window is 60s, NOT the suppressAuto line's 10s: at a 15s period a 10s throttle
+              // suppresses nothing at all. One line a minute is proof the gate is alive; 120 is
+              // noise that buries the lines that matter. Every cancel still lands in the jsonl,
+              // so the record loses nothing. (Root cause is server-side: idle_timeout_ms on the
+              // parked session — a talk-daemon.ts change, not this file's.)
+              if (emptyRoom && !suppressAuto && !noiseBlip && !selfEcho && !mindBusy) {
+                if (Date.now() - lastEmptyRoomAt > 60000) {
+                  lastEmptyRoomAt = Date.now();
+                  say("info", "auto-reply into an empty room cancelled — nobody has spoken yet this call", { empty_room: true });
+                } else rec({ ev: "info", text: "auto-reply into an empty room cancelled (throttled)", empty_room: true, throttled: true });
+              }
               // A suppressed mouth must never be INVISIBLE (the 14:19 outage ran 12 minutes
               // undetected because this cancel was silent). Throttled so a closed-mouth
               // session doesn't spam.
@@ -1911,9 +2087,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // Starvation fix (fire17, 2026-08-20): a REAL user turn whose auto-reply was
               // cancelled only because MIND audio was playing still deserves its answer —
               // mark it and release it the moment the MIND's audio ends (mouth first).
-              if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho) {
+              // `!emptyRoom` is the FOURTH exclusion and it is not optional (W38 verify, HIGH):
+              // without it the empty-room belt is bypassed on its own path. A parked call under
+              // presence self-prompts on the server's idle timer while MIND audio plays; the
+              // cancel above kills that response for being empty-room speech, and this hold then
+              // marks it for RELEASE — and the release at the end of the MIND line carries
+              // awaitingResponse, which gates the whole cancel branch, so the re-created reply is
+              // never re-judged and the mouth delivers a full turn to nobody (and teaches
+              // rememberSpoken/mouth_last a line nobody heard). A response nobody asked for,
+              // cancelled because nobody is in the room, is not a starved user turn.
+              if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
                 pendingMouthReply = true;
                 say("info", "mouth reply held behind mind audio — will release");
+              } else if (mindBusy && emptyRoom && !suppressAuto && !noiseBlip && !selfEcho) {
+                // NOT INVISIBLE EITHER. The empty-room notice above reports only when nothing
+                // else is in play (`!mindBusy`), and this cancel is no longer claimed as a held
+                // turn — so without this line the cancel would leave no trace at all. jsonl only:
+                // an unattended call self-prompts every ~15s and the console must stay readable.
+                rec({ ev: "info", text: "auto-reply into an empty room cancelled while mind audio played — NOT held (nobody has spoken yet this call)",
+                  empty_room: true, mind_busy: true });
               }
               break;
             }
@@ -2031,6 +2223,66 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // anything is removed, strip the part our own speech explains and require NOTHING to
             // be left. Any residue at all — a short answer, a question mark — and it is FLAGGED.
             const residual = echoish ? echoResidual(tScript, m.src) : "";
+            // TEETH — ONE definition, TWO doors (call 31599, 2026-08-20). A reply born from a turn
+            // that is a moment later judged echo must die no matter WHICH belt judged it. 099e723
+            // gave teeth to the live text belt only; the RECOVERY delete below leaned entirely on
+            // the response.created suppression, which holds only while suppressAuto is still armed
+            // — and this same handler restores it a few lines up (inRecoveryWindow), so a reply
+            // the server creates AFTER the transcript lands has nothing holding it at all. Same
+            // cancel, same truncate, same forward-reaching hold, both doors. HIS WORDS ARE NEVER
+            // TOUCHED: the turn is already logged and emitted byte-identical — only our answer to
+            // it dies.
+            const echoTeeth = (door: string) => {
+              // E128's DISCRIMINATOR, ON THE RECOVERY DOOR TOO (call 31599, W36 verify). A recovery
+              // transcript can land LATE — 2.0s after the response it belongs to, measured on 31599
+              // — and by then a GENUINE live turn may already be under way. `turnStartedAt` is the
+              // RECOVERED turn's clock, always EARLIER, so `curResponseBornAt >= turnStartedAt` is
+              // true for HIS reply as well: the teeth would cancel it, truncate what he heard, drop
+              // a held answer to an even earlier real turn and gag the mouth for ECHO_HOLD_MS,
+              // killing the next create at birth too. That is exactly the "הוא לא מגיב לי" class
+              // this file already closed twice (E128 below, the supersede fix at speech_started).
+              // The tell is the same one E128 uses: a speech_started LATER than this turn's start
+              // means a real turn has begun, and its answer is not ours to kill. Only the recovery
+              // door needs it — the live door judges the turn that just closed.
+              // TRADE, honestly: an echo reply born BEFORE that live turn keeps speaking here; the
+              // live turn's own barge and TEETH doors are what cut it. Nothing of his is touched
+              // on either path — his turn is already logged and emitted byte-identical.
+              // TIGHTENED (W38 verify): `speechStartedAt` is the GLOBAL newest start, while
+              // `turnStartedAt` came off the FIFO — so a SECOND queued echo turn from the same
+              // resend reads as "a live turn is in flight" and disarms the teeth on the first
+              // one, leaving an echo-born reply speaking until the second transcript lands. A
+              // speech_started that falls inside the window the resend was still streaming is
+              // OUR OWN audio, not him: only a start outside it counts as a live turn.
+              // TRADE, stated honestly: `lastResendMs` is the DURATION of the audio resent, not
+              // wall time, and a bulk append is consumed far faster than it plays — so on a long
+              // resend this window is wider than the burst it describes, and a GENUINE live turn
+              // starting inside it is judged not-stale, i.e. E128's protection is narrower there.
+              // Bounded: the corpus (n=31) has every resend-sourced turn starting within 2s of
+              // the resend, the echo verdict itself is required before any of this runs, and
+              // nothing of his is touched on either path — only our answer dies.
+              const stale = door === "recovery" && speechStartedAt > turnStartedAt
+                && !(lastResendAt && speechStartedAt >= lastResendAt && speechStartedAt - lastResendAt <= lastResendMs);
+              if (!stale) {
+                echoHoldUntil = Date.now() + ECHO_HOLD_MS;   // reaches the NEXT create, not yet born
+                pendingMouthReply = false;                   // and the one parked behind MIND audio
+              }
+              if (!stale && responseActive && !mindResponse && !closing && turnStartedAt > 0 && curResponseBornAt >= turnStartedAt) {
+                try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+                if (curResponseId) cancelledResponses.add(curResponseId);   // its in-flight deltas are dead
+                if (curItemId) {
+                  const heardMs = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
+                  try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {}
+                }
+                responseActive = false; awaitingResponse = false;
+                stopPlayer(); speaking = false;
+                playingUntil = Date.now() + 250;   // swallow the kill tail — reopening at 0 lets it transcribe
+              }
+              if (stale) say("info", `self-echo — recovery echo classified, but a live turn is in flight: the mouth is LEFT ALONE (sim ${m.score.toFixed(2)}), his turn kept in full`,
+                { echo_suppressed: false, echo_door: door, echo_stale: true, echo_sim: Number(m.score.toFixed(2)), echo_src: m.src.slice(0, 200),
+                  turn_started_at: turnStartedAt, live_speech_at: speechStartedAt });
+              else say("info", `self-echo — auto-reply SUPPRESSED ${ECHO_HOLD_MS}ms (sim ${m.score.toFixed(2)}, ${door}), his turn kept in full`,
+                { echo_suppressed: true, echo_door: door, echo_sim: Number(m.score.toFixed(2)), echo_src: m.src.slice(0, 200) });
+            };
             if (wasRecovered && echoish && bulkAppended && infoFree(residual)) {
               // HIS WORDS NEVER LEAVE THE LOG. The item is removed from the MODEL'S CONTEXT only —
               // the turn is still recorded and still emitted, carrying the evidence that removed
@@ -2043,6 +2295,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               });
               say("info", `recovered turn was speaker echo — removed from the model's context, KEPT in the log (sim ${m.score.toFixed(2)}, resent ${Math.round(lastResendMs)}ms vs turn ${turnMs}ms, no residual)`);
               if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+              echoTeeth("recovery");   // the item is gone; a reply born from it must go too, and the next create is held
               flushReply();
               break;
             }
@@ -2060,6 +2313,76 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 echo_recovered: wasRecovered, echo_residual: residual.slice(0, 200),
                 resent_ms: Math.round(lastResendMs), speech_ms: turnMs,
               } : undefined);
+              // ── PRESENCE GATE: the opening line waits for a proven listener ────────────
+              // This is the ONE place the engine learns a human is really there. A you-turn
+              // that arrives with none of the echo annotations — `suspect` is exactly
+              // echo_suspect, the echo_deleted_from_context branch already returned above,
+              // and the echo_suppressed hold cannot arm without `echoish` ⇒ `suspect` — is
+              // presence. AT ARRIVAL is deliberate: a later belt may reclassify this turn,
+              // but waiting for that verdict would hold his greeting hostage to a window with
+              // no upper bound; the cost of the rare wrong fire is ONE spoken line, and never
+              // a word of his (say("you") above already logged it byte-identical).
+              // REAL SPEECH ONLY (W36 verify). `openerArmed && !suspect` alone fires on a VAD NOISE
+              // BLIP: at VAD 500 blips are frequent, a blip's own auto-reply is cancelled by the
+              // noise gate (so nothing reads as busy), and a short blip transcribes to hallucinated
+              // words — "Thank you.", "you" — which score 0 on the echo belts and are never
+              // flagged. The opening line would then go out into exactly the empty room presence
+              // mode exists to protect. The bar is the engine's OWN, read from THIS turn's clock:
+              // the same APIPLAN_MIN_SPEECH_MS the mouth's noise gate uses. Under the bar the
+              // opener stays ARMED — his real first turn still releases it.
+              const minSpeech = Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500;
+              if (openerArmed && !suspect && turnMs >= minSpeech) {
+                // DO NOT RACE THE SERVER (W36 verify). sendGreeting sets awaitingResponse, and
+                // response.created reads it as `mindResponse = awaitingResponse` — so firing in the
+                // same tick as the server's VAD reply to this very turn (created 4ms after
+                // speech_stopped on 31599, its response.created not yet dispatched here) would
+                // stamp HIS reply MIND-initiated, disabling the noise gate, the mouth-barge cancel
+                // and both TEETH doors on it, with two responses free to speak over each other.
+                // A short recheck timer lets that response.created land first, and every covering
+                // state is re-read AT FIRE TIME rather than now.
+                openerArmed = false;   // scheduled — re-armed inside if the mouth turns out merely CLOSED
+                setTimeout(() => {
+                  if (closed || closing || greeted || ws.readyState !== WebSocket.OPEN) return;
+                  // NEVER DOUBLE-GREET. If the mouth is already speaking to him — its own VAD
+                  // auto-reply to this very turn (the normal case), a MIND line in flight or
+                  // parked behind one — then his first words are already being answered, and an
+                  // opening line on top of that is a second voice. THAT fold is a real discharge:
+                  // he was spoken to, so the one-shot is spent.
+                  const covering = responseActive || awaitingResponse || speaking || mindBusy || pendingMouthReply;
+                  if (covering) { say("info", "opening line folded into his first answer — the mouth was already speaking (LM_GREET=presence)", { opener: "folded" }); return; }
+                  // ONE-SHOT ECONOMY (W36 verify). A CLOSED mouth is NOT an answer. suppressAuto is
+                  // armed for the whole recovery window and for the whole call under
+                  // APIPLAN_VAD_CREATE_RESPONSE=0, and the fold's premise — "his first words are
+                  // already being answered" — is then simply false: he would speak, receive
+                  // nothing at all, and the opening line would be gone for the rest of the call.
+                  // Hold it instead; it releases on his next turn once the mouth reopens.
+                  if (suppressAuto) {
+                    // STRUCTURAL vs TRANSIENT (W38 verify). Holding is right for a RECOVERY
+                    // window — suppressAuto lifts in seconds and the opener still gets spent on
+                    // him. Under APIPLAN_VAD_CREATE_RESPONSE=0 the mouth is closed for the WHOLE
+                    // call by configuration: it never reopens, so the hold can never discharge,
+                    // and the notice below would re-fire on every unflagged turn for the entire
+                    // call while the opening line stays owed forever. In that mode the MIND is
+                    // the voice — his first words ARE being answered — so the one-shot is spent,
+                    // exactly like the `covering` fold above.
+                    if (process.env.APIPLAN_VAD_CREATE_RESPONSE === "0") {
+                      say("info", "opening line folded — the mouth is closed for this whole call (APIPLAN_VAD_CREATE_RESPONSE=0); the MIND is the voice that answers him (LM_GREET=presence)",
+                        { opener: "folded", reason: "mouth closed for the call" });
+                      return;
+                    }
+                    openerArmed = true;
+                    // Throttled like the empty-room cancel, and for the same reason: the state is
+                    // worth SEEING, once a minute — not once per turn. Every hold still lands in
+                    // the jsonl, so the record loses nothing.
+                    if (Date.now() - lastOpenerHeldAt > 60000) {
+                      lastOpenerHeldAt = Date.now();
+                      say("info", "opening line held — the mouth is closed; it releases on his next turn once the mouth reopens (LM_GREET=presence)", { opener: "held" });
+                    } else rec({ ev: "info", text: "opening line held (throttled) — the mouth is still closed", opener: "held", throttled: true });
+                    return;
+                  }
+                  sendGreeting("opening line released — first unflagged turn confirms a listener (LM_GREET=presence)");
+                }, Number(process.env.APIPLAN_OPENER_DELAY_MS) || 250);
+              }
             }
             // TEETH — the flag must COST the mouth its answer (call 31192, 2026-08-20: the FULL
             // ECHO FEEDBACK LOOP, ~30 turns of the mouth replying to itself, his ears cut ~7x).
@@ -2078,23 +2401,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // born BEFORE this turn's speech started (E128's guard — that reply belongs to the
             // previous, real turn), never while closing, and never on the recovery path, where
             // the response.created cancel already holds the mouth.
-            if (tScript && echoish && !wasRecovered && !inRecoveryWindow) {
-              echoHoldUntil = Date.now() + ECHO_HOLD_MS;   // reaches the NEXT create, not yet born
-              pendingMouthReply = false;                   // and the one parked behind MIND audio
-              if (responseActive && !mindResponse && !closing && turnStartedAt > 0 && curResponseBornAt >= turnStartedAt) {
-                try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-                if (curResponseId) cancelledResponses.add(curResponseId);   // its in-flight deltas are dead
-                if (curItemId) {
-                  const heardMs = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
-                  try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {}
-                }
-                responseActive = false; awaitingResponse = false;
-                stopPlayer(); speaking = false;
-                playingUntil = Date.now() + 250;   // swallow the kill tail — reopening at 0 lets it transcribe
-              }
-              say("info", `self-echo — auto-reply SUPPRESSED ${ECHO_HOLD_MS}ms (sim ${m.score.toFixed(2)}), his turn kept in full`,
-                { echo_suppressed: true, echo_sim: Number(m.score.toFixed(2)), echo_src: m.src.slice(0, 200) });
-            }
+            if (tScript && echoish && !wasRecovered && !inRecoveryWindow) echoTeeth("live");
             // ── THREE-WAY RESUME, piece 3 + assembly (canon 027) ──────────────────────
             // His interjection just landed — the FIRST completed transcript after the cut,
             // whichever path carried it. All three pieces now exist together: where the reply was
@@ -2232,6 +2539,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.output_audio_transcript.done":
         case "response.audio_transcript.done":
           if (ev.transcript?.trim()) {
+            // STILLBORN REPLY (call 31599): cancelled at birth AND no audio delta ever reached the
+            // player (itemFirstDeltaAt is still 0) = not one syllable was audible, so printing it
+            // as a `model` turn tells the MIND the mouth spoke when it did not. Say what happened
+            // instead — our own words, never his, and the text is kept verbatim in the log line.
+            // A reply cut MID-flight still prints exactly as before: some of it WAS heard.
+            if (!itemFirstDeltaAt && cancelledResponses.has(ev.response_id ?? curResponseId ?? "")) {
+              // EMPTY ROOM STAYS QUIET (W36 verify). Nobody has spoken ONCE on this call, so this
+              // transcript is the parked session's own idle self-prompt (idle_timeout_ms=15000),
+              // killed at birth by the empty-room gate — whose own throttled line already said so.
+              // A second console record per self-prompt would double the noise of an unattended
+              // call (~240 lines per 30 minutes). Still written to the jsonl: our words are kept,
+              // just not shouted. The instant he has spoken once this is false forever and every
+              // stillborn reply prints exactly as before.
+              if (!GREET_LEGACY && speechStartedAt === 0) {
+                rec({ ev: "info", text: `empty-room reply never spoken — "${ev.transcript.trim().slice(0, 160)}"`, cancelled_reply: true, empty_room: true });
+                break;
+              }
+              say("info", `cancelled reply never spoken — "${ev.transcript.trim().slice(0, 160)}"`, { cancelled_reply: true });
+              break;
+            }
             pending.push(ev.transcript.trim());
             replyTimer = setTimeout(flushReply, 2000);   // transcript never came; print anyway
           }
