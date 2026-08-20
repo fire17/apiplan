@@ -2243,6 +2243,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }
       if (ev.type === "session.updated") {
         succUpdN++; succQuietAt = Date.now();
+        // ACK-CONTENT VERIFICATION (11776 lesson): an acked update is not a config in force —
+        // read what the server says is EFFECTIVE. After the un-park, an ack still carrying
+        // create_response:false means the merge kept the parked semantics: the mouth would hear
+        // him perfectly and never answer, for the rest of the call, silently. Resend explicit,
+        // say it loudly, and record the effective value either way.
+        if (succUnparkSeq >= 0 && succUpdN > succUnparkSeq) {
+          const eff = (ev.session?.audio?.input?.turn_detection ?? ev.session?.turn_detection) as Record<string, unknown> | undefined;
+          const effCr = eff ? eff["create_response"] : undefined;
+          rec({ ev: "info", rotation: true, text: `rotation: un-park acked — effective create_response=${String(effCr)}`, unpark_effective_cr: effCr === undefined ? null : !!effCr });
+          if (effCr === false && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0") {
+            try { s.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
+              audio: { input: rotLiveInput(), output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } })); } catch {}
+            say("info", "rotation: un-park ack still carried create_response:false — explicit live config re-sent (a mouth that hears and never answers is the outage class this closes)", { rotation: true, unpark_cr_stuck: true });
+          }
+        }
         if (rotState === "opening") { rotState = "parked"; say("info", "rotation: successor configured and parked — watching it run quietly before the channel moves", { rotation: true }); }
         return;
       }
@@ -2271,11 +2286,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
      *  first and its VAD cannot fire on an empty buffer, so the instant the microphone moves it
      *  is already able to answer. Un-parking AFTER the swap leaves a window where his finished
      *  turn draws no reply. Partial update: the seeded instructions stay. */
+    /** MERGE-PROOF live input (live defect, call 11776 01:07: 4 of his turns went unanswered
+     *  after 3 rotations — zero response.created, zero cancels, transcripts fine — the parked
+     *  create_response:false plausibly SURVIVED an acked un-park because the update omitted the
+     *  key and the server merges turn_detection). Never rely on omission to clear a key: the
+     *  un-park states create_response EXPLICITLY (true unless APIPLAN_VAD_CREATE_RESPONSE=0). */
+    const rotLiveInput = () => ({ ...audioInput,
+      turn_detection: { ...(audioInput.turn_detection as Record<string, unknown>),
+        create_response: process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0" } });
     const rotUnpark = () => {
       const s = succ; if (!s || s.readyState !== WebSocket.OPEN) return;
       try {
         s.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
-          audio: { input: audioInput, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
+          audio: { input: rotLiveInput(), output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
       } catch { return; }
       succUnparkSeq = succUpdN; succUnparkAt = Date.now();
       rotState = "unparking";
@@ -2464,7 +2487,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (!unparkAcked) {
         try {
           ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
-            audio: { input: audioInput, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
+            audio: { input: rotLiveInput(), output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
           say("info", "rotation: un-park was unacknowledged at the swap — live input config re-sent on the new session", { rotation: true, unpark_resent: true });
         } catch {}
       }
