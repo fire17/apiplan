@@ -3,7 +3,7 @@
 // providers and the TUI are written once and run everywhere.
 import { homedir, platform, tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync, statSync } from "node:fs";
 
 export const IS_WIN = platform() === "win32";
 export const IS_MAC = platform() === "darwin";
@@ -262,7 +262,7 @@ export function micCommand(rate = 24000): string[] | null {
   return ["ffmpeg", "-hide_banner", "-loglevel", "error", ...src,
     "-ac", "1", "-ar", String(rate), "-f", "s16le", "-"];
 }
-export function speakerCommand(rate = 24000): string[] | null {
+export function speakerCommand(rate = 24000, channels: "mono" | "stereo" = "mono"): string[] | null {
   if (!whichSync("ffplay")) return null;
   // -ch_layout, NOT -ac: `-ac` is an ffmpeg option and ffplay rejects it outright
   // ("Option not found"), exiting instantly — which sounds exactly like silence.
@@ -271,9 +271,168 @@ export function speakerCommand(rate = 24000): string[] | null {
   // PCM has no timestamps, so the gaps between turns drift its clock.
   // Low-latency flags: start playing the moment PCM arrives instead of probing/buffering
   // a header-less stream. Cuts ~75-170ms of real (previously unmeasured) audible latency.
+  // channels="stereo" is the LiveMind voice field (canon 023): the PCM is already interleaved
+  // in-process by panChunk() before it reaches this stdin, so the layout must match (the byte
+  // rate doubles, the duration does not). NEVER add `-af pan=` here — ffplay fixes its filter
+  // graph at spawn, so his live knob would only be heard on the NEXT player, and a filter in
+  // this path spends the very latency the flags above bought back.
   return ["ffplay", "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
     "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-    "-f", "s16le", "-ar", String(rate), "-ch_layout", "mono", "-i", "-"];
+    "-f", "s16le", "-ar", String(rate), "-ch_layout", channels, "-i", "-"];
+}
+
+// ── LiveMind STEREO VOICE FIELD (canon 023, fire17's spec) ───────────────────
+// His words: MOUTH = 100% right + 50% left, MIND = 100% left + 50% right — "חלק חלק,
+// ומעבר חלק ביניהם". A crossover, not a hard pan: the 50% bleed keeps the ~3-6 dB that a
+// hard pan costs, and he tuned it by ear before anyone measured it.
+//
+// This is the ONE loader for BOTH voices. The mouth interleaves per PCM chunk (below); the
+// mind builds an ffplay `-af pan=` string from panGains("mind") at every utterance spawn.
+// One file, one kill switch, one mono decision — so the field can never end up half-on.
+//
+// Three laws shape this code:
+//  1. LIVE KNOB, NO RESTART — he tunes WHILE a call runs. So the mouth is panned here, in
+//     process, per PCM chunk. An ffplay `-af pan=` graph is fixed at spawn: a knob change
+//     would only be heard on the NEXT player, i.e. a reply late. (The MIND path is
+//     per-utterance, so `-af pan` IS fine there — it re-reads these gains at every spawn.)
+//  2. A MISSING OR HALF-WRITTEN KNOB FILE MUST NEVER BREAK HIS AUDIO. He hand-edits
+//     ~/.livemind/stereo.json mid-call (the hub slider and `lm-pan` write the same file),
+//     so catching a half-flushed save is the NORMAL case, not an edge case: the last good
+//     gains stand, everything is clamped 0..1, and the call keeps talking.
+//  3. MONO DEGRADE IS HONEST — both ears get identical samples at FULL volume, never one
+//     ear at half. panGains() returns unity for BOTH voices, so the mind's filter string
+//     collapses to a flat duplicate and the two voices stay equally loud.
+export const STEREO_FILE = process.env.LIVEMIND_STEREO_FILE || join(HOME, ".livemind", "stereo.json");
+export type PanGains = { l: number; r: number };
+const PAN_DEFAULTS: Record<"mouth" | "mind", PanGains> = { mouth: { l: 0.5, r: 1.0 }, mind: { l: 1.0, r: 0.5 } };
+const PAN_UNITY: PanGains = { l: 1, r: 1 };
+let panCache: Record<"mouth" | "mind", PanGains> = PAN_DEFAULTS;
+let panMtime = -1, panStatAt = 0;
+// Two independent reasons the field can collapse; either one means honest mono-sum.
+let monoAccess = false, monoDevice = false, monoCheckAt = 0;
+const monoSum = () => monoAccess || monoDevice;
+
+/** Kill switch for the field, both voices at once: LIVEMIND_STEREO=0 (APIPLAN_STEREO=off works too). */
+export function stereoEnabled(): boolean {
+  const v = (process.env.LIVEMIND_STEREO ?? process.env.APIPLAN_STEREO ?? "").trim().toLowerCase();
+  return v !== "0" && v !== "off" && v !== "false" && v !== "no";
+}
+
+/** Current gains for one voice. Hot path: stats the knob ≤5x/sec, parses only on mtime change. */
+export function panGains(who: "mouth" | "mind"): PanGains {
+  if (monoSum()) return PAN_UNITY;
+  const now = Date.now();
+  if (now - panStatAt > 200) {              // ≤5 stats/sec — never a read or a parse per chunk
+    panStatAt = now;
+    try {
+      const m = statSync(STEREO_FILE).mtimeMs;
+      if (m !== panMtime) {
+        const j: any = JSON.parse(readFileSync(STEREO_FILE, "utf8"));
+        const g = (v: unknown, d: number) => (typeof v === "number" && v >= 0 && v <= 1 ? v : d);
+        panCache = {
+          mouth: { l: g(j?.mouth?.l, PAN_DEFAULTS.mouth.l), r: g(j?.mouth?.r, PAN_DEFAULTS.mouth.r) },
+          mind:  { l: g(j?.mind?.l,  PAN_DEFAULTS.mind.l),  r: g(j?.mind?.r,  PAN_DEFAULTS.mind.r)  },
+        };
+        panMtime = m;
+      }
+    } catch { /* missing, half-written, or garbage: keep the last good gains and keep talking */ }
+  }
+  return panCache[who] ?? PAN_DEFAULTS[who];
+}
+
+// A chunk of raw PCM can in principle split a sample across two deltas. Dropping that odd
+// byte would shift the byte-parity of EVERY later sample — the stream turns to noise and
+// never recovers — so it is carried into the next chunk instead. Per voice, reset with the player.
+const panCarry: Record<"mouth" | "mind", number> = { mouth: -1, mind: -1 };
+export function panReset(who: "mouth" | "mind") { panCarry[who] = -1; }
+
+/** mono s16le → interleaved stereo s16le at the live gains. Clamped, so a bad knob cannot distort him. */
+export function panChunk(chunk: Buffer, who: "mouth" | "mind" = "mouth"): Buffer {
+  const { l, r } = panGains(who);           // read ONCE per chunk, not per sample
+  let buf = chunk;
+  const carried = panCarry[who];
+  if (carried >= 0) {                        // rare: re-join the sample that straddled two chunks
+    const joined = Buffer.allocUnsafe(chunk.length + 1);
+    joined[0] = carried;
+    chunk.copy(joined, 1);
+    buf = joined;
+  }
+  const n = buf.length >> 1;
+  panCarry[who] = (buf.length & 1) ? buf[buf.length - 1]! : -1;
+  const out = Buffer.allocUnsafe(n * 4);
+  for (let i = 0; i < n; i++) {
+    const s = buf.readInt16LE(i * 2);
+    let L = Math.round(s * l), R = Math.round(s * r);
+    if (L > 32767) L = 32767; else if (L < -32768) L = -32768;
+    if (R > 32767) R = 32767; else if (R < -32768) R = -32768;
+    out.writeInt16LE(L, i * 4);
+    out.writeInt16LE(R, i * 4 + 2);
+  }
+  return out;
+}
+
+/** macOS "Play stereo audio as mono" silently destroys the field. ~20ms, so read it sync. */
+function readAccessibilityMono(): boolean {
+  if (!IS_MAC) return false;
+  try {
+    const r = Bun.spawnSync(["defaults", "read", "com.apple.universalaccess", "monoAudio"], { stderr: "ignore" });
+    return new TextDecoder().decode(r.stdout).trim() === "1";
+  } catch { return false; }   // absent key = feature off; never block a call on a probe
+}
+/** The device itself: a BT headset with its mic open switches to mono HFP. ~200ms, so async. */
+function probeOutputDevice(log?: (msg: string) => void) {
+  if (!IS_MAC) return;
+  (async () => {
+    try {
+      const p = Bun.spawn(["system_profiler", "SPAudioDataType"], { stdout: "pipe", stderr: "ignore" });
+      const txt = await new Response(p.stdout as ReadableStream).text();
+      const dev = txt.split(/\n\s*\n/).find((b) => /Default Output Device:\s*Yes/i.test(b)) || "";
+      const ch = Number(dev.match(/Output Channels:\s*(\d+)/i)?.[1] ?? 2);
+      const was = monoDevice;
+      monoDevice = ch < 2;
+      if (monoDevice !== was)
+        log?.(monoDevice
+          ? `stereo field degraded to MONO-SUM — default output device has ${ch} channel (Bluetooth HFP?)`
+          : "stereo field: the default output device is stereo again — the field is back");
+    } catch { /* a probe must never touch his audio */ }
+  })();
+}
+/**
+ * Re-decide the mode. His calls run for HOURS: AirPods can arrive mid-call (HFP collapses both
+ * channels) and the accessibility switch can flip at any time, so a start-of-call decision goes
+ * stale and the log line then lies. Throttled to once per 30s and called only where a player is
+ * being spawned anyway, so it costs one cached spawn on a path that already spawns ffplay.
+ */
+export function stereoRecheck(log?: (msg: string) => void) {
+  if (!stereoEnabled()) return;
+  const now = Date.now();
+  if (now - monoCheckAt < 30000) return;
+  monoCheckAt = now;
+  const was = monoAccess;
+  monoAccess = readAccessibilityMono();
+  if (monoAccess !== was)
+    log?.(monoAccess
+      ? "stereo field: MONO-SUM — 'play stereo audio as mono' came on mid-call; both ears identical, full volume"
+      : "stereo field: 'play stereo audio as mono' went off — the field is back");
+  probeOutputDevice(log);
+}
+
+/**
+ * Startup: decide whether this machine can actually carry a stereo field, and SAY which mode
+ * engaged (a silently-collapsed field is indistinguishable from a working one by ear).
+ * Mono degrade is honest — both ears get the same samples at full volume, never one ear halved.
+ */
+export function initStereo(log: (msg: string) => void) {
+  if (!stereoEnabled()) { log("stereo field OFF (LIVEMIND_STEREO=0) — mouth stays mono"); return; }
+  monoCheckAt = Date.now();
+  monoAccess = readAccessibilityMono();
+  const g = panGains("mouth");
+  log(monoSum()
+    ? "stereo field: MONO-SUM — accessibility 'play stereo audio as mono' is on; both ears identical, full volume"
+    : `stereo field: mouth L=${g.l.toFixed(2)} R=${g.r.toFixed(2)} · live knob ${STEREO_FILE} (edit mid-call, no restart)`);
+  // The device probe costs ~200ms, so it runs ASYNC — the player is spawned lazily on the first
+  // audio byte, seconds later, and stereo is the safe default meanwhile.
+  probeOutputDevice(log);
 }
 
 /** Hand a file to the desktop to open however it likes. Returns the tool, or null. */

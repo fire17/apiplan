@@ -5,7 +5,7 @@
 // Turn-taking is the server's job: `server_vad` means OpenAI decides when you stopped
 // talking, so there is no push-to-talk and no silence heuristic of our own to get wrong.
 import { openai, openRealtime, speakRealtime } from "./providers.ts";
-import { micCommand, speakerCommand, ensureDir } from "./platform.ts";
+import { micCommand, speakerCommand, ensureDir, stereoEnabled, initStereo, panChunk, panReset, panGains, stereoRecheck } from "./platform.ts";
 import { dirname, basename } from "node:path";
 import { unlinkSync } from "node:fs";
 import * as fs from "node:fs";
@@ -64,7 +64,11 @@ export type TalkOpts = {
 
 export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const mic = micCommand(RATE);
-  const spk = speakerCommand(RATE);
+  // LiveMind stereo voice field (canon 023): the MOUTH leans right, the MIND leans left.
+  // The interleave happens in-process (panChunk) so his knob is live — the player only
+  // needs to be told the layout. LIVEMIND_STEREO=0 restores the exact mono path of before.
+  const stereo = stereoEnabled();
+  const spk = speakerCommand(RATE, stereo ? "stereo" : "mono");
   if (!mic) throw new Error("no microphone capture available — install ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`).");
   if (!spk) throw new Error("no audio playback available — ffplay ships with ffmpeg; install it.");
 
@@ -98,6 +102,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
 
   const ws = o.socket ?? openRealtime(c.token, model);
   rec({ ev: "info", text: `talk start model=${model} voice=${o.voice || "cedar"}${o.socket ? " (parked socket)" : ""}${o.tools?.length ? ` tools=${o.tools.length}` : ""}` });
+  // Which voice-field mode actually engaged (stereo / mono-sum / off) — a silently collapsed
+  // field sounds exactly like a working one, so it is stated in the log at every call start.
+  initStereo((m) => rec({ ev: "info", text: m }));
   // Forensics anchor: log the engine's git sha so log analysis never infers the running
   // code version from process start times (verified pain: 61139 judged on unshipped code).
   try {
@@ -489,6 +496,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let playerChecked = false;
   let playerRestarts = 0;        // guard against a death-loop if ffplay can't start at all
   const startPlayer = () => {
+    panReset("mouth");   // fresh player, fresh byte alignment: a half-sample carried from the dead one would shift everything after it
+    stereoRecheck((m) => rec({ ev: "info", text: m }));   // AirPods can arrive mid-call: re-decide mono-sum, ≤1 probe/30s
     const p = Bun.spawn(spk, { stdin: "pipe", stdout: "ignore", stderr: "inherit" });
     player = p;
     // Per-player death watch (not once-ever): a player that dies MID-CALL — device change,
@@ -974,9 +983,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
         // Low-latency flags: without them ffplay holds a read-ahead buffer that stays
         // audible ~40-100ms after SIGKILL — the post-barge self-hear window (verified).
+        // STEREO FIELD (canon 023): the MIND speaks 100% left + 50% right. The gains are
+        // read HERE, once per utterance, so editing ~/.livemind/stereo.json mid-call moves
+        // the field on the very next MIND line (≤1 utterance of lag, no restart, no work).
+        // `-af` is safe on THIS path only: ffplay fixes its filter graph at spawn and this
+        // player is per-utterance — the mouth's long-lived stdin player interleaves in JS.
+        // Measured: the filter adds no spawn cost (107.1 vs 107.9 ms/spawn over 20 runs).
+        // Gains come from platform.ts — the SAME loader the mouth uses, so one knob file, one
+        // kill switch, and one mono decision: on a mono sink panGains() returns unity and this
+        // filter collapses to a flat duplicate, keeping the MIND exactly as loud as the MOUTH.
+        // byte 22 of the WAV header is the channel count: the pan expression reads c0 only,
+        // so if the narrator ever returns stereo we play it flat instead of dropping a side.
+        const mindGain = r.bytes[22] === 1 && stereoEnabled() ? panGains("mind") : null;
+        const mindPan = mindGain ? ["-af", `pan=stereo|c0=${mindGain.l}*c0|c1=${mindGain.r}*c0`] : [];
         speakerCheck(); warnIfUnheard("mind");                        // LANE 18: async, cached 5s
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-          "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0", f],
+          "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
+          ...mindPan, f],
           { stdout: "ignore", stderr: "ignore" });
         // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
         // sample) so the barge cut never over-counts words as spoken.
@@ -1465,9 +1488,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // flush(): Bun's stdin is a buffered sink, so without it the audio sits in
             // the buffer instead of reaching the speaker.
             const buf = Buffer.from(ev.delta, "base64");
-            queueAudio(buf.length);
+            queueAudio(buf.length);                          // MONO bytes: stereo doubles the bytes, never the duration
             itemQueuedMs += (buf.length / 2 / RATE) * 1000;
-            try { player!.stdin!.write(buf); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
+            // The voice field is applied HERE, per chunk — so a knob edit he makes mid-sentence
+            // is heard in the very next chunk. No filter graph, no restart, no added latency.
+            const pcm = stereo ? panChunk(buf, "mouth") : buf;
+            try { player!.stdin!.write(pcm); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
           }
           break;
         case "response.output_audio_transcript.done":
