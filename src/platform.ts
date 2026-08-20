@@ -318,26 +318,65 @@ export function stereoEnabled(): boolean {
   return v !== "0" && v !== "off" && v !== "false" && v !== "no";
 }
 
+// ── VOICE TRIM (path-gain parity) ─────────────────────────────────────────────
+// The field decides WHERE a voice sits; the trim decides HOW LOUD it is — per voice, in the SAME
+// live file: {"mouth":{"l":0.5,"r":1,"g":1},"mind":{"l":1,"r":0.5,"g":0.8}}. One loader, one
+// kill switch, one mono decision, still.
+//
+// WHY IT EXISTS, measured 2026-08-20 (his ear: "the mouth is quieter than the mind"):
+//  • ffplay does NOT normalize the MIND path down. `pan=stereo|c0=1.0*c0|c1=0.5*c0` was measured
+//    end-to-end (mono 4095 in → L max 4095, R max 2048): c0 passes at unity. af_pan renormalizes
+//    only terms written WITHOUT an explicit `k*` coefficient, and only when one output's |gain|
+//    sum exceeds 1 — the shipped expression fails both tests, so it cannot attenuate.
+//  • The two pan paths are arithmetically MIRROR-EQUAL (mouth 0.5/1.0 in-process, mind 1.0/0.5
+//    in the filter) — identical energy. The mismatch is not in the panning.
+//  • The SOURCES differ: four MIND narrator renders measure peak -0.43..0.00 dBFS, RMS -19..-21
+//    dBFS — hot, effectively at full scale. The mouth's realtime deltas are not on disk to
+//    measure, but a hotter narrator is exactly what his ear reports.
+// ATTENUATION ONLY, clamped 0..1: the mind already sits at 0 dBFS, so the clip-free way to match
+// two voices is to lower the LOUDER one — never to boost the quieter one into the ceiling.
+// Default 1.0 for both = byte-identical audio: this knob costs nothing until he turns it.
+// (g:0 mutes that voice — honest, and reversible in the same breath, since the file is live.)
+const TRIM_DEFAULTS: Record<"mouth" | "mind", number> = { mouth: 1, mind: 1 };
+let trimCache: Record<"mouth" | "mind", number> = { ...TRIM_DEFAULTS };
+
+/** The one throttled read of the live knob file: ≤5 stats/sec, one parse per mtime change. */
+function refreshPan() {
+  const now = Date.now();
+  if (now - panStatAt <= 200) return;       // ≤5 stats/sec — never a read or a parse per chunk
+  panStatAt = now;
+  try {
+    const m = statSync(STEREO_FILE).mtimeMs;
+    if (m === panMtime) return;
+    const j: any = JSON.parse(readFileSync(STEREO_FILE, "utf8"));
+    const g = (v: unknown, d: number) => (typeof v === "number" && v >= 0 && v <= 1 ? v : d);
+    panCache = {
+      mouth: { l: g(j?.mouth?.l, PAN_DEFAULTS.mouth.l), r: g(j?.mouth?.r, PAN_DEFAULTS.mouth.r) },
+      mind:  { l: g(j?.mind?.l,  PAN_DEFAULTS.mind.l),  r: g(j?.mind?.r,  PAN_DEFAULTS.mind.r)  },
+    };
+    trimCache = { mouth: g(j?.mouth?.g, TRIM_DEFAULTS.mouth), mind: g(j?.mind?.g, TRIM_DEFAULTS.mind) };
+    panMtime = m;
+  } catch { /* missing, half-written, or garbage: keep the last good gains and keep talking */ }
+}
+
 /** Current gains for one voice. Hot path: stats the knob ≤5x/sec, parses only on mtime change. */
 export function panGains(who: "mouth" | "mind"): PanGains {
+  refreshPan();                             // BEFORE the mono check — the trim stays live in mono-sum too
   if (monoSum()) return PAN_UNITY;
-  const now = Date.now();
-  if (now - panStatAt > 200) {              // ≤5 stats/sec — never a read or a parse per chunk
-    panStatAt = now;
-    try {
-      const m = statSync(STEREO_FILE).mtimeMs;
-      if (m !== panMtime) {
-        const j: any = JSON.parse(readFileSync(STEREO_FILE, "utf8"));
-        const g = (v: unknown, d: number) => (typeof v === "number" && v >= 0 && v <= 1 ? v : d);
-        panCache = {
-          mouth: { l: g(j?.mouth?.l, PAN_DEFAULTS.mouth.l), r: g(j?.mouth?.r, PAN_DEFAULTS.mouth.r) },
-          mind:  { l: g(j?.mind?.l,  PAN_DEFAULTS.mind.l),  r: g(j?.mind?.r,  PAN_DEFAULTS.mind.r)  },
-        };
-        panMtime = m;
-      }
-    } catch { /* missing, half-written, or garbage: keep the last good gains and keep talking */ }
-  }
   return panCache[who] ?? PAN_DEFAULTS[who];
+}
+
+/** Live output trim for one voice, 0..1 (1 = untouched). LIVEMIND_MOUTH_GAIN / LIVEMIND_MIND_GAIN
+ *  win over the file, so a call can be STARTED at a fixed balance without moving his live slider;
+ *  an out-of-range or typo'd env is ignored rather than obeyed, and the file (or 1.0) stands. */
+export function voiceGain(who: "mouth" | "mind"): number {
+  const raw = process.env[who === "mouth" ? "LIVEMIND_MOUTH_GAIN" : "LIVEMIND_MIND_GAIN"];
+  if (raw !== undefined && raw !== "") {
+    const v = Number(raw);
+    if (Number.isFinite(v) && v >= 0 && v <= 1) return v;
+  }
+  refreshPan();
+  return trimCache[who] ?? 1;
 }
 
 // A chunk of raw PCM can in principle split a sample across two deltas. Dropping that odd
@@ -349,6 +388,8 @@ export function panReset(who: "mouth" | "mind") { panCarry[who] = -1; }
 /** mono s16le → interleaved stereo s16le at the live gains. Clamped, so a bad knob cannot distort him. */
 export function panChunk(chunk: Buffer, who: "mouth" | "mind" = "mouth"): Buffer {
   const { l, r } = panGains(who);           // read ONCE per chunk, not per sample
+  const t = voiceGain(who);                 // …and the trim with it — both ≤1, so gl/gr can add no clipping
+  const gl = l * t, gr = r * t;
   let buf = chunk;
   const carried = panCarry[who];
   if (carried >= 0) {                        // rare: re-join the sample that straddled two chunks
@@ -362,12 +403,27 @@ export function panChunk(chunk: Buffer, who: "mouth" | "mind" = "mouth"): Buffer
   const out = Buffer.allocUnsafe(n * 4);
   for (let i = 0; i < n; i++) {
     const s = buf.readInt16LE(i * 2);
-    let L = Math.round(s * l), R = Math.round(s * r);
+    let L = Math.round(s * gl), R = Math.round(s * gr);
     if (L > 32767) L = 32767; else if (L < -32768) L = -32768;
     if (R > 32767) R = 32767; else if (R < -32768) R = -32768;
     out.writeInt16LE(L, i * 4);
     out.writeInt16LE(R, i * 4 + 2);
   }
+  return out;
+}
+
+/** Mono s16le at the voice trim — the LIVEMIND_STEREO=0 path, where panChunk never runs and the
+ *  trim would otherwise be a silently dead knob. At the default (1) it returns the SAME buffer:
+ *  no copy, no loop, no cost. A trailing odd byte (a sample straddling two chunks) is passed
+ *  through untouched rather than dropped — dropping it would shift the byte-parity of every later
+ *  sample and turn the stream to noise, and one slightly-untrimmed sample is inaudible. */
+export function trimMono(chunk: Buffer, who: "mouth" | "mind" = "mouth"): Buffer {
+  const t = voiceGain(who);
+  if (!(t < 1)) return chunk;               // 1, NaN-proof: the default path stays byte-identical
+  const out = Buffer.allocUnsafe(chunk.length);
+  const n = chunk.length >> 1;
+  for (let i = 0; i < n; i++) out.writeInt16LE(Math.round(chunk.readInt16LE(i * 2) * t), i * 2);
+  if (chunk.length & 1) out[chunk.length - 1] = chunk[chunk.length - 1]!;
   return out;
 }
 

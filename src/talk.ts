@@ -5,7 +5,7 @@
 // Turn-taking is the server's job: `server_vad` means OpenAI decides when you stopped
 // talking, so there is no push-to-talk and no silence heuristic of our own to get wrong.
 import { openai, openRealtime, speakRealtime } from "./providers.ts";
-import { micCommand, speakerCommand, ensureDir, stereoEnabled, initStereo, panChunk, panReset, panGains, stereoRecheck } from "./platform.ts";
+import { micCommand, speakerCommand, ensureDir, stereoEnabled, initStereo, panChunk, panReset, panGains, stereoRecheck, voiceGain, trimMono } from "./platform.ts";
 import { dirname, basename } from "node:path";
 import { unlinkSync } from "node:fs";
 import * as fs from "node:fs";
@@ -72,6 +72,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   if (!mic) throw new Error("no microphone capture available — install ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`).");
   if (!spk) throw new Error("no audio playback available — ffplay ships with ffmpeg; install it.");
 
+  // ── DUPLEX BARGE-IN (--barge / LM_BARGE=1) IS OFF BY DEFAULT (call 31192, 2026-08-20) ──
+  // Duplex barge leaves the mic OPEN while the mouth plays, so on speakers our own voice
+  // reaches the server VAD and the speech_started handler cancels the reply we are still
+  // speaking. Measured in call 31192, the FIRST live run with it on: 40 self-cuts, every one
+  // of them within 200ms of an input_audio_buffer.speech_started, the greeting cut 688ms in,
+  // seven times over — and the leak then transcribed as a `you` turn, so the mouth answered
+  // itself for ~30 turns. The flag alone therefore no longer switches duplex on: it also
+  // needs APIPLAN_BARGE_OK=1, an explicit "I am on headphones" from whoever starts the call.
+  // OFF-BY-DEFAULT STAYS until ONE live call runs duplex with zero self-cuts; when that call
+  // exists, drop the env requirement — never the evidence gate in speech_started.
+  // The LOCAL mouth-barge (canon 027, further down) is untouched by this: it is the
+  // no-duplex path and it never even ran in 31192 (`stillAudible() && !o.barge` skipped it),
+  // which is why that call's log carries zero "mouth interrupted" lines.
+  const bargeOn = !!o.barge && process.env.APIPLAN_BARGE_OK === "1";
   const c = openai.creds();
   const model = o.model || process.env.APIPLAN_REALTIME_MODEL || "gpt-realtime";
   // gpt-4o-mini-transcribe hallucinates far less than whisper-1 on near-silence; override
@@ -168,7 +182,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     transcription: { model: transcribeModel },
     // Filter room noise / speaker bleed BEFORE VAD. near_field assumes headphones (which
     // barge-in already requires); far_field suits a laptop/room mic.
-    noise_reduction: { type: o.barge ? "near_field" : "far_field" },
+    noise_reduction: { type: bargeOn ? "near_field" : "far_field" },
     // 0.5 was low enough that room noise opened a turn, and Whisper answers near-silence
     // with a canned hallucination. A higher bar plus a longer pause needs actual speech.
     // silence_duration_ms is how long you must pause before it decides you're done and
@@ -424,9 +438,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  Costs NOTHING when leak is impossible: no ring, a too-short transcript, or a ring whose
    *  newest line is already older than the window (recentSpoken is push-ordered by time). */
   const echoScore = (t: string, maxAgeMs = Infinity): { score: number; src: string } => {
-    if (!recentSpoken.length || echoNorm(t).length < 8) return { score: 0, src: "" };
+    const nt = echoNorm(t);
+    if (!recentSpoken.length || nt.length < ECHO_MIN_CHARS) return { score: 0, src: "" };
     const now = Date.now();
     if (now - recentSpoken[recentSpoken.length - 1]!.t > maxAgeMs) return { score: 0, src: "" };
+    // EXACT / PREFIX FAST PATH, before Dice (call 31192, 2026-08-20). Two of that loop's
+    // shapes never reached the Dice pass at all: the length floor of 8 returned 0 for
+    // "Perfect."(7) / "I'm here."(6) / "Exactly."(7) / "Hey."(3) before anything was compared,
+    // and a leak that our own barge detector CUT mid-word leaves only the opening of the line
+    // on the wire ("Hey." off "Hey, welcome back! The mind voice is restored...") — a prefix,
+    // not a near-match. Normalized equality, or a prefix of a line we just spoke, is
+    // CERTAINTY rather than similarity, so it scores 1 outright and skips the window search.
+    // The floor is its own knob: the only cost of a false positive here is one auto-reply the
+    // mouth does not give (his words are never touched), but a rig where he answers in very
+    // short words can raise it.
+    for (const s of recentSpoken) {
+      if (now - s.t > maxAgeMs) continue;
+      const ns = echoNorm(s.text);
+      if (ns.length >= ECHO_MIN_CHARS && (ns === nt || ns.startsWith(nt))) return { score: 1, src: s.text };
+    }
+    if (nt.length < 8) return { score: 0, src: "" };   // Dice keeps its own, higher floor
     let score = 0, src = "";
     for (const s of recentSpoken) {
       if (now - s.t > maxAgeMs) continue;
@@ -436,8 +467,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     return { score, src };
   };
   const ECHO_BAR = 0.75;        // text belt on the RECOVERY path — one of FOUR conditions to delete
-  const ECHO_LIVE_BAR = 0.9;    // a LIVE turn is only ever FLAGGED, so the bar is raised: being
-                                // wrong here costs a label, and a label must be worth reading
+  const ECHO_LIVE_BAR = 0.9;    // a LIVE turn is never deleted, only flagged + answered-not, so the
+                                // bar stays high: being wrong costs one auto-reply, never his words
+  // Shortest transcript the belt will judge at all. Below it, a match carries no information
+  // (one bigram matches any line containing it) — "כן" must never be explained away.
+  const ECHO_MIN_CHARS = Math.max(2, Number(process.env.APIPLAN_ECHO_MIN_CHARS) || 3);
+  // How long the mouth stays silent after a self-echo turn. Sized from call 31192's own
+  // cadence: the loop's turns landed 1.4-2.1s apart, so one window covers the NEXT turn in a
+  // cascade — including the ASR-garbage turns ("Yalla.", "Metsuya ?", "אני שומע." — the mouth's
+  // own Hebrew mis-transcribed) that no text belt can ever match. Each new flag re-arms it.
+  const ECHO_HOLD_MS = Math.max(0, Number(process.env.APIPLAN_ECHO_HOLD_MS) || 2500);
+  let echoHoldUntil = 0;        // until this wall clock a VAD auto-reply is an answer to our own voice
   /** What the transcript says that our own recent speech does NOT explain. Clause by clause: a
    *  clause we clearly said is stripped, everything else survives. A SHORT clause is never
    *  explained away — "כן" is one bigram and would match any line containing it, yet a yes/no
@@ -774,6 +814,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // the stereo field (canon 023) and was spot-checked separately: leak p90 580-802, max 1832
     // across its 4 clean windows — the same band as mono, so the stereo pan did not move the
     // leak floor. Re-measure if the pan gains change materially (they are logged in `bars:`).
+    // RE-MEASURED 2026-08-20 on call 31192, at fire17's HIGH speaker volume (30 leak-only mic
+    // windows from ~/.livemind/recordings/livemind-31192, turns 001-030, he silent throughout):
+    //   leak instantaneous peak  max 2311  (per-window p90 249-1102) — ABOVE this 2000 bar
+    //   leak sustained above bar max 85ms at EVERY bar 1600-2200 → 0/30 windows would fire
+    //   his own speech in the same call, same volume: window peaks 1147-2569, sustained 256-853ms
+    // Two honest conclusions. (1) The 2000/200ms pair still holds on this rig, but its margin is
+    // now SUSTAIN, not level: raise APIPLAN_MOUTH_BARGE_MS before ever raising the bar, because
+    // the bar can no longer be put above the leak without also being above him. (2) The contrast
+    // guard stays removed, re-evaluated against THIS incident rather than the old corpus: the
+    // grace-window floor predicts the same window's later leak between 0.34x and 15.9x (grace as
+    // quiet as 108 while the leak later hit 1721), so an auto-floor sampled there would have been
+    // noise. What replaces it is the self-disarm below — measurement, not decoration.
     const mouthKnob = (name: string, dflt: number) => { const v = envBar(name, dflt); return Number.isFinite(v) ? v : dflt; };
     // 0 disables the mouth barge entirely; every other value is a raw PCM peak bar.
     const MOUTH_BARGE_PEAK = mouthKnob("APIPLAN_MOUTH_BARGE_PEAK", 2000);
@@ -801,14 +853,143 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // transient rule in recoverOverlap. Number.isFinite: a typo'd env falls back to the default
     // rather than silently disabling the guard; only an explicit 0 turns it off.
     const RECOVER_TAIL_MS = (() => { const v = envBar("APIPLAN_RECOVER_TAIL_MS", 400); return Number.isFinite(v) ? v : 400; })();
+    // ── STUCK-LATCH TIMEOUT (the userSpeaking latch) ─────────────────────────────────
+    // `userSpeaking` is raised by the server's input_audio_buffer.speech_started and cleared
+    // ONLY by speech_stopped (or, since call 86130, by a mute flip). Whenever the server
+    // holds a VAD segment open over a SILENT room, the stack law muzzles the MIND for the
+    // whole stretch: measured on call 20127, one segment ran 10.4s with not a single mic
+    // frame above the voice bar, and 8-10s of dead air inside an open turn recurs. The 120s
+    // failsafe in injectContext is a last resort, not a fix.
+    // OBSERVED SILENCE, never a plain clock: the latch clears only when no mic frame has
+    // reached LATCH_PEAK for the required stretch — i.e. when the ROOM is quiet, the only
+    // honest evidence that his turn ended. Two stretches, because the two cases differ:
+    //   · segment opened by a blip and NO voice ever heard inside it → LATCH_MS (4s).
+    //     Nothing of his is in flight; holding the MIND is pure loss.
+    //   · voice WAS heard → he is mid-turn and merely pausing → LATCH_HOLD_MS (12s), and
+    //     flushInjectQueue's 2.5s sustained-silence gate stacks on top: nothing can speak
+    //     before 14.5s of continuous quiet inside a live turn.
+    // CALIBRATION, replayed frame-for-frame through this exact predicate over all 136 VAD
+    // segments of calls 20127 + 31192 (audio from ~/.livemind/recordings, 100ms peak blocks).
+    // "clip" = the latch released and he spoke again inside that same segment afterwards:
+    //   fast/slow   releases   clips   dead air freed
+    //     4s /  6s      7         4         52.8s
+    //     4s /  8s      4         4         49.6s
+    //     4s / 10s      5         1         50.3s
+    //     4s / 12s      4         0         49.6s   <- shipped
+    //     3s / 12s      5         1         53.6s
+    //     5s / 12s      3         0         46.5s
+    // 12s is the first slow stretch with ZERO clips in the corpus; higher buys nothing
+    // (identical at 15s and 20s) and costs responsiveness, and the longest genuine mid-turn
+    // pause measured is 6.3s — less than half of it.
+    // If a release ever does catch him mid-thought it self-heals twice: the RE-LATCH below
+    // re-arms the hold within LATCH_RELATCH_MS of his voice, and a MIND line he talks over is
+    // cut by the MIND barge detector (APIPLAN_MIND_BARGE_PEAK) within ~250ms. APIPLAN_LATCH_MS=0
+    // disables the whole timeout (back to the 120s failsafe alone).
+    const LATCH_MS = (() => { const v = envBar("APIPLAN_LATCH_MS", 4000); return Number.isFinite(v) && v >= 0 ? v : 4000; })();
+    const LATCH_HOLD_MS = (() => { const v = envBar("APIPLAN_LATCH_HOLD_MS", 12000); return Number.isFinite(v) && v >= 0 ? v : 12000; })();
+    // Same measured band as every other loudness gate on this rig (speaker leak max 1789,
+    // his close-mic speech p90 1642-2194): "is there a voice in the room at all".
+    const LATCH_PEAK = (() => { const v = envBar("APIPLAN_LATCH_PEAK", 1800); return Number.isFinite(v) ? v : 1800; })();
+    // Leaky sustain behind the re-latch — one loud frame is a chair scrape, not a turn.
+    const LATCH_RELATCH_MS = (() => { const v = envBar("APIPLAN_LATCH_RELATCH_MS", 300); return Number.isFinite(v) && v > 0 ? v : 300; })();
+    let lastVoiceAt = 0;        // last mic frame at/above LATCH_PEAK, or last you_delta
+    let latchVoiceMs = 0;       // leaky accumulator behind the re-latch
+    let latchHadVoice = false;  // any voice heard inside THIS latch? (picks which stretch applies)
+    let latchTimedOut = false;  // the latch was cleared by timeout, not by the server
     let bargeMs = 0; let lastBargeAt = 0;
     let mouthBargeMs = 0; let lastMouthBargeAt = 0; let mouthBargeTailUntil = 0;
+    // Last moment the LOCAL mic evidence cleared bar+sustain — the duplex self-cut guard.
+    let bargeEvidenceAt = 0;
+    // SELF-DISARM. The UNCONFIRMED line below is the mis-tune feedback channel; on a rig whose
+    // leak clears the bar it would otherwise print once per cut, forever. Two unconfirmed cuts
+    // in a row and the detector stands down for the rest of the call (his words are never
+    // touched by this — the overlap-recovery path stays fully armed either way).
+    let mouthBargeArmed = true; let mouthBargeUnconfirmed = 0;
     let mutedSpeechMs = 0; let mutedWarnAt = 0;
+    // ── VOLUME-SCALED BARS (lane b) ───────────────────────────────────────────────
+    // Every bar above is an ABSOLUTE PCM peak calibrated at ONE output volume. His volume moves:
+    // turn it down and the leak falls under the bar (the detectors go deaf — no barge, no
+    // recovery); turn it up and the leak clears the bar (SELF-BARGE, and in call 31192 a full
+    // echo loop, whose mic turns measure leak peaks 429–1795 — i.e. touching the 1800/2000 bars).
+    // A cheap live reference fixes the anchor: during a mouth reply's GRACE window the only thing
+    // in the mic is OUR OWN audio, so its peak IS this rig's current leak floor. Sampled per
+    // reply, kept as the MEDIAN of the last few (contamination by his trailing words inflates a
+    // sample, and a median resists that), it says how far the rig has drifted from the volume the
+    // bars were calibrated at.
+    //
+    // HONEST ABOUT THE PRIOR NEGATIVE RESULT (see "NO CONTRAST GUARD" above): a floor×margin bar
+    // was built twice and failed twice — inert in the grace window, and as a lagged running max it
+    // tracked HIS voice and halved the catch. This is deliberately NOT that. It is a RATIO anchored
+    // to a measured baseline (so at the calibration volume it reproduces the shipped bars exactly),
+    // it is a median over replies rather than a running max, it ignores windows near his speech, it
+    // needs LEAK_MIN samples before it moves at all, it is clamped to 0.5–2×, and it is DEFAULT OFF.
+    // Enable with LIVEMIND_ADAPTIVE_BARS=1; LIVEMIND_LEAK_LOG=1 measures and reports without
+    // touching a single bar — run one call with it to harvest the numbers before enabling.
+    // WHAT IT CANNOT DO: the reference conflates speaker volume with mic gain (it measures the
+    // whole speaker→mic path). Both move the leak bars the same way, so that is right for them.
+    // MUTEDWARN is different — it is a bar on HIS voice, and only the mic-gain half of the drift
+    // is real for it — so it scales DOWN ONLY: a quieter rig makes it more sensitive (harmless,
+    // the mic is muted, nothing is sent, and the existing comment already says it can be
+    // aggressive), while a louder rig must never be allowed to raise it into deafness and let him
+    // talk into a stuck mute unwarned again.
+    // NOT REACHED IN BARGE MODE: the mouth-barge block that samples this sits under
+    // `stillAudible() && !o.barge`, so with LM_BARGE=1 no reference is collected and every bar
+    // stays exactly as shipped.
+    const ADAPTIVE_BARS = /^(1|on|true|yes)$/i.test(String(process.env.LIVEMIND_ADAPTIVE_BARS ?? ""));
+    const LEAK_LOG = ADAPTIVE_BARS || /^(1|on|true|yes)$/i.test(String(process.env.LIVEMIND_LEAK_LOG ?? ""));
+    // The leak floor the shipped bars were calibrated against: this rig's grace-window leak p90
+    // measured 580–802 (call 20127, stereo field). 800 ⇒ scale 1.0 ⇒ today's bars, unchanged.
+    const LEAK_BASE = Math.max(1, mouthKnob("LIVEMIND_LEAK_BASE", 800));
+    const LEAK_MIN = Math.max(1, mouthKnob("LIVEMIND_LEAK_MIN", 4));      // replies before the scale may move
+    const LEAK_CLAMP = 2;                                                 // never scale a bar past 0.5–2×
+    // A bar must always clear the leak it sits above. This rig's leak/speech margin is only ~1.15×
+    // (leak max 1789, his speech p90 1642) — 1.25 sits just over the leak and just under his voice.
+    const LEAK_MARGIN = mouthKnob("LIVEMIND_LEAK_MARGIN", 1.25);
+    const leakRing: number[] = [];
+    let leakRef = 0, barScale = 1, gracePeak = 0, graceReply = 0, leakLogAt = 0, leakLogged = 0;
+    /** One grace-window frame of our own audio. `pk` is already computed by the caller — free. */
+    const noteLeakFrame = (pk: number, played: number, replyAt: number) => {
+      if (replyAt !== graceReply) { flushLeakSample(); graceReply = replyAt; gracePeak = 0; }
+      if (played > 0 && played < MOUTH_BARGE_GRACE && pk > gracePeak) gracePeak = pk;
+    };
+    /** Close one reply's window: keep its peak unless his voice could have been in it. */
+    function flushLeakSample() {
+      const pk = gracePeak; gracePeak = 0;
+      // His turn closes ~1.1s before the reply's first delta, so his trailing words can bleed into
+      // the opening of the grace window. Skip a sample taken that close to his speech; the median
+      // covers whatever slips through.
+      if (pk <= 0 || Date.now() - lastSpeechStopAt < 1000) return;
+      leakRing.push(pk);
+      if (leakRing.length > 8) leakRing.shift();
+      if (leakRing.length < LEAK_MIN) return;
+      const s = [...leakRing].sort((a, b) => a - b);
+      leakRef = s[s.length >> 1]!;
+      const want = Math.min(LEAK_CLAMP, Math.max(1 / LEAK_CLAMP, leakRef / LEAK_BASE));
+      const moved = Math.abs(want - barScale) / (barScale || 1);
+      barScale = want;
+      if (LEAK_LOG && (moved > 0.25 || !leakLogged) && Date.now() - leakLogAt > 60000) {
+        leakLogAt = Date.now(); leakLogged = 1;
+        say("info", `leak reference ${leakRef} (median of ${leakRing.length}, base ${LEAK_BASE}) — bars ×${barScale.toFixed(2)}`
+          + (ADAPTIVE_BARS ? ` APPLIED: mouthbarge ${scaleBar(MOUTH_BARGE_PEAK)} barge ${scaleBar(BARGE_PEAK)} recover ${scaleBar(envBar("APIPLAN_RECOVER_PEAK", 2000))}`
+                           : " (measure-only — set LIVEMIND_ADAPTIVE_BARS=1 to apply)"),
+          { leak_ref: leakRef, leak_samples: leakRing.length, bar_scale: Number(barScale.toFixed(3)), applied: ADAPTIVE_BARS });
+      }
+    }
+    /** A bar at the CURRENT output volume. Off ⇒ the shipped number, byte for byte. A leak bar is
+     *  never returned below what the measured leak itself can reach (deafness is degraded, a
+     *  self-barge is a loop); `downOnly` is the MUTEDWARN case above — no leak, so no margin, and
+     *  never raised. */
+    const scaleBar = (base: number, downOnly = false) => {
+      if (!ADAPTIVE_BARS || base <= 0 || barScale === 1) return base;
+      const scaled = Math.round(base * barScale);
+      return downOnly ? Math.min(base, scaled) : Math.max(scaled, Math.round(leakRef * LEAK_MARGIN));
+    };
     // Auditability: a live log must always record which thresholds were in force.
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`);
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+      + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`);
     const framePeak = (v: Uint8Array) => {
       let pk = 0;
       for (let i = 0; i + 1 < v.length; i += 32) {           // sparse scan — same cost profile as the archive's
@@ -835,7 +1016,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // APIPLAN_RECOVER_PEAK tunes the bar (default 2000 — calibrated: leak maxes 1789
         // on this rig, his speech sustains 300-700ms above 1800; 6500 was NEVER-RECOVER);
         // 0 disables recovery entirely.
-        const RECOVER_PEAK = envBar("APIPLAN_RECOVER_PEAK", 2000);
+        const RECOVER_PEAK = scaleBar(envBar("APIPLAN_RECOVER_PEAK", 2000));
         if (RECOVER_PEAK <= 0) return;
         const len = end - start;
         if (len < RATE * 2 * 0.4) return;                     // <400ms can't be real speech (same bar as the hangup guard)
@@ -913,6 +1094,45 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           const { done: rdone, value } = await reader.read();
           if (rdone) break;
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
+          // ── STUCK-LATCH TIMEOUT / RE-LATCH (bars and calibration above) ────────────
+          // Rides the frames we already have, ahead of every drop below — no timer, no poll,
+          // and framePeak runs only while a latch is actually open. Muted frames are skipped:
+          // a mute flip already synthesizes the stop (call 86130).
+          if (LATCH_MS > 0 && value?.length && !micMuted && (userSpeaking || latchTimedOut)) {
+            const nowL = Date.now();
+            if (stillAudible() || mindBusy || mindPlayer) {
+              // UNOBSERVABLE WINDOW. While OUR audio plays, these frames carry speaker leak,
+              // so a peak proves nothing about him — freeze the clock rather than time out
+              // blind, and never let our own leak drive a re-latch.
+              lastVoiceAt = nowL; latchVoiceMs = 0;
+            } else {
+              const pkL = framePeak(value);
+              const fMsL = (value.length / 2 / RATE) * 1000;
+              if (pkL >= LATCH_PEAK) { lastVoiceAt = nowL; latchVoiceMs += fMsL; if (userSpeaking) latchHadVoice = true; }
+              else latchVoiceMs = Math.max(0, latchVoiceMs - fMsL);
+              const needL = latchHadVoice ? LATCH_HOLD_MS : LATCH_MS;
+              if (userSpeaking && lastVoiceAt && nowL - lastVoiceAt >= needL) {
+                // The SERVER's segment stays open — this clears only OUR latch, so held MIND
+                // lines may flow. speechTurns is NOT pushed and lastSpeechMs is NOT touched:
+                // the turn is not over, and the echo timing belt must keep pairing this turn's
+                // real start and duration with its real transcript (31/31 corpus).
+                latchTimedOut = true; userSpeaking = false; latchVoiceMs = 0;
+                lastSpeechStopAt = nowL;   // flushInjectQueue's 2.5s quiet gate still applies
+                say("info", `user-speaking latch timed out — ${Math.round((nowL - lastVoiceAt) / 100) / 10}s with no voice above ${LATCH_PEAK} (${latchHadVoice ? "pause inside a live turn" : "blip, no voice ever"}, VAD turn open ${((nowL - speechStartedAt) / 1000).toFixed(1)}s); releasing ${injectQueue.length} held MIND line(s)`,
+                  { latch_timeout: true, quiet_ms: nowL - lastVoiceAt, need_ms: needL, had_voice: latchHadVoice,
+                    open_ms: nowL - speechStartedAt, bar: LATCH_PEAK, held: injectQueue.length });
+                if (injectQueue.length) setTimeout(flushInjectQueue, 0);
+              } else if (latchTimedOut && !userSpeaking && latchVoiceMs >= LATCH_RELATCH_MS) {
+                // RE-LATCH — the half that makes the timeout safe. He resumed inside the still
+                // open server segment, where no second speech_started will ever come, so the
+                // hold is re-armed LOCALLY. speechStartedAt is deliberately left at the
+                // server's real segment start: the echo timing belt and the 120s failsafe in
+                // injectContext both read it.
+                latchTimedOut = false; latchVoiceMs = 0; userSpeaking = true; latchHadVoice = true; lastVoiceAt = nowL;
+                say("info", "user speaking again (local VAD, server turn still open) — MIND lines hold");
+              }
+            }
+          }
           if (micMuted) {                                      // muted: drop mic frames so the model never hears them
             // A mute flip rolls the archive segment — a pending overlap window into the old
             // segment is no longer a live turn (verified defect: a window resent 4.5 min
@@ -921,7 +1141,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // Talking into a stuck/forgotten mute is silent deafness (root cause of the
             // 13:37 "הפה לא עונה לי" — mic muted, never unmuted, zero feedback). Say so.
             if (value?.length) {
-              if (framePeak(value) >= MUTEDWARN_PEAK) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
+              if (framePeak(value) >= scaleBar(MUTEDWARN_PEAK, true)) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
               if (mutedSpeechMs > 1000 && Date.now() - mutedWarnAt > 10000) {
                 mutedWarnAt = Date.now(); mutedSpeechMs = 0;
                 say("info", "speaking while muted — the mouth cannot hear you");
@@ -942,7 +1162,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               const fMs = (value.length / 2 / RATE) * 1000;
               // Leaky accumulator — real speech dips below any bar mid-word; a strict
               // consecutive rule never accumulates 250ms (measured).
-              bargeMs = framePeak(value) >= BARGE_PEAK ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
+              bargeMs = framePeak(value) >= scaleBar(BARGE_PEAK) ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
               if (bargeMs >= BARGE_SUSTAIN && Date.now() - lastBargeAt > 1000) {
                 bargeMs = 0; lastBargeAt = Date.now();
                 const L = mindLine;
@@ -973,7 +1193,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // would feed speaker echo straight into VAD, which is self-barge by construction — it
           // detects the barge LOCALLY on the frames we are already dropping, exactly like the
           // MIND barge above, and then runs the same cancel+truncate the ws path would have run.
-          if (stillAudible() && !o.barge) {
+          // DUPLEX EVIDENCE (call 31192). With duplex opted in, the frames below flow straight
+          // to the server, its VAD hears our own speakers, and the ws barge path cuts the mouth
+          // mid-word. Measure here the same local level+sustain the mouth-barge path uses, so
+          // that cancel can demand proof the ROOM was loud rather than trusting a VAD that is
+          // listening to us. Measured on 31192's own mic archive at his HIGH speaker volume
+          // (30 leak-only windows, 4096B frames): the leak never sustained more than 85ms above
+          // 2000 — one frame — while his real speech sustained 256-853ms. SUSTAIN is the
+          // discriminator, not level: the leak's instantaneous peak reached 2311, i.e. ABOVE the
+          // 2000 bar. Inert unless bargeOn, so the default no-duplex path is unchanged.
+          if (bargeOn) {
+            if (!stillAudible()) mouthBargeMs = 0;                  // never bank energy across replies
+            else if (value?.length && MOUTH_BARGE_PEAK > 0) {
+              const fMs = (value.length / 2 / RATE) * 1000;
+              mouthBargeMs = framePeak(value) >= MOUTH_BARGE_PEAK ? mouthBargeMs + fMs : Math.max(0, mouthBargeMs - fMs);
+              if (mouthBargeMs >= MOUTH_BARGE_SUSTAIN) bargeEvidenceAt = Date.now();
+            }
+          }
+          if (stillAudible() && !bargeOn) {
             if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
               if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
@@ -1003,11 +1240,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // itself. Bounded and self-reporting — nothing loops, nothing speaks on its own, his
             // words are never lost (the overlap window stays armed), and an unfollowed cut is
             // announced UNCONFIRMED and discarded. Tune APIPLAN_MOUTH_BARGE_PEAK (0 disables).
-            if (value?.length && MOUTH_BARGE_PEAK > 0 && !mindBusy && !mindResponse && Date.now() >= mouthBargeTailUntil) {
+            if (value?.length && MOUTH_BARGE_PEAK > 0 && mouthBargeArmed && !mindBusy && !mindResponse && Date.now() >= mouthBargeTailUntil) {
               const fMs = (value.length / 2 / RATE) * 1000;
               const pk = framePeak(value);
               const played = itemFirstDeltaAt ? Date.now() - itemFirstDeltaAt : 0;
-              mouthBargeMs = pk >= MOUTH_BARGE_PEAK ? mouthBargeMs + fMs : Math.max(0, mouthBargeMs - fMs);
+              // LANE b: the grace window is our own audio by construction — read the rig's live leak
+              // floor off the peak we just computed. Costs one compare per frame.
+              noteLeakFrame(pk, played, itemFirstDeltaAt);
+              const mouthBar = scaleBar(MOUTH_BARGE_PEAK);
+              mouthBargeMs = pk >= mouthBar ? mouthBargeMs + fMs : Math.max(0, mouthBargeMs - fMs);
               // `played <= itemQueuedMs + tail` keeps the cut bound to the MOUTH's own timeline:
               // audio always arrives faster than it plays, so inside a reply (and through its
               // drain) played never exceeds what we queued. Past that, whatever still gates the
@@ -1091,10 +1332,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 };
                 mouthBarge = mb;
                 say("info", `mouth interrupted by user — cut at ${mb.heardMs}ms of ${mb.queuedMs}ms`
-                  + ` (${heardChars}/${full} chars, peak ${pk} vs bar ${MOUTH_BARGE_PEAK}, ${sustained}ms sustained${cancelling ? ", response cancelled" : ", audio tail only"})`
+                  + ` (${heardChars}/${full} chars, peak ${pk} vs bar ${mouthBar}, ${sustained}ms sustained${cancelling ? ", response cancelled" : ", audio tail only"})`
                   + (mb.remainder ? ` — UNSPOKEN: ${mb.remainder.slice(0, 160)}` : ""),
                   { mouth_barge: true, heard_ms: mb.heardMs, queued_ms: mb.queuedMs,
-                    heard_chars: heardChars, chars: full, peak: pk, bar: MOUTH_BARGE_PEAK,
+                    heard_chars: heardChars, chars: full, peak: pk, bar: mouthBar,
+                    leak_ref: leakRef || undefined, bar_scale: barScale !== 1 ? Number(barScale.toFixed(3)) : undefined,
                     sustain_ms: sustained, cancelled: cancelling, item_id: itemId });
                 saveMindState(undefined, true);   // FORCED: a cut is the one thing that must survive a SIGKILL
                 // SELF-REPORTING MIS-TUNE. A real barge is followed by his turn (the gate reopens
@@ -1107,9 +1349,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                   setTimeout(() => {
                     if (closed || mb.confirmed !== null) return;
                     mb.confirmed = mb.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
-                    if (mb.confirmed) return;
-                    say("info", `mouth barge UNCONFIRMED — no user turn and no recovered speech in ${MOUTH_BARGE_CONFIRM}ms after the cut (peak ${pk} vs bar ${MOUTH_BARGE_PEAK}); record discarded. If this repeats, raise APIPLAN_MOUTH_BARGE_PEAK`,
-                      { mouth_barge_unconfirmed: true, peak: pk, bar: MOUTH_BARGE_PEAK, sustain_ms: sustained });
+                    if (mb.confirmed) { mouthBargeUnconfirmed = 0; return; }
+                    // Second unconfirmed cut in a row = this rig's leak is clearing the bar.
+                    // Stand the detector down for the rest of the call instead of cutting every
+                    // reply; the operator sees exactly why, and one restart with a raised
+                    // APIPLAN_MOUTH_BARGE_PEAK (or MOUTH_BARGE_MS, see the calibration note)
+                    // re-arms it. Nothing of his is lost — overlap recovery is untouched.
+                    if (++mouthBargeUnconfirmed >= 2 && mouthBargeArmed) {
+                      mouthBargeArmed = false;
+                      say("info", `mouth barge DISARMED for this call — ${mouthBargeUnconfirmed} unconfirmed cuts in a row at bar ${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms. Speaker leak is clearing the bar; raise APIPLAN_MOUTH_BARGE_MS (sustain separates leak from speech far better than level) and restart to re-arm.`,
+                        { mouth_barge_disarmed: true, unconfirmed: mouthBargeUnconfirmed, bar: MOUTH_BARGE_PEAK, sustain_ms: MOUTH_BARGE_SUSTAIN });
+                    }
+                    say("info", `mouth barge UNCONFIRMED — no user turn and no recovered speech in ${MOUTH_BARGE_CONFIRM}ms after the cut (peak ${pk} vs bar ${mouthBar}${leakRef ? `, leak ref ${leakRef}` : ""}); record discarded. If this repeats, raise APIPLAN_MOUTH_BARGE_PEAK`,
+                      { mouth_barge_unconfirmed: true, peak: pk, bar: mouthBar, leak_ref: leakRef || undefined, sustain_ms: sustained });
                     if (mouthBarge === mb) mouthBarge = null;
                   }, MOUTH_BARGE_CONFIRM);
                 }
@@ -1235,8 +1487,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // filter collapses to a flat duplicate, keeping the MIND exactly as loud as the MOUTH.
         // byte 22 of the WAV header is the channel count: the pan expression reads c0 only,
         // so if the narrator ever returns stereo we play it flat instead of dropping a side.
+        // The TRIM rides in the same coefficients (or in a bare volume= when there is no pan to
+        // fold it into): one filter, no second graph, no extra spawn cost. The explicit `k*c0`
+        // form is load-bearing — af_pan renormalizes ONLY coefficient-less terms, and measurement
+        // confirms this form passes c0 at unity, so what is written here is what is heard.
+        // toFixed(4) keeps float dust (0.30000000000000004) out of argv.
         const mindGain = r.bytes[22] === 1 && stereoEnabled() ? panGains("mind") : null;
-        const mindPan = mindGain ? ["-af", `pan=stereo|c0=${mindGain.l}*c0|c1=${mindGain.r}*c0`] : [];
+        const mindTrim = voiceGain("mind");
+        const mindPan = mindGain
+          ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
+          : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
         speakerCheck(); warnIfUnheard("mind");                        // LANE 18: async, cached 5s
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
           "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
@@ -1412,6 +1672,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         // of the audible turn — synthesize the stop.
                         if (micMuted && userSpeaking) {
                           userSpeaking = false;
+                          latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;
                           lastSpeechStopAt = Date.now();
                           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
                           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
@@ -1470,7 +1731,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (ev.delta) { rec({ ev: "model_delta", text: ev.delta }); mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
           break;
         case "conversation.item.input_audio_transcription.delta":
-          if (ev.delta) rec({ ev: "you_delta", text: ev.delta });
+          // A transcription delta IS voice: a quiet talker under the peak bar must never let
+          // the stuck-latch timeout fire on him. (On this rig deltas arrive in a burst after the
+          // commit, so this is a belt — the mic frames are the working signal.)
+          if (ev.delta) { lastVoiceAt = Date.now(); if (userSpeaking) latchHadVoice = true; rec({ ev: "you_delta", text: ev.delta }); }
           break;
       }
       switch (ev.type) {
@@ -1501,11 +1765,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             const noiseBlip = lastSpeechMs > 0 && lastSpeechMs < minSpeech;
             // mindBusy: while the MIND has audio in flight the mouth is FORBIDDEN to start a
             // response of its own — otherwise a VAD auto-reply talks over the MIND (two voices).
-            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy)) {
+            // ECHO HOLD (call 31192): a turn just transcribed as our OWN voice re-arms a short
+            // window in which the mouth may not answer at all. The transcript that proves the
+            // echo lands ~300ms AFTER the server has already created the reply, so the belt has
+            // to be able to reach forward one turn — that is this flag's whole job.
+            const selfEcho = Date.now() < echoHoldUntil;
+            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
+              if (selfEcho && !suppressAuto && !noiseBlip) say("info", "auto-reply cancelled at birth — self-echo hold", { echo_suppressed: true, echo_hold: true });
               // A suppressed mouth must never be INVISIBLE (the 14:19 outage ran 12 minutes
               // undetected because this cancel was silent). Throttled so a closed-mouth
               // session doesn't spam.
@@ -1516,7 +1786,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // Starvation fix (fire17, 2026-08-20): a REAL user turn whose auto-reply was
               // cancelled only because MIND audio was playing still deserves its answer —
               // mark it and release it the moment the MIND's audio ends (mouth first).
-              if (mindBusy && !suppressAuto && !noiseBlip) {
+              if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho) {
                 pendingMouthReply = true;
                 say("info", "mouth reply held behind mind audio — will release");
               }
@@ -1541,6 +1811,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
+          // Fresh latch — the stuck-latch timeout clock starts here, with no voice heard yet.
+          lastVoiceAt = Date.now(); latchVoiceMs = 0; latchHadVoice = false; latchTimedOut = false;
           // Supersede fix (EVA's 17:01 question, proven real): the held-reply clear used to
           // happen HERE, at speech_started — before the turn's duration is even knowable. A
           // noise blip (<minSpeech, frequent at VAD 500) would clear the hold and then its own
@@ -1555,7 +1827,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // Only cancel a response that is genuinely still generating — speaking can lag
           // response.done by one event, and cancelling a finished response draws a
           // "response_cancel_not_active" error for nothing.
-          if (speaking && o.barge && responseActive) {
+          // SELF-CUT GUARD (call 31192). In duplex mode the server VAD fires on our own speaker
+          // leak, and this branch then cancels the mouth mid-sentence: 40/40 of that call's cuts
+          // landed within 200ms of a speech_started and NONE of them was him. So while the mouth
+          // is audible, believe the VAD only when the local mic evidence gathered in pumpMic
+          // (peak >= MOUTH_BARGE_PEAK sustained MOUTH_BARGE_MS) is fresh. Measured: that evidence
+          // never appeared anywhere in 31192's leak (max 85ms sustained), so all 40 self-cuts
+          // would have been blocked; the cost of a mis-block is that the mouth finishes its
+          // sentence — exactly the no-duplex behaviour. APIPLAN_MOUTH_BARGE_PEAK=0 disables the
+          // detector and with it this gate, leaving duplex trusting the VAD alone (loop risk).
+          if (speaking && bargeOn && responseActive
+              && (MOUTH_BARGE_PEAK <= 0 || Date.now() - bargeEvidenceAt < 1500)) {
             ws.send(JSON.stringify({ type: "response.cancel" }));
             responseActive = false; awaitingResponse = false;
             if (curResponseId) cancelledResponses.add(curResponseId);
@@ -1574,6 +1856,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
           userSpeaking = false;
           lastSpeechStopAt = Date.now();
+          latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;   // the server closed the turn — the local latch is moot
           // This turn's own clock, for the echo timing belt (consumed by its transcript below).
           speechTurns.push({ startedAt: speechStartedAt, ms: lastSpeechMs });
           if (speechTurns.length > 4) speechTurns.shift();
@@ -1652,6 +1935,40 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 echo_recovered: wasRecovered, echo_residual: residual.slice(0, 200),
                 resent_ms: Math.round(lastResendMs), speech_ms: turnMs,
               } : undefined);
+            }
+            // TEETH — the flag must COST the mouth its answer (call 31192, 2026-08-20: the FULL
+            // ECHO FEEDBACK LOOP, ~30 turns of the mouth replying to itself, his ears cut ~7x).
+            // The belt above was NOT blind on that call: eleven live you-turns carried
+            // echo_sim 1.00 — the mouth's own sentence word for word — and every one of them was
+            // merely ANNOTATED. A live turn had no consequence anywhere in this handler, so the
+            // VAD auto-reply the server created 2ms after speech_stopped went on speaking, ITS
+            // audio leaked back through the mic (open during playback under barge), and the next
+            // turn was the next echo. The transcript ALWAYS lands while that response is still
+            // generating — 250-900ms of margin, measured on every turn of the loop — so this is
+            // exactly where the loop can be cut, and the only place it can.
+            // HIS WORDS ARE NEVER TOUCHED: say("you") above already logged and emitted the turn
+            // byte-identical, and it stays in the model's context. Only OUR OWN answer to it
+            // dies. Flag + suppress breaks the loop without censoring one syllable of his.
+            // Guards: never a MIND-initiated response (it owes nothing to this turn), never one
+            // born BEFORE this turn's speech started (E128's guard — that reply belongs to the
+            // previous, real turn), never while closing, and never on the recovery path, where
+            // the response.created cancel already holds the mouth.
+            if (tScript && echoish && !wasRecovered && !inRecoveryWindow) {
+              echoHoldUntil = Date.now() + ECHO_HOLD_MS;   // reaches the NEXT create, not yet born
+              pendingMouthReply = false;                   // and the one parked behind MIND audio
+              if (responseActive && !mindResponse && !closing && turnStartedAt > 0 && curResponseBornAt >= turnStartedAt) {
+                try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+                if (curResponseId) cancelledResponses.add(curResponseId);   // its in-flight deltas are dead
+                if (curItemId) {
+                  const heardMs = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
+                  try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {}
+                }
+                responseActive = false; awaitingResponse = false;
+                stopPlayer(); speaking = false;
+                playingUntil = Date.now() + 250;   // swallow the kill tail — reopening at 0 lets it transcribe
+              }
+              say("info", `self-echo — auto-reply SUPPRESSED ${ECHO_HOLD_MS}ms (sim ${m.score.toFixed(2)}), his turn kept in full`,
+                { echo_suppressed: true, echo_sim: Number(m.score.toFixed(2)), echo_src: m.src.slice(0, 200) });
             }
             // ── THREE-WAY RESUME, piece 3 + assembly (canon 027) ──────────────────────
             // His interjection just landed — the FIRST completed transcript after the cut,
@@ -1783,7 +2100,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             itemQueuedMs += (buf.length / 2 / RATE) * 1000;
             // The voice field is applied HERE, per chunk — so a knob edit he makes mid-sentence
             // is heard in the very next chunk. No filter graph, no restart, no added latency.
-            const pcm = stereo ? panChunk(buf, "mouth") : buf;
+            const pcm = stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth");
             try { player!.stdin!.write(pcm); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
           }
           break;
