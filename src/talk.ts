@@ -477,6 +477,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let savedSuppress = false; let suppressRestoreAt = 0;
     async function recoverOverlap(path: string, start: number, end: number) {
       try {
+        // Loudness bar (fire17, two live incidents 2026-08-20: the mouth's greeting and a
+        // MIND line's tail came back as fake "you" turns): the dropped window is mostly
+        // SPEAKER LEAK, and leak is speech-shaped — duration cannot tell it from the human,
+        // only loudness can (close mic beats speaker bleed). Recovery therefore requires
+        // sustained audio above a real-speech peak bar, and resends only the loud region.
+        // APIPLAN_RECOVER_PEAK tunes the bar (default 6500, same scale as the barge bar);
+        // 0 disables recovery entirely.
+        const RECOVER_PEAK = Number(process.env.APIPLAN_RECOVER_PEAK ?? 6500);
+        if (RECOVER_PEAK <= 0) return;
         const len = end - start;
         if (len < RATE * 2 * 0.4) return;                     // <400ms can't be real speech (same bar as the hangup guard)
         for (let i = 0; i < 60; i++) {                        // wait for a quiet, response-free moment (max ~30s)
@@ -489,11 +498,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const got = fs.readSync(fd, buf, 0, len, 44 + start); // 44 = WAV header; offsets are archive data bytes
         fs.closeSync(fd);
         if (got < RATE * 2 * 0.4) return;
+        // Scan 50ms blocks; require ≥200ms above the bar, then trim the resend to the loud
+        // region (±300ms padding) so leak-only stretches never re-enter the model.
+        const BLK = Math.round(RATE * 2 * 0.05);
+        let firstLoud = -1; let lastLoud = -1; let loudMs = 0;
+        for (let b = 0; b * BLK < got; b++) {
+          if (framePeak(buf.subarray(b * BLK, Math.min(got, (b + 1) * BLK))) >= RECOVER_PEAK) {
+            if (firstLoud < 0) firstLoud = b;
+            lastLoud = b; loudMs += 50;
+          }
+        }
+        if (loudMs < 200) { say("info", `overlap recovery skipped — nothing above the leak bar (${loudMs}ms loud)`); return; }
+        const from = Math.max(0, (firstLoud - 6) * BLK);
+        const to = Math.min(got, (lastLoud + 7) * BLK);
+        const slice = buf.subarray(from, to);
         const tmp = `${archDir}/overlap-${Date.now()}.wav`;
-        fs.writeFileSync(tmp, Buffer.concat([archHeader(got), buf.subarray(0, got)]));
+        fs.writeFileSync(tmp, Buffer.concat([archHeader(slice.length), slice]));
         savedSuppress = suppressAuto; suppressRestoreAt = Date.now() + 20000;
         suppressAuto = true;                                  // transcribe only — never auto-answer the recovered turn
-        say("info", `recovering speech spoken during mouth reply (${(got / 2 / RATE).toFixed(1)}s)`);
+        say("info", `recovering speech spoken during mouth reply (${(slice.length / 2 / RATE).toFixed(1)}s loud-trimmed of ${(got / 2 / RATE).toFixed(1)}s)`);
         await resendAudio(tmp);
         try { fs.unlinkSync(tmp); } catch {}
         await Bun.sleep(15000);                               // failsafe: transcription event normally restores much sooner
