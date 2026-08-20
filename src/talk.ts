@@ -205,6 +205,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Default from env (APIPLAN_VAD_CREATE_RESPONSE=0 → start closed); otherwise open so the mouth
   // gives its quick opener before the MIND takes over with the truth.
   let suppressAuto = process.env.APIPLAN_VAD_CREATE_RESPONSE === "0";
+  let lastSuppressEchoAt = 0;   // throttle for the suppressed-auto-reply visibility echo
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -535,7 +536,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const slice = buf.subarray(from, to);
         const tmp = `${archDir}/overlap-${Date.now()}.wav`;
         fs.writeFileSync(tmp, Buffer.concat([archHeader(slice.length), slice]));
-        savedSuppress = suppressAuto; suppressRestoreAt = Date.now() + 20000;
+        // REENTRANT-SAFE suppress (root cause of the 14:19 mouth outage, call 86130: two
+        // recoveries fired back-to-back; the second saved the first's forced `true` as the
+        // restore baseline, so suppressAuto restored to TRUE forever and 22 auto-replies
+        // died silently). The baseline is captured ONLY when no window is armed.
+        if (!suppressRestoreAt) savedSuppress = suppressAuto;
+        suppressRestoreAt = Date.now() + 20000;
         recoverSentAt = 0;                                    // armed: transcripts landing BEFORE the resend commits never restore
         suppressAuto = true;                                  // transcribe only — never auto-answer the recovered turn
         say("info", `recovering speech spoken during mouth reply (${(slice.length / 2 / RATE).toFixed(1)}s loud-trimmed of ${(got / 2 / RATE).toFixed(1)}s)`);
@@ -798,6 +804,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // hold is echoed, so the watching MIND can re-weave them against what he just said
       // ({"drop_queue":true} + one fresh line). Enforced here so it works from any
       // session — nobody has to remember. 120s failsafe in case speech_stopped is lost.
+      // STALE-QUEUE AUTO-REPLACE (fire17, voice, 2026-08-20: "שזה לא משהו שהוא צריך לזכור
+      // אלא חלק מהפלואו והמערכת של המחסנית משלבת את ההודעות האלה ביחד"): a fresh MIND line
+      // arriving over stale lines REPLACES them by construction — the MIND sends its one
+      // merged line and pileup is impossible; no drop_queue ritual needed ({"drop_queue"}
+      // stays for manual control). Live evidence for the law: on call 22157 lines went
+      // HELD→STALE repeatedly and nothing ever spoke.
+      if (queueStale && injectQueue.length) {
+        say("info", `stale queue auto-replaced (${injectQueue.length}) by fresh line`);
+        injectQueue.length = 0;
+      }
       queueStale = false;   // a new inject IS the re-weave — it releases the stale hold
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
         injectQueue.push(text);
@@ -867,6 +883,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         micMuted = j.mute;
                         archRoll(micMuted ? "mute flip" : "unmute flip");
                         say("info", micMuted ? "mic muted" : "mic unmuted");
+                        // Stuck-latch fix (call 86130: speech_started then mic muted
+                        // mid-speech → the server never sends speech_stopped → userSpeaking
+                        // stayed true and held the MIND queue for 40s+). A mute IS the end
+                        // of the audible turn — synthesize the stop.
+                        if (micMuted && userSpeaking) {
+                          userSpeaking = false;
+                          lastSpeechStopAt = Date.now();
+                          if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
+                          if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
+                        }
                       }
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
                       suppressRestoreAt = 0;                          // MIND's explicit choice outranks a pending overlap-recovery restore
@@ -954,6 +980,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
+              // A suppressed mouth must never be INVISIBLE (the 14:19 outage ran 12 minutes
+              // undetected because this cancel was silent). Throttled so a closed-mouth
+              // session doesn't spam.
+              if (suppressAuto && !noiseBlip && Date.now() - lastSuppressEchoAt > 10000) {
+                lastSuppressEchoAt = Date.now();
+                say("info", `auto-reply suppressed (mouth ${suppressRestoreAt ? "in recovery window" : "CLOSED by MIND"})`);
+              }
               // Starvation fix (fire17, 2026-08-20): a REAL user turn whose auto-reply was
               // cancelled only because MIND audio was playing still deserves its answer —
               // mark it and release it the moment the MIND's audio ends (mouth first).
@@ -1024,7 +1057,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // the blip gate) transcribes to an EMPTY string; a VAD auto-reply born from it is a
           // ramble at nothing. Cancel it the moment the empty transcript lands — but never a
           // MIND-initiated response (mindResponse), which owes nothing to this user turn.
-          if (!ev.transcript?.trim() && responseActive && !mindResponse && !awaitingResponse && !closing) {
+          // Audio outranks a missing transcript: a turn with substantial committed speech
+          // (2x the blip bar) keeps its reply even when transcription returns empty — a
+          // transcription hiccup must never kill a real answer (lane 12 hardening).
+          if (!ev.transcript?.trim() && responseActive && !mindResponse && !awaitingResponse && !closing
+              && lastSpeechMs < 2 * (Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500)) {
             try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
             if (curResponseId) cancelledResponses.add(curResponseId);
             responseActive = false;
