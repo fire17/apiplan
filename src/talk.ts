@@ -95,6 +95,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
 
   const ws = o.socket ?? openRealtime(c.token, model);
   rec({ ev: "info", text: `talk start model=${model} voice=${o.voice || "cedar"}${o.socket ? " (parked socket)" : ""}${o.tools?.length ? ` tools=${o.tools.length}` : ""}` });
+  // Forensics anchor: log the engine's git sha so log analysis never infers the running
+  // code version from process start times (verified pain: 61139 judged on unshipped code).
+  try {
+    const sha = new TextDecoder().decode(Bun.spawnSync(["git", "-C", dirname(new URL(import.meta.url).pathname), "rev-parse", "--short", "HEAD"]).stdout).trim();
+    if (sha) rec({ ev: "info", text: `engine ${sha}` });
+  } catch { /* never block a call on git */ }
 
   // Structural allow-list: a tool name the caller never declared is never dispatched,
   // no matter what the model asks for.
@@ -449,7 +455,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // recovered turn cannot auto-fire a reply.
     // ponytail: single-shot at playback end; if a mouth reply runs very long, his words
     // surface only after it ends — chunked mid-playback recovery is the revisit.
-    let ovStart = -1; let ovEnd = 0; let ovPath = "";
+    let ovStart = -1; let ovEnd = 0; let ovPath = ""; let ovAt = 0;
     let recovering = false;
     // USER BARGES MIND (fire17's law: his voice outranks everything, including the MIND's
     // own audio). While the MIND narrator plays, mic frames are gated (echo-safe) but still
@@ -462,10 +468,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Worst mis-tune (leak peaks above threshold, e.g. very loud speakers): the MIND cuts
     // itself spuriously — degraded, but no loop and nothing speaks on its own. Tune with
     // APIPLAN_MIND_BARGE_PEAK (0 disables) / APIPLAN_MIND_BARGE_MS.
-    const BARGE_PEAK = Number(process.env.APIPLAN_MIND_BARGE_PEAK ?? 6500);
-    const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 300;
-    let bargeMs = 0;
+    // CALIBRATED 2026-08-20 from this rig's real archives (opus verify sweep, 587s of
+    // audio): speaker leak peaks 400-1789; his close-mic speech p90 1642-2194, max ~3400.
+    // 6500 was above BOTH — barge was dead code and recovery never fired. The workable
+    // absolute band is ~1800-2000 (margin only ~1.15x — env-tune per rig, contrast-based
+    // calibration is the revisit). Sustain uses a LEAKY accumulator: natural speech dips
+    // (1690→389→1570 inside 300ms measured) defeat a consecutive-frames rule.
+    const envBar = (name: string, dflt: number) => {
+      const v = process.env[name];
+      return v === undefined || v === "" ? dflt : Number(v);   // ""≠0: only an explicit 0 disables
+    };
+    const BARGE_PEAK = envBar("APIPLAN_MIND_BARGE_PEAK", 1800);
+    const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 250;
+    const MUTEDWARN_PEAK = envBar("APIPLAN_MUTEDWARN_PEAK", 1800);   // no leak risk while muted — can be aggressive
+    let bargeMs = 0; let lastBargeAt = 0;
     let mutedSpeechMs = 0; let mutedWarnAt = 0;
+    // Auditability: a live log must always record which thresholds were in force.
+    say("info", `bars: barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} mutedwarn=${MUTEDWARN_PEAK}`);
     const framePeak = (v: Uint8Array) => {
       let pk = 0;
       for (let i = 0; i + 1 < v.length; i += 32) {           // sparse scan — same cost profile as the archive's
@@ -475,6 +494,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       return pk;
     };
     let savedSuppress = false; let suppressRestoreAt = 0;
+    let recoverSentAt = 0;   // restore-keying: only a transcript arriving AFTER the resend committed may restore suppressAuto
     async function recoverOverlap(path: string, start: number, end: number) {
       try {
         // Loudness bar (fire17, two live incidents 2026-08-20: the mouth's greeting and a
@@ -482,9 +502,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // SPEAKER LEAK, and leak is speech-shaped — duration cannot tell it from the human,
         // only loudness can (close mic beats speaker bleed). Recovery therefore requires
         // sustained audio above a real-speech peak bar, and resends only the loud region.
-        // APIPLAN_RECOVER_PEAK tunes the bar (default 6500, same scale as the barge bar);
+        // APIPLAN_RECOVER_PEAK tunes the bar (default 2000 — calibrated: leak maxes 1789
+        // on this rig, his speech sustains 300-700ms above 1800; 6500 was NEVER-RECOVER);
         // 0 disables recovery entirely.
-        const RECOVER_PEAK = Number(process.env.APIPLAN_RECOVER_PEAK ?? 6500);
+        const RECOVER_PEAK = envBar("APIPLAN_RECOVER_PEAK", 2000);
         if (RECOVER_PEAK <= 0) return;
         const len = end - start;
         if (len < RATE * 2 * 0.4) return;                     // <400ms can't be real speech (same bar as the hangup guard)
@@ -515,12 +536,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const tmp = `${archDir}/overlap-${Date.now()}.wav`;
         fs.writeFileSync(tmp, Buffer.concat([archHeader(slice.length), slice]));
         savedSuppress = suppressAuto; suppressRestoreAt = Date.now() + 20000;
+        recoverSentAt = 0;                                    // armed: transcripts landing BEFORE the resend commits never restore
         suppressAuto = true;                                  // transcribe only — never auto-answer the recovered turn
         say("info", `recovering speech spoken during mouth reply (${(slice.length / 2 / RATE).toFixed(1)}s loud-trimmed of ${(got / 2 / RATE).toFixed(1)}s)`);
         await resendAudio(tmp);
         try { fs.unlinkSync(tmp); } catch {}
-        await Bun.sleep(15000);                               // failsafe: transcription event normally restores much sooner
-        if (suppressRestoreAt && Date.now() >= suppressRestoreAt - 5000) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
+        recoverSentAt = Date.now();
+        // Failsafe restore is a timer, NOT an in-try sleep: holding `recovering` for 15s
+        // silently dropped every overlap window that opened meanwhile (verified defect).
+        setTimeout(() => { if (suppressRestoreAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; } }, 15000);
       } catch { /* recovery must never break the call */ }
       finally { recovering = false; }
     }
@@ -532,10 +556,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (rdone) break;
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
           if (micMuted) {                                      // muted: drop mic frames so the model never hears them
+            // A mute flip rolls the archive segment — a pending overlap window into the old
+            // segment is no longer a live turn (verified defect: a window resent 4.5 min
+            // later as fresh speech). Discard it; the audio itself stays archived.
+            if (ovStart >= 0) { ovStart = -1; ovEnd = 0; ovPath = ""; }
             // Talking into a stuck/forgotten mute is silent deafness (root cause of the
             // 13:37 "הפה לא עונה לי" — mic muted, never unmuted, zero feedback). Say so.
             if (value?.length) {
-              if (framePeak(value) >= 4000) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
+              if (framePeak(value) >= MUTEDWARN_PEAK) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
               if (mutedSpeechMs > 1000 && Date.now() - mutedWarnAt > 10000) {
                 mutedWarnAt = Date.now(); mutedSpeechMs = 0;
                 say("info", "speaking while muted — the mouth cannot hear you");
@@ -543,36 +571,52 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
             continue;
           }
-          if (stillAudible() && !o.barge) {
-            if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
-              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; }
-              if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
+          // MIND narrator playing: frames NEVER flow in ANY mode (o.barge only trades off
+          // the MOUTH's playback — the narrator's audio must not reach the model even with
+          // headphones-mode on; verified gap). Detect the human barging locally.
+          if (mindPlayer && mindLine) {
+            if (value?.length && archFd >= 0) {
+              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
+              if (ovPath === archPath) ovEnd = archBytes;
             }
-            // User-barges-MIND: local detection only (nothing sent), MIND playback only —
-            // during MOUTH playback a kill would be a mouth-barge, which no-barge mode
-            // forbids for echo reasons; the overlap recovery above covers those words.
-            if (mindPlayer && mindLine && value?.length && BARGE_PEAK > 0) {
-              if (framePeak(value) >= BARGE_PEAK) bargeMs += (value.length / 2 / RATE) * 1000; else bargeMs = 0;
-              if (bargeMs >= BARGE_SUSTAIN) {
-                bargeMs = 0;
+            if (value?.length && BARGE_PEAK > 0) {
+              const fMs = (value.length / 2 / RATE) * 1000;
+              // Leaky accumulator — real speech dips below any bar mid-word; a strict
+              // consecutive rule never accumulates 250ms (measured).
+              bargeMs = framePeak(value) >= BARGE_PEAK ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
+              if (bargeMs >= BARGE_SUSTAIN && Date.now() - lastBargeAt > 1000) {
+                bargeMs = 0; lastBargeAt = Date.now();
                 const L = mindLine;
-                L.cut = Math.min(L.text.length, Math.round(((Date.now() - L.startAt) / L.ms) * L.text.length));
+                // startAt is biased by ffplay spin-up (~250ms measured) and the cut rounds
+                // DOWN to a word boundary — never record words he did not hear as spoken.
+                const raw = Math.min(L.text.length, Math.round(((Date.now() - L.startAt) / L.ms) * L.text.length));
+                const wb = L.text.lastIndexOf(" ", raw);
+                L.cut = wb > 0 ? wb : Math.max(0, raw);
                 try { mindPlayer.kill("SIGKILL"); } catch {}   // exited handler records the spoken prefix only
-                playingUntil = 0;                              // unblock the mic NOW — his words flow to transcription
+                playingUntil = Date.now() + 250;               // swallow the kill tail — reopening at 0 lets the tail transcribe
                 say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
                 ovStart = -1; ovEnd = 0; ovPath = "";          // his live speech supersedes overlap recovery here
               }
-              continue;
+            }
+            continue;
+          }
+          if (stillAudible() && !o.barge) {
+            if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
+              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
+              if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
             }
             bargeMs = 0;
             continue;
           }
           bargeMs = 0;
           if (ovStart >= 0 && !recovering) {                   // playback just ended → recover the dropped window
-            recovering = true;
-            recoverOverlap(ovPath, ovStart, ovEnd);            // async; never blocks the mic pump
+            // Max age: a stale window is not a live turn (mute gaps, long stalls).
+            if (Date.now() - ovAt < 30000) {
+              recovering = true;
+              recoverOverlap(ovPath, ovStart, ovEnd);          // async; never blocks the mic pump
+            }
             ovStart = -1; ovEnd = 0; ovPath = "";
           }
           if (ws.readyState !== WebSocket.OPEN) break;
@@ -668,9 +712,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         await Bun.write(f, r.bytes);
         const ms = ((r.bytes.length - 44) / 2 / RATE) * 1000;
         playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
-        mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", f],
+        // Low-latency flags: without them ffplay holds a read-ahead buffer that stays
+        // audible ~40-100ms after SIGKILL — the post-barge self-hear window (verified).
+        mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+          "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0", f],
           { stdout: "ignore", stderr: "ignore" });
-        mindLine = { text, ms, startAt: Date.now(), cut: -1 };
+        // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
+        // sample) so the barge cut never over-counts words as spoken.
+        mindLine = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1 };
         say("model", text);   // the exact words now audible — the monitor/GUI see the true line
         mindPlayer.exited.then(() => {
           // If the user barged (pumpMic set cut), only the SPOKEN PREFIX goes into the
@@ -960,7 +1009,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "conversation.item.input_audio_transcription.completed":
           // Overlap recovery done: the recovered turn transcribed — reopen the mouth to
           // whatever it was before (MIND's explicit {"autospeak"} always wins, see below).
-          if (suppressRestoreAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
+          // Keyed on recoverSentAt: a LIVE turn's lagging transcript arriving before the
+          // resend committed must NOT restore early (verified race — the mouth would
+          // auto-answer the recovered turn).
+          if (suppressRestoreAt && recoverSentAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
           // Stale-queue law: a completed user turn makes every held MIND line stale —
           // it must be re-woven against these new words, never auto-fired (echo once).
@@ -990,7 +1042,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "conversation.item.input_audio_transcription.failed":
-          if (suppressRestoreAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
+          if (suppressRestoreAt && recoverSentAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
           // Don't strand a held reply for 4s when the transcript simply failed.
           flushReply();
           break;
