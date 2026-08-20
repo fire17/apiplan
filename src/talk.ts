@@ -217,6 +217,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // and ghost audio plays after the interrupt.
   let curResponseId: string | null = null;   // response currently generating
   let responseActive = false;                 // a response is mid-generation (safe to cancel)
+  let curResponseBornAt = 0;                  // E128: when the active response was born — the empty-transcript
+                                              // gate may only cancel a reply born from ITS OWN segment
   let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
   let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
   let mindBusy = false;                       // a MIND narrator line is generating or playing (serializes the queue)
@@ -1018,6 +1020,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "response.created":
           curResponseId = ev.response?.id ?? null;
+          curResponseBornAt = Date.now();
           // Mouthpiece mode: if the model started a response we did NOT initiate (awaitingResponse
           // is false → it's a VAD auto-reply to the user's/ambient speech, not an injected line),
           // cancel it at once so the mouth stays a pure mouthpiece for the MIND. Belt-and-suspenders
@@ -1128,12 +1131,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // Audio outranks a missing transcript: a turn with substantial committed speech
           // (2x the blip bar) keeps its reply even when transcription returns empty — a
           // transcription hiccup must never kill a real answer (lane 12 hardening).
+          // E128 (EVA, call 31591 15:54+15:56 — "הוא לא מגיב לי בסוף בכלל"): only cancel a
+          // response born from THIS empty segment. A blip landing while the PREVIOUS real
+          // turn's reply is still generating must never kill that reply — frequent at
+          // VAD 500 where a trailing blip becomes its own segment.
           if (!ev.transcript?.trim() && responseActive && !mindResponse && !awaitingResponse && !closing
+              && curResponseBornAt >= speechStartedAt
               && lastSpeechMs < 2 * (Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500)) {
             try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
             if (curResponseId) cancelledResponses.add(curResponseId);
             responseActive = false;
             say("info", "empty-transcript auto-reply cancelled (noise, not speech)");
+          } else if (!ev.transcript?.trim() && responseActive && !mindResponse
+              && curResponseBornAt < speechStartedAt) {
+            say("info", "empty segment ignored — active reply belongs to the previous real turn (E128 guard)");
           }
           flushReply();
           // Hangup is irreversible — require REAL speech behind it, not a noise hallucination.
