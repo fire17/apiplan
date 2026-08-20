@@ -6,8 +6,9 @@
 // talking, so there is no push-to-talk and no silence heuristic of our own to get wrong.
 import { openai, openRealtime, speakRealtime } from "./providers.ts";
 import { micCommand, speakerCommand, ensureDir } from "./platform.ts";
-import { dirname } from "node:path";
+import { dirname, basename } from "node:path";
 import { unlinkSync } from "node:fs";
+import * as fs from "node:fs";
 
 const RATE = 24000;
 
@@ -195,6 +196,54 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
   const cancelledResponses = new Set<string>();
 
+  // ─── GAPLESS TURN ARCHIVE (fire17's never-lose law, 2026-08-20) ───────────────
+  // Tee every mic frame to per-turn WAVs BEFORE any drop (mute / barge / backpressure),
+  // so what the human said survives even when the model never heard it (the lost
+  // 2-minute caps-on message, 2026-08-20). Segments roll when the mouth starts a reply
+  // (= the user-turn boundary per fire17), on mute flips, and at a 10-minute failsafe;
+  // segments that never rise above the silence floor are deleted. APIPLAN_ARCHIVE=0 off.
+  const archOn = process.env.APIPLAN_ARCHIVE !== "0";
+  const archDir = `${process.env.HOME}/.livemind/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
+  let archFd = -1; let archBytes = 0; let archPeak = 0; let archN = 0; let archPath = "";
+  let archLastResp = "";
+  const archHeader = (len: number) => {
+    const h = Buffer.alloc(44);
+    h.write("RIFF", 0); h.writeUInt32LE(36 + len, 4); h.write("WAVEfmt ", 8);
+    h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+    h.writeUInt32LE(RATE, 24); h.writeUInt32LE(RATE * 2, 28); h.writeUInt16LE(2, 32);
+    h.writeUInt16LE(16, 34); h.write("data", 36); h.writeUInt32LE(len, 40);
+    return h;
+  };
+  const archRoll = (why: string) => {
+    if (archFd < 0) return;
+    try {
+      const fd = archFd; archFd = -1;
+      fs.writeSync(fd, archHeader(archBytes), 0, 44, 0);   // patch the placeholder header
+      fs.closeSync(fd);
+      if (archPeak < 500) fs.unlinkSync(archPath);          // pure room noise, no speech
+      else say("info", `turn archived (${why}): ${archPath}`);
+    } catch { /* archive must never break the call */ }
+    archBytes = 0; archPeak = 0; archPath = "";
+  };
+  const archWrite = (frame: Uint8Array) => {
+    if (!archOn) return;
+    try {
+      if (archFd < 0) {
+        fs.mkdirSync(archDir, { recursive: true });
+        archPath = `${archDir}/turn-${String(++archN).padStart(3, "0")}-${Date.now()}.wav`;
+        archFd = fs.openSync(archPath, "w");
+        fs.writeSync(archFd, archHeader(0));                 // placeholder; patched on roll
+      }
+      fs.writeSync(archFd, frame);
+      archBytes += frame.length;
+      for (let i = 0; i + 1 < frame.length; i += 32) {       // sparse peak scan — cheap
+        const v = Math.abs((frame[i] | (frame[i + 1] << 8)) << 16 >> 16);
+        if (v > archPeak) archPeak = v;
+      }
+      if (archBytes > RATE * 2 * 600) archRoll("10min failsafe");
+    } catch { /* archive must never break the call */ }
+  };
+
   let player: ReturnType<typeof Bun.spawn> | null = null;
   let speaking = false;          // the model currently has audio in flight
   let playerChecked = false;
@@ -273,6 +322,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     if (m) setTimeout(() => { try { m.kill(9); } catch {} }, 500);   // escalate if ffmpeg ignores TERM
     stopPlayer();
     if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; }
+    archRoll("call end");
     try { logw?.flush?.(); } catch {}
   };
   // Clean up the child ffmpeg/ffplay on EVERY exit path, not just Ctrl-C: a leftover
@@ -368,6 +418,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         while (true) {
           const { done: rdone, value } = await reader.read();
           if (rdone) break;
+          if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
           if (micMuted) continue;                              // muted: drop mic frames so the model never hears them
           if (stillAudible() && !o.barge) continue;
           if (ws.readyState !== WebSocket.OPEN) break;
@@ -375,6 +426,35 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: Buffer.from(value).toString("base64") }));
         }
       } catch { /* the socket or the mic went away; the loop above handles it */ }
+    }
+
+    // RESEND (fire17's never-lose law, 2026-08-20): {"audio":"<file>"} streams a saved
+    // recording into the model exactly as live speech — transcoded to the session format,
+    // mute BYPASSED (an explicit resend IS intent to be heard), 700ms silence tail so the
+    // server VAD closes the turn and the mouth answers as if it was just spoken.
+    async function resendAudio(path: string) {
+      try {
+        if (!(await Bun.file(path).exists())) { say("info", `audio resend failed: not found ${path}`); return; }
+        const p = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+          "-f", "s16le", "-ac", "1", "-ar", String(RATE), "-"], { stdout: "pipe", stderr: "ignore" });
+        const reader = p.stdout.getReader();
+        let sent = 0;
+        while (true) {
+          const { done: rdone, value } = await reader.read();
+          if (rdone) break;
+          if (ws.readyState !== WebSocket.OPEN) return;
+          for (let i = 0; i < value.length; i += 32768) {
+            while ((ws as any).bufferedAmount > 512 * 1024) await Bun.sleep(20);
+            ws.send(JSON.stringify({ type: "input_audio_buffer.append",
+              audio: Buffer.from(value.subarray(i, i + 32768)).toString("base64") }));
+            sent += Math.min(32768, value.length - i);
+          }
+        }
+        if (!sent) { say("info", `audio resend failed: empty or unreadable ${path}`); return; }
+        ws.send(JSON.stringify({ type: "input_audio_buffer.append",
+          audio: Buffer.alloc(RATE * 2 * 0.7).toString("base64") }));   // silence tail closes the turn
+        say("info", `audio resent (${(sent / (RATE * 2)).toFixed(1)}s): ${basename(path)}`);
+      } catch (e) { say("info", `audio resend failed: ${String(e).slice(0, 120)}`); }
     }
 
     /** Dispatch ONE declared tool call, reply with its output, and let the model speak
@@ -527,6 +607,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       }
                     } else if (typeof j.mute === "boolean") {   // mic mute toggle — stop/resume sending mic audio to the model
                       micMuted = j.mute;
+                      archRoll(micMuted ? "mute flip" : "unmute flip");
                       say("info", micMuted ? "mic muted" : "mic unmuted");
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
                       suppressAuto = !j.autospeak;
@@ -542,6 +623,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         type: "message", role: "system",
                         content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: ${String(j.context)}` }] } }));
                       say("info", "context preloaded (silent)");
+                    } else if (typeof j.audio === "string") {   // resend a recording as live speech
+                      resendAudio(j.audio);
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
                   } catch {}
                 }
@@ -687,6 +770,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // A cancelled response's deltas are already dead — playing them is the
             // post-barge ghost-audio bug.
             if (ev.response_id && cancelledResponses.has(ev.response_id)) break;
+            if (ev.response_id && ev.response_id !== archLastResp) {   // mouth reply begins = user turn done
+              archLastResp = ev.response_id; archRoll("mouth reply");
+            }
             speaking = true;
             if (!player || player.exitCode !== null) startPlayer();   // dead/absent → fresh player
             if (!itemFirstDeltaAt) itemFirstDeltaAt = Date.now();
