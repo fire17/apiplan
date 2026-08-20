@@ -85,7 +85,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try { logw.write(JSON.stringify({ t: Date.now(), ...obj }) + "\n"); logw.flush?.(); } catch {}
   };
   const emit = o.onEvent ?? (() => {});
-  const say = (kind: "you" | "model" | "info", text: string) => { emit(kind, text); rec({ ev: kind, text }); };
+  // `extra` rides into the LOG event only, never into the emitted text — that is how a turn is
+  // ANNOTATED without one of his words being changed, held, or dropped. SPREAD FIRST: the
+  // canonical fields win, so an annotation is structurally incapable of altering what he said.
+  const say = (kind: "you" | "model" | "info", text: string, extra?: Record<string, unknown>) => { emit(kind, text); rec({ ...extra, ev: kind, text }); };
 
   // Inbound control channel — where injected context (monitor reports, mid-call context)
   // is read from. Exported in the env so an in-process tool (set_monitor) knows where a
@@ -202,6 +205,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // noise can't fire the IRREVERSIBLE hangup: a real "bye" needs real speech behind it.
   let speechStartedAt = 0;
   let lastSpeechMs = 0;
+  // Per-turn snapshots of those two numbers: pushed at speech_stopped, consumed by that turn's
+  // transcript (FIFO, 4 deep — turns and transcripts arrive in order on this socket, and a
+  // bounded ring means one lost transcript can never strand the pairing for long). The globals
+  // above stay for the gates that legitimately mean "the latest turn" (E128, hangup); the echo
+  // timing belt reads THIS turn's pair or it does not fire at all.
+  const speechTurns: Array<{ startedAt: number; ms: number }> = [];
   let userSpeaking = false;   // VAD says the human is mid-turn — MIND lines HOLD (stack law)
   let lastSpeechStopAt = 0;   // sustained-silence gate: MIND may speak only after ~2.5s of real quiet
 
@@ -341,18 +350,74 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // (MIND lines + mouth replies) are kept; a RECOVERED turn whose transcript near-matches
   // one is speaker echo: discarded from the log and deleted from the model's context.
   // Applies ONLY to recovered turns — a live turn is never censored.
-  const recentSpoken: string[] = [];
+  // Entries carry the wall clock they were spoken at: a LIVE turn may only be suspected of
+  // echoing something said in the last ~45s (speaker leak returns within one playback), while
+  // the recovery path stays age-blind, exactly as before.
+  const recentSpoken: Array<{ t: number; text: string }> = [];
   let mouthBuf = "";
-  const rememberSpoken = (t: string) => { if (t.trim()) { recentSpoken.push(t); if (recentSpoken.length > 6) recentSpoken.shift(); } };
-  const echoSim = (a: string, b: string) => {           // bigram Dice similarity, diacritic/punct-insensitive
-    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-    const grams = (s: string) => { const g = new Set<string>(); for (let i = 0; i + 1 < s.length; i++) g.add(s.slice(i, i + 2)); return g; };
-    const A = grams(norm(a)), B = grams(norm(b));
+  const rememberSpoken = (t: string) => { if (t.trim()) { recentSpoken.push({ t: Date.now(), text: t }); if (recentSpoken.length > 6) recentSpoken.shift(); } };
+  // Hoisted so a window loop never rebuilds them (this runs inside ws.onmessage, the same
+  // handler that writes audio deltas to the player's stdin — a long block would stutter it).
+  const echoNorm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const echoGrams = (s: string) => { const g = new Set<string>(); for (let i = 0; i + 1 < s.length; i++) g.add(s.slice(i, i + 2)); return g; };
+  const dice = (A: Set<string>, B: Set<string>) => {    // bigram Dice, diacritic/punct-insensitive
     if (!A.size || !B.size) return 0;
     let inter = 0; for (const g of A) if (B.has(g)) inter++;
     return (2 * inter) / (A.size + B.size);
   };
-  const looksLikeEcho = (t: string) => recentSpoken.some((s) => echoSim(t, s) >= 0.75 || (s.length > 40 && echoSim(t, s.slice(-Math.max(40, t.length * 2))) >= 0.75));
+  // SLIDING BEST-WINDOW (EVA forensics 2026-08-20). The old fixed `t.length * 2` tail window
+  // caps Dice at ~2/3 even for a PERFECT tail echo — grams(t) holds n-1 members inside a window
+  // holding ~2n-1, so 2(n-1)/(3n-2) -> 0.667, and the measured ceiling band 0.667-0.79 STRADDLES
+  // the 0.75 bar. Clipped-tail echoes are exactly what leak recovery produces (mute, late unmute,
+  // loud-trim), so the belt was blind to its own main case (two known specimens scored 0.69).
+  // Comparing against the best window of the SAME normalized length restores the margin.
+  // Cost: grams(t) built ONCE, windows strided n/8, <= 6 short cached strings.
+  const echoBest = (t: string, s: string) => {
+    const nt = echoNorm(t), ns = echoNorm(s);
+    if (nt.length < 2 || ns.length < 2) return 0;
+    const A = echoGrams(nt);
+    if (ns.length <= nt.length * 1.2) return dice(A, echoGrams(ns));
+    let best = dice(A, echoGrams(ns.slice(-nt.length)));      // the exact tail is always tested
+    const step = Math.max(1, Math.floor(nt.length / 8));      // strided: ~8 probes per window length
+    for (let i = 0; i + nt.length <= ns.length; i += step) best = Math.max(best, dice(A, echoGrams(ns.slice(i, i + nt.length))));
+    return best;
+  };
+  /** Best match against anything we spoke within `maxAgeMs`, AND the line it matched — the
+   *  source line is what the residual test below strips, so it must travel with the score.
+   *  Costs NOTHING when leak is impossible: no ring, a too-short transcript, or a ring whose
+   *  newest line is already older than the window (recentSpoken is push-ordered by time). */
+  const echoScore = (t: string, maxAgeMs = Infinity): { score: number; src: string } => {
+    if (!recentSpoken.length || echoNorm(t).length < 8) return { score: 0, src: "" };
+    const now = Date.now();
+    if (now - recentSpoken[recentSpoken.length - 1]!.t > maxAgeMs) return { score: 0, src: "" };
+    let score = 0, src = "";
+    for (const s of recentSpoken) {
+      if (now - s.t > maxAgeMs) continue;
+      const sc = echoBest(t, s.text);
+      if (sc > score) { score = sc; src = s.text; }
+    }
+    return { score, src };
+  };
+  const ECHO_BAR = 0.75;        // text belt on the RECOVERY path — one of FOUR conditions to delete
+  const ECHO_LIVE_BAR = 0.9;    // a LIVE turn is only ever FLAGGED, so the bar is raised: being
+                                // wrong here costs a label, and a label must be worth reading
+  /** What the transcript says that our own recent speech does NOT explain. Clause by clause: a
+   *  clause we clearly said is stripped, everything else survives. A SHORT clause is never
+   *  explained away — "כן" is one bigram and would match any line containing it, yet a yes/no
+   *  is the most load-bearing thing he says. Under 4 normalized chars, it stays. */
+  const echoResidual = (t: string, s: string) => {
+    const ns = echoNorm(s);
+    return t.split(/(?<=[.!?…。！？؟])\s+|\n+/)
+      .filter((p) => {
+        const np = echoNorm(p);
+        if (!np) return false;
+        if (np.length < 4) return true;                       // a short answer is never "explained"
+        return !(echoBest(p, s) >= 0.6 || ns.includes(np));
+      }).join(" ").trim();
+  };
+  /** Information-free = our own speech explains the transcript ENTIRELY. No slack: anything at
+   *  all left over is his, and his words are never deleted. The `?` clause is a redundant belt. */
+  const infoFree = (r: string) => echoNorm(r).length === 0 && !/[?？؟]/.test(r);
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -633,10 +698,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const BARGE_PEAK = envBar("APIPLAN_MIND_BARGE_PEAK", 1800);
     const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 250;
     const MUTEDWARN_PEAK = envBar("APIPLAN_MUTEDWARN_PEAK", 1800);   // no leak risk while muted — can be aggressive
+    // How much of the window's END may be playback teardown rather than speech — see the
+    // transient rule in recoverOverlap. Number.isFinite: a typo'd env falls back to the default
+    // rather than silently disabling the guard; only an explicit 0 turns it off.
+    const RECOVER_TAIL_MS = (() => { const v = envBar("APIPLAN_RECOVER_TAIL_MS", 400); return Number.isFinite(v) ? v : 400; })();
     let bargeMs = 0; let lastBargeAt = 0;
     let mutedSpeechMs = 0; let mutedWarnAt = 0;
     // Auditability: a live log must always record which thresholds were in force.
-    say("info", `bars: barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} mutedwarn=${MUTEDWARN_PEAK}`);
+    say("info", `bars: barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} mutedwarn=${MUTEDWARN_PEAK}`);
     const framePeak = (v: Uint8Array) => {
       let pk = 0;
       for (let i = 0; i + 1 < v.length; i += 32) {           // sparse scan — same cost profile as the archive's
@@ -647,6 +716,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     };
     let savedSuppress = false; let suppressRestoreAt = 0;
     let recoverSentAt = 0;   // restore-keying: only a transcript arriving AFTER the resend committed may restore suppressAuto
+    // RESEND PROVENANCE — the two numbers the timing belt is built from (both already appear in
+    // the log; keeping them in memory is what lets a turn be judged without any new audio path)
+    // and the id of the item the SERVER built from the resent audio. Deletion is bound to that
+    // id: a live or later item can never reach the delete branch, whatever it says.
+    let lastResendAt = 0; let lastResendMs = 0;
+    let recoveredItemId: string | null = null;
     async function recoverOverlap(path: string, start: number, end: number) {
       try {
         // Loudness bar (fire17, two live incidents 2026-08-20: the mouth's greeting and a
@@ -674,14 +749,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // Scan 50ms blocks; require ≥200ms above the bar, then trim the resend to the loud
         // region (±300ms padding) so leak-only stretches never re-enter the model.
         const BLK = Math.round(RATE * 2 * 0.05);
-        let firstLoud = -1; let lastLoud = -1; let loudMs = 0;
+        // TEARDOWN-TRANSIENT GUARD (EVA forensics 2026-08-20, specimen 44292@15:14:55). A click at
+        // playback teardown is SHORT and ISOLATED; his voice is neither. So a loud block in the
+        // last TAIL_MS is only HELD — never discarded on position alone — and it is held only
+        // while three things are true: it sits in the tail, nothing was loud in the preceding
+        // ISO_MS (an open loud region is speech still going, and it keeps counting AND keeps
+        // extending lastLoud so the +-padding trim never truncates his last words), and the
+        // contiguous held run is still shorter than ISO_MS. The moment a held run reaches ISO_MS
+        // it is folded back in whole — a 200ms+ burst is speech, wherever it lands. Replay of
+        // S3's exact window: 250ms -> 100ms countable, 150ms held -> SKIP; a 300ms onset in the
+        // tail -> folded back, RECOVER, resend end untruncated.
+        const TAIL_MS = RECOVER_TAIL_MS;
+        const ISO_MS = 200;
+        const tailFrom = TAIL_MS > 0 ? got - Math.round(RATE * 2 * (TAIL_MS / 1000)) : got;
+        const isoBlocks = Math.round(ISO_MS / 50);
+        let firstLoud = -1; let lastLoud = -1; let loudMs = 0; let tailLoudMs = 0; let tailRun = 0;
         for (let b = 0; b * BLK < got; b++) {
-          if (framePeak(buf.subarray(b * BLK, Math.min(got, (b + 1) * BLK))) >= RECOVER_PEAK) {
-            if (firstLoud < 0) firstLoud = b;
-            lastLoud = b; loudMs += 50;
+          if (framePeak(buf.subarray(b * BLK, Math.min(got, (b + 1) * BLK))) < RECOVER_PEAK) { tailRun = 0; continue; }
+          if (b * BLK >= tailFrom && (lastLoud < 0 || b - lastLoud > isoBlocks)) {
+            tailRun++;
+            if (tailRun * 50 >= ISO_MS) {                     // too long to be a click — it is speech
+              loudMs += tailRun * 50; tailLoudMs -= (tailRun - 1) * 50;
+              if (firstLoud < 0) firstLoud = b - (tailRun - 1);
+              lastLoud = b; tailRun = 0;                      // contiguity now carries it (isolation test above)
+            } else tailLoudMs += 50;
+            continue;
           }
+          tailRun = 0;
+          if (firstLoud < 0) firstLoud = b;
+          lastLoud = b; loudMs += 50;
         }
-        if (loudMs < 200) { say("info", `overlap recovery skipped — nothing above the leak bar (${loudMs}ms loud)`); return; }
+        if (loudMs < 200) { say("info", `overlap recovery skipped — nothing above the leak bar (${loudMs}ms loud${tailLoudMs > 0 ? `, ${tailLoudMs}ms isolated in the ${TAIL_MS}ms teardown tail — held`: ""})`); return; }
         const from = Math.max(0, (firstLoud - 6) * BLK);
         const to = Math.min(got, (lastLoud + 7) * BLK);
         const slice = buf.subarray(from, to);
@@ -810,6 +908,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (!sent) { say("info", `audio resend failed: empty or unreadable ${path}`); return; }
         ws.send(JSON.stringify({ type: "input_audio_buffer.append",
           audio: Buffer.alloc(RATE * 2 * 0.7).toString("base64") }));   // silence tail closes the turn
+        lastResendAt = Date.now(); lastResendMs = (sent / (RATE * 2)) * 1000;   // timing-belt provenance
+        recoveredItemId = null;                                                  // re-arm: the NEXT commit is this resend's item
         say("info", `audio resent (${(sent / (RATE * 2)).toFixed(1)}s): ${basename(path)}`);
       } catch (e) { say("info", `audio resend failed: ${String(e).slice(0, 120)}`); }
     }
@@ -1165,6 +1265,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // The assistant message whose audio is about to play — barge-in truncates THIS.
           if (ev.item?.type === "message") { curItemId = ev.item.id; itemFirstDeltaAt = 0; itemQueuedMs = 0; }
           break;
+        case "input_audio_buffer.committed":
+          if (recoverSentAt && !recoveredItemId && ev.item_id) {
+            recoveredItemId = ev.item_id;
+            rec({ ev: "info", text: `recovered audio committed as ${ev.item_id}` });
+          }
+          break;
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
@@ -1195,6 +1301,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
           userSpeaking = false;
           lastSpeechStopAt = Date.now();
+          // This turn's own clock, for the echo timing belt (consumed by its transcript below).
+          speechTurns.push({ startedAt: speechStartedAt, ms: lastSpeechMs });
+          if (speechTurns.length > 4) speechTurns.shift();
           // Held MIND lines flow once his turn REALLY lands — the sustained-silence gate
           // inside flushInjectQueue re-holds if he resumes within 2.5s.
           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
@@ -1206,19 +1315,72 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // resend committed must NOT restore early (verified race — the mouth would
           // auto-answer the recovered turn).
           {
-            const wasRecovered = !!(suppressRestoreAt && recoverSentAt);
-            if (wasRecovered) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
-            // ECHO-DEDUPE: a recovered turn whose words are ours is speaker leak — never
-            // his. Discard from the log AND from the model's context; leave live turns
-            // untouched (he is never censored).
-            if (wasRecovered && ev.transcript?.trim() && looksLikeEcho(ev.transcript)) {
-              say("info", "recovered turn was speaker echo — discarded");
+            // ITEM-BOUND RECOVERY. `suppressRestoreAt && recoverSentAt` is a process-global
+            // WINDOW, so the FIRST transcript to land inside it used to claim the recovery path —
+            // his LIVE turn included, judged at the loose recovery bar with the power to delete.
+            // Recovery is now the identity of the item the server built from the resent audio;
+            // the suppressAuto restore keeps the old window key, because it must fire even if
+            // that commit event never arrives.
+            const inRecoveryWindow = !!(suppressRestoreAt && recoverSentAt);
+            if (inRecoveryWindow) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
+            const wasRecovered = !!ev.item_id && ev.item_id === recoveredItemId;
+            if (wasRecovered) recoveredItemId = null;
+            const tScript = ev.transcript?.trim() ?? "";
+            // This turn's own speech clock — never the globals, which any later turn overwrites.
+            const turn = speechTurns.shift();
+            const turnStartedAt = turn?.startedAt ?? 0; const turnMs = turn?.ms ?? 0;
+            // TEXT BELT. A recovered turn is judged against everything we spoke; a LIVE turn only
+            // against the last 45s, at the raised bar, and only ever to be flagged.
+            const m = tScript ? echoScore(tScript, wasRecovered ? Infinity : 45000) : { score: 0, src: "" };
+            const echoish = m.score >= (wasRecovered ? ECHO_BAR : ECHO_LIVE_BAR);
+            // TIMING BELT (EVA forensics, 31/31 across three live calls). A turn is resend-sourced
+            // iff an `audio resent (Xs)` committed <= 2s before ITS speech_started AND the turn
+            // CLOSED far faster than the audio appended to it. Bulk append is the tell: the server
+            // ends a resent turn on its own 1.1s silence tail regardless of content length
+            // (measured 0.5-1.2s of turn for 2.8-19.6s of audio), while a live turn cannot stop
+            // before the speech inside it ends (every genuine turn in the corpus ran 2.98-104.73s,
+            // n=31). The 1500ms FLOOR keeps a LONG resend from making a merged turn — his voice
+            // inside a 19.6s window — look bulk-appended on a bare `<`.
+            const bulkAppended = !!lastResendAt && turnStartedAt >= lastResendAt
+              && turnStartedAt - lastResendAt <= 2000 && turnMs > 0 && lastResendMs - turnMs > 1500;
+            // RESIDUAL TEST — the sacred rule made structural (fire17: the human is NEVER
+            // censored). `conversation.item.delete` removes a WHOLE item, and a recovered item can
+            // carry leak AND his live speech together: 44292@15:05:38 was a verbatim MIND tail
+            // followed by his own question "ולגבי התיקון?" and scores 1.00 on text alone. So before
+            // anything is removed, strip the part our own speech explains and require NOTHING to
+            // be left. Any residue at all — a short answer, a question mark — and it is FLAGGED.
+            const residual = echoish ? echoResidual(tScript, m.src) : "";
+            if (wasRecovered && echoish && bulkAppended && infoFree(residual)) {
+              // HIS WORDS NEVER LEAVE THE LOG. The item is removed from the MODEL'S CONTEXT only —
+              // the turn is still recorded and still emitted, carrying the evidence that removed
+              // it, so even a wrong decision loses nothing: what he said stays in the log stream
+              // and on the dashboard, byte-identical, forever.
+              say("you", tScript, {
+                echo_deleted_from_context: true, echo_sim: Number(m.score.toFixed(2)),
+                echo_src: m.src.slice(0, 200), echo_recovered: true, echo_belt: "text+timing+residual",
+                resent_ms: Math.round(lastResendMs), speech_ms: turnMs, item_id: ev.item_id ?? null,
+              });
+              say("info", `recovered turn was speaker echo — removed from the model's context, KEPT in the log (sim ${m.score.toFixed(2)}, resent ${Math.round(lastResendMs)}ms vs turn ${turnMs}ms, no residual)`);
               if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
               flushReply();
               break;
             }
+            // FLAG, NEVER DROP. Anything else that smells of leak — a live turn, a mixed or
+            // partial recovery, one belt without the other, a residual that survived — is
+            // ANNOTATED: additive fields on the ev:"you" record (the text stays byte-identical)
+            // plus one info line. The turn still prints, still reaches the model, still reaches
+            // the dashboard. Contract: docs/eva-annotation-contract.md.
+            if (tScript) {
+              const suspect = echoish || bulkAppended;
+              if (suspect) say("info", `possible speaker echo — turn FLAGGED, not removed (${echoish ? "text" : "—"}/${bulkAppended ? "timing" : "—"}${echoish && residual ? ", residual kept" : ""})`);
+              say("you", tScript, suspect ? {
+                echo_suspect: true, echo_sim: Number(m.score.toFixed(2)),
+                echo_belt: `${echoish ? "text" : ""}${echoish && bulkAppended ? "+" : ""}${bulkAppended ? "timing" : ""}`,
+                echo_recovered: wasRecovered, echo_residual: residual.slice(0, 200),
+                resent_ms: Math.round(lastResendMs), speech_ms: turnMs,
+              } : undefined);
+            }
           }
-          if (ev.transcript?.trim()) say("you", ev.transcript.trim());
           // Stale-queue law: a completed user turn makes every held MIND line stale —
           // it must be re-woven against these new words, never auto-fired (echo once).
           if (ev.transcript?.trim() && injectQueue.length && !queueStale) {
@@ -1259,6 +1421,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "conversation.item.input_audio_transcription.failed":
+          speechTurns.shift();   // no transcript will ever consume this turn's pair — keep the FIFO aligned
           if (suppressRestoreAt && recoverSentAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
           // Don't strand a held reply for 4s when the transcript simply failed.
           flushReply();
