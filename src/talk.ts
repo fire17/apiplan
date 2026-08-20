@@ -206,6 +206,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // gives its quick opener before the MIND takes over with the truth.
   let suppressAuto = process.env.APIPLAN_VAD_CREATE_RESPONSE === "0";
   let lastSuppressEchoAt = 0;   // throttle for the suppressed-auto-reply visibility echo
+  // ECHO-DEDUPE BELT (EVA integrity finding 2026-08-20: three ev:"you" turns were the
+  // system's OWN sentences re-heard through the speakers — one even survived the 2000
+  // loudness bar at high volume, leak/speech margin is only ~1.15x). Recent spoken texts
+  // (MIND lines + mouth replies) are kept; a RECOVERED turn whose transcript near-matches
+  // one is speaker echo: discarded from the log and deleted from the model's context.
+  // Applies ONLY to recovered turns — a live turn is never censored.
+  const recentSpoken: string[] = [];
+  let mouthBuf = "";
+  const rememberSpoken = (t: string) => { if (t.trim()) { recentSpoken.push(t); if (recentSpoken.length > 6) recentSpoken.shift(); } };
+  const echoSim = (a: string, b: string) => {           // bigram Dice similarity, diacritic/punct-insensitive
+    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+    const grams = (s: string) => { const g = new Set<string>(); for (let i = 0; i + 1 < s.length; i++) g.add(s.slice(i, i + 2)); return g; };
+    const A = grams(norm(a)), B = grams(norm(b));
+    if (!A.size || !B.size) return 0;
+    let inter = 0; for (const g of A) if (B.has(g)) inter++;
+    return (2 * inter) / (A.size + B.size);
+  };
+  const looksLikeEcho = (t: string) => recentSpoken.some((s) => echoSim(t, s) >= 0.75 || (s.length > 40 && echoSim(t, s.slice(-Math.max(40, t.length * 2))) >= 0.75));
   let curItemId: string | null = null;       // assistant item whose audio is playing
   let itemFirstDeltaAt = 0;                  // wall clock of that item's first audio delta
   let itemQueuedMs = 0;                      // how much audio of it we handed the player
@@ -727,6 +745,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // sample) so the barge cut never over-counts words as spoken.
         mindLine = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1 };
         say("model", text);   // the exact words now audible — the monitor/GUI see the true line
+        rememberSpoken(text); // echo-dedupe: a recovered "you" matching this is speaker leak
         mindPlayer.exited.then(() => {
           // If the user barged (pumpMic set cut), only the SPOKEN PREFIX goes into the
           // mouth's history — recording words that were never heard corrupts its context.
@@ -942,7 +961,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       switch (ev.type) {
         case "response.output_audio_transcript.delta":
         case "response.audio_transcript.delta":
-          if (ev.delta) rec({ ev: "model_delta", text: ev.delta });
+          if (ev.delta) { rec({ ev: "model_delta", text: ev.delta }); mouthBuf += ev.delta; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
           break;
         case "conversation.item.input_audio_transcription.delta":
           if (ev.delta) rec({ ev: "you_delta", text: ev.delta });
@@ -1045,7 +1064,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // Keyed on recoverSentAt: a LIVE turn's lagging transcript arriving before the
           // resend committed must NOT restore early (verified race — the mouth would
           // auto-answer the recovered turn).
-          if (suppressRestoreAt && recoverSentAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
+          {
+            const wasRecovered = !!(suppressRestoreAt && recoverSentAt);
+            if (wasRecovered) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
+            // ECHO-DEDUPE: a recovered turn whose words are ours is speaker leak — never
+            // his. Discard from the log AND from the model's context; leave live turns
+            // untouched (he is never censored).
+            if (wasRecovered && ev.transcript?.trim() && looksLikeEcho(ev.transcript)) {
+              say("info", "recovered turn was speaker echo — discarded");
+              if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+              flushReply();
+              break;
+            }
+          }
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
           // Stale-queue law: a completed user turn makes every held MIND line stale —
           // it must be re-woven against these new words, never auto-fired (echo once).
@@ -1130,6 +1161,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           speaking = false;
           responseActive = false;
           awaitingResponse = false;
+          if (mouthBuf.trim()) { rememberSpoken(mouthBuf); mouthBuf = ""; }   // echo-dedupe corpus
           // Now that the out-of-band MIND line has actually been spoken, record it in the
           // conversation so the mouth knows it was said (one answer, no repeats). Doing this
           // BEFORE speaking made the model skip the line as already-said.
