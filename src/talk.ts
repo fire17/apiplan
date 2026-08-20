@@ -427,6 +427,51 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Pump one ffmpeg's stdout until it ends. While the model is speaking we stop sending,
     // unless barge-in was asked for: on speakers its own voice re-enters the mic and it
     // interrupts itself in a loop.
+    //
+    // OVERLAP RECOVERY (fire17, voice, 2026-08-20: "אני צריך לראות את זה באפליקציה מיד
+    // איך שאמרתי את זה"): in no-barge mode, speech spoken WHILE the mouth talks is
+    // frame-dropped below — the model never hears it, so it never transcribes and never
+    // reaches the dashboard (it survives only in the archive). Fix: track the dropped
+    // window (it sits at known byte offsets of the CURRENT archive segment — segments
+    // roll exactly at mouth-reply start), and once playback ends, auto-resend that slice
+    // through the proven resendAudio path with auto-reply SUPPRESSED — the server
+    // transcribes it (words land on the dashboard seconds later, and in the model's
+    // context so the mouth's next answer knows them) but the response.created cancel
+    // (suppressAuto) guarantees the mouth never answers the recovered turn on its own.
+    // Live frames re-entering the model was the historical echo bug (see playingUntil
+    // note) — this path never re-opens it: no audio flows during playback, and the
+    // recovered turn cannot auto-fire a reply.
+    // ponytail: single-shot at playback end; if a mouth reply runs very long, his words
+    // surface only after it ends — chunked mid-playback recovery is the revisit.
+    let ovStart = -1; let ovEnd = 0; let ovPath = "";
+    let recovering = false;
+    let savedSuppress = false; let suppressRestoreAt = 0;
+    async function recoverOverlap(path: string, start: number, end: number) {
+      try {
+        const len = end - start;
+        if (len < RATE * 2 * 0.4) return;                     // <400ms can't be real speech (same bar as the hangup guard)
+        for (let i = 0; i < 60; i++) {                        // wait for a quiet, response-free moment (max ~30s)
+          if (!userSpeaking && !stillAudible() && !responseActive && !awaitingResponse && !mindBusy) break;
+          await Bun.sleep(500);
+        }
+        if (closed || ws.readyState !== WebSocket.OPEN) return;
+        const fd = fs.openSync(path, "r");
+        const buf = Buffer.alloc(len);
+        const got = fs.readSync(fd, buf, 0, len, 44 + start); // 44 = WAV header; offsets are archive data bytes
+        fs.closeSync(fd);
+        if (got < RATE * 2 * 0.4) return;
+        const tmp = `${archDir}/overlap-${Date.now()}.wav`;
+        fs.writeFileSync(tmp, Buffer.concat([archHeader(got), buf.subarray(0, got)]));
+        savedSuppress = suppressAuto; suppressRestoreAt = Date.now() + 20000;
+        suppressAuto = true;                                  // transcribe only — never auto-answer the recovered turn
+        say("info", `recovering speech spoken during mouth reply (${(got / 2 / RATE).toFixed(1)}s)`);
+        await resendAudio(tmp);
+        try { fs.unlinkSync(tmp); } catch {}
+        await Bun.sleep(15000);                               // failsafe: transcription event normally restores much sooner
+        if (suppressRestoreAt && Date.now() >= suppressRestoreAt - 5000) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
+      } catch { /* recovery must never break the call */ }
+      finally { recovering = false; }
+    }
     async function pumpMic(proc: ReturnType<typeof Bun.spawn>) {
       const reader = proc.stdout.getReader();
       try {
@@ -435,7 +480,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (rdone) break;
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
           if (micMuted) continue;                              // muted: drop mic frames so the model never hears them
-          if (stillAudible() && !o.barge) continue;
+          if (stillAudible() && !o.barge) {
+            if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
+              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; }
+              if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
+            }
+            continue;
+          }
+          if (ovStart >= 0 && !recovering) {                   // playback just ended → recover the dropped window
+            recovering = true;
+            recoverOverlap(ovPath, ovStart, ovEnd);            // async; never blocks the mic pump
+            ovStart = -1; ovEnd = 0; ovPath = "";
+          }
           if (ws.readyState !== WebSocket.OPEN) break;
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
           ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: Buffer.from(value).toString("base64") }));
@@ -598,11 +654,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
         injectQueue.push(text);
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
+        // QUEUE MERGE LAW (fire17, voice, 2026-08-20: "כמה הודעות במקביל נכנסות למחסנית
+        // במקום להתעדכן... זה צריך להיות הודעה אחת"): the queue must never grow past one —
+        // this echo (once per growth) tells the watching MIND to {"drop_queue"} + weave
+        // everything held into ONE fresh line.
+        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         return;
       }
       if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
       if (!responseActive && !awaitingResponse && !mindBusy) { sendInjected(text); return; }
       injectQueue.push(text);
+      if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
@@ -659,6 +721,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         say("info", micMuted ? "mic muted" : "mic unmuted");
                       }
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
+                      suppressRestoreAt = 0;                          // MIND's explicit choice outranks a pending overlap-recovery restore
                       suppressAuto = !j.autospeak;
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
                     } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
@@ -788,6 +851,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
           break;
         case "conversation.item.input_audio_transcription.completed":
+          // Overlap recovery done: the recovered turn transcribed — reopen the mouth to
+          // whatever it was before (MIND's explicit {"autospeak"} always wins, see below).
+          if (suppressRestoreAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
           // Stale-queue law: a completed user turn makes every held MIND line stale —
           // it must be re-woven against these new words, never auto-fired (echo once).
@@ -817,6 +883,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "conversation.item.input_audio_transcription.failed":
+          if (suppressRestoreAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; }
           // Don't strand a held reply for 4s when the transcript simply failed.
           flushReply();
           break;
