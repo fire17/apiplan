@@ -751,7 +751,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // recovered turn cannot auto-fire a reply.
     // ponytail: single-shot at playback end; if a mouth reply runs very long, his words
     // surface only after it ends — chunked mid-playback recovery is the revisit.
-    let ovStart = -1; let ovEnd = 0; let ovPath = ""; let ovAt = 0;
+    let ovStart = -1; let ovEnd = 0; let ovPath = ""; let ovAt = 0; let ovSrc = "";
     let recovering = false;
     // USER BARGES MIND (fire17's law: his voice outranks everything, including the MIND's
     // own audio). While the MIND narrator plays, mic frames are gated (echo-safe) but still
@@ -853,6 +853,85 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // transient rule in recoverOverlap. Number.isFinite: a typo'd env falls back to the default
     // rather than silently disabling the guard; only an explicit 0 turns it off.
     const RECOVER_TAIL_MS = (() => { const v = envBar("APIPLAN_RECOVER_TAIL_MS", 400); return Number.isFinite(v) ? v : 400; })();
+    // ── HALF-DUPLEX DUCK (LIVEMIND_HALF_DUPLEX, default on for the MIND window) ──
+    // The MIND's design addendum, 2026-08-20: duck the MIC CAPTURE while our own audio plays
+    // and restore ~300ms after it stops, so the speaker-leak echo class dies BY CONSTRUCTION
+    // instead of being recognised after the fact. What 099e723 ALREADY does, checked in code
+    // before building anything: live mic frames never reach the session while the MIND narrator
+    // plays (`mindPlayer && mindLine` -> continue, in every mode, barge included) and never
+    // while the mouth plays unless duplex barge is on (`stillAudible() && !bargeOn` -> continue).
+    // The append path was therefore already half-duplex, and the mouth window needs no second
+    // gate. TWO holes remained, both measured on his own calls:
+    //   1. NO TAIL ON THE MIND WINDOW. playingUntil for a MIND line is set to start+ms, but
+    //      ffplay is audible ~250ms LATER than that clock (APIPLAN_MIND_START_MS exists to
+    //      compensate exactly that bias), so stillAudible()'s +250ms of slack is already spent
+    //      when the audio really ends — and the capture pipeline hands us those frames later
+    //      still. Call 96316 @20:00:51.262: a live you-turn that is the verbatim TAIL of the
+    //      MIND line spoken seconds earlier, echo_sim 1.00, echo_recovered=false.
+    //   2. THE RESEND DOOR. Frames refused at the append gate are still ARCHIVED, and overlap
+    //      recovery resends that archive into the model when playback ends — the one door a
+    //      half-duplex gate must close too (see the recovery trigger in pumpMic).
+    // THE TRADE, stated honestly: with the duck on, speech spoken UNDER our own audio does not
+    // reach the model at all — that is what half-duplex MEANS. It is not lost: every frame is
+    // still archived to WAV (the never-lose law is untouched) and no transcript is ever deleted
+    // by this. A real interjection is still caught LIVE by the local loudness detectors — WHEN
+    // ARMED: APIPLAN_MIND_BARGE_PEAK kills the narrator mid-word and reopens the mic,
+    // APIPLAN_MOUTH_BARGE_PEAK cancels+truncates the mouth's reply; either set to 0 disables
+    // that belt by design, and a fully-disarmed rig has no live path during its window. Full-duplex
+    // interjection is the BARGE feature's job and is explicitly out of scope while barge is off.
+    // MUTUALLY EXCLUSIVE WITH DUPLEX BARGE by definition: when bargeOn, mic frames flow during
+    // playback BY DESIGN, so the duck yields entirely and 099e723's own duplex guards (the
+    // bargeEvidenceAt self-cut gate) stay in force unchanged.
+    // Modes: "mind" (default) = tail on both windows + a MIND window is never resent; "all" also
+    // stops resending a MOUTH window (his in-reply words then rest on the mouth barge alone);
+    // "0"/"off" restores 099e723 exactly — one extra comparison per mic frame and nothing else.
+    const HD_MODE = (() => {
+      const v = String(process.env.LIVEMIND_HALF_DUPLEX ?? "").trim().toLowerCase();
+      if (v === "0" || v === "off" || v === "false" || v === "no") return "off";
+      if (v === "all" || v === "1" || v === "on" || v === "true" || v === "yes") return "all";
+      return "mind";
+    })();
+    const HD_ON = HD_MODE !== "off";
+    // Restore delay after the last of our own audio. Finite and clamped by construction: a
+    // typo'd env must never latch the mic shut, and a NaN here would make every comparison
+    // false — the historical echo loop, reopened by one bad env var.
+    const HD_TAIL = (() => { const v = envBar("LIVEMIND_HALF_DUPLEX_TAIL_MS", 300); return Number.isFinite(v) && v >= 0 ? Math.min(v, 5000) : 300; })();
+    let duckMindUntil = 0; // MIND tail: re-armed by every frame seen while the narrator plays
+    let duckMs = 0;        // continuous ms swallowed by the window now open
+    let duckSrc = "";      // which of our two voices opened it
+    /** Mic is ducked: our own audio is on the air, or stopped less than HD_TAIL ms ago.
+     *  TWO CLOCKS, because the two voices know their end differently — and NEITHER may outlive
+     *  the audio it ducks for. The MOUTH rides `playingUntil` itself rather than a clock of its
+     *  own: every place the engine zeroes it (a barge, a dead player, silenceMouth, a failed
+     *  write) means the audio is GONE, and the mic must reopen in that same instant exactly as
+     *  it does at 099e723 — his words right after a cut are the entire point of a barge, and a
+     *  duck that kept holding there would eat them. The MIND cannot use that clock: playingUntil
+     *  for a narrator line is start+ms while ffplay is audible ~250ms LATER (the spin-up bias
+     *  APIPLAN_MIND_START_MS exists for), which is the hole being closed — so its tail is
+     *  re-armed by frames seen while its player is ALIVE and therefore expires HD_TAIL after the
+     *  real end of the audio, or HD_TAIL after a barge kills the player, never later.
+     *  A non-finite clock makes both comparisons false: the duck fails OPEN, like 099e723,
+     *  rather than latching the mic shut. */
+    const ducked = () => {
+      if (!HD_ON || bargeOn) return false;
+      const now = Date.now();
+      return (playingUntil > 0 && now < playingUntil + HD_TAIL) || now < duckMindUntil;
+    };
+    /** One mic frame observed while our own audio plays: re-arm the MIND tail and count it.
+     *  Called only from the two playing branches, never from the tail — a tail must expire. */
+    const duckFrame = (ms: number, src: string) => {
+      if (!HD_ON || bargeOn) return;
+      if (src === "mind") duckMindUntil = Date.now() + HD_TAIL;
+      if (!duckSrc) duckSrc = src;
+      duckMs += ms;
+    };
+    /** The mic just reopened. Forensics only (never chat): one line per window that swallowed
+     *  a real stretch of audio, so a silent stretch is never diagnosed as a broken mic. */
+    const duckRelease = () => {
+      if (duckMs > 500) say("info", `half-duplex: mic ducked ${Math.round(duckMs)}ms during ${duckSrc} playback (+${HD_TAIL}ms tail)`,
+        { half_duplex_ducked_ms: Math.round(duckMs), duck_src: duckSrc, tail_ms: HD_TAIL });
+      duckMs = 0; duckSrc = "";
+    };
     // ── STUCK-LATCH TIMEOUT (the userSpeaking latch) ─────────────────────────────────
     // `userSpeaking` is raised by the server's input_audio_buffer.speech_started and cleared
     // ONLY by speech_stopped (or, since call 86130, by a mute flip). Whenever the server
@@ -989,7 +1068,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
     say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
-      + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`);
+      + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
+      + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
       let pk = 0;
       for (let i = 0; i + 1 < v.length; i += 32) {           // sparse scan — same cost profile as the archive's
@@ -1100,7 +1180,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // a mute flip already synthesizes the stop (call 86130).
           if (LATCH_MS > 0 && value?.length && !micMuted && (userSpeaking || latchTimedOut)) {
             const nowL = Date.now();
-            if (stillAudible() || mindBusy || mindPlayer) {
+            if (stillAudible() || mindBusy || mindPlayer || ducked()) {
               // UNOBSERVABLE WINDOW. While OUR audio plays, these frames carry speaker leak,
               // so a peak proves nothing about him — freeze the clock rather than time out
               // blind, and never let our own leak drive a re-latch.
@@ -1137,7 +1217,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // A mute flip rolls the archive segment — a pending overlap window into the old
             // segment is no longer a live turn (verified defect: a window resent 4.5 min
             // later as fresh speech). Discard it; the audio itself stays archived.
-            if (ovStart >= 0) { ovStart = -1; ovEnd = 0; ovPath = ""; }
+            if (ovStart >= 0) { ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = ""; }
             // Talking into a stuck/forgotten mute is silent deafness (root cause of the
             // 13:37 "הפה לא עונה לי" — mic muted, never unmuted, zero feedback). Say so.
             if (value?.length) {
@@ -1153,8 +1233,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // the MOUTH's playback — the narrator's audio must not reach the model even with
           // headphones-mode on; verified gap). Detect the human barging locally.
           if (mindPlayer && mindLine) {
+            // HALF-DUPLEX: these frames are our own narrator coming back through the mic. They
+            // are already refused below (`continue`); holding the duck open here is what makes
+            // the mic stay shut for HD_TAIL ms AFTER the player exits — the ffplay spin-up bias
+            // means the audio is still in the air when playingUntil has already expired.
+            duckFrame(value?.length ? (value.length / 2 / RATE) * 1000 : 0, "mind");
             if (value?.length && archFd >= 0) {
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
+              ovSrc = "mind";   // OUTSIDE the open-guard: MIND is the stricter label and always wins —
+                                // a window opened under the mouth that then carries narrator leak must
+                                // never be resent under a "mouth" label (verify catch, 2026-08-20)
               if (ovPath === archPath) ovEnd = archBytes;
             }
             saveMindState("speaking", false);   // LANE 15: <=1/s progress — a SIGKILL still leaves the spoken prefix on disk
@@ -1177,7 +1265,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
                 saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
-                ovStart = -1; ovEnd = 0; ovPath = "";          // his live speech supersedes overlap recovery here
+                ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";   // his live speech supersedes overlap recovery here
               }
             }
             continue;
@@ -1211,8 +1299,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
           }
           if (stillAudible() && !bargeOn) {
+            // HALF-DUPLEX: the mouth's own audio, already refused by this branch at 099e723 —
+            // the duck adds only the tail (its own +250ms of slack is measured against the
+            // player's clock, not the speaker's). No second gate: never double-gate a path the
+            // engine already closes. The mouth's tail rides playingUntil itself, so it costs
+            // HD_TAIL minus the 250ms stillAudible() already holds — 50ms at the defaults — and
+            // it disappears the instant a barge zeroes that clock. This call only labels and
+            // counts the window for the forensic line.
+            duckFrame(value?.length ? (value.length / 2 / RATE) * 1000 : 0, "mouth");
             if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
-              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
+              if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); ovSrc = "mouth"; }
               if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
             }
             bargeMs = 0;
@@ -1370,13 +1466,42 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             continue;
           }
           bargeMs = 0;
+          // HALF-DUPLEX TAIL. Our own audio stopped less than HD_TAIL ms ago, so these frames
+          // still carry it — the speaker's own latency plus the capture pipeline's. Nothing is
+          // appended, and the overlap window stays open because this tail belongs to OUR
+          // playback, not to his turn. Self-limiting: ducked() reads a clock only the two
+          // playing branches above extend, so a tail can never hold itself open.
+          if (ducked()) { duckMs += value?.length ? (value.length / 2 / RATE) * 1000 : 0; continue; }
+          duckRelease();                                       // mic open again — report a window that swallowed real audio
           if (ovStart >= 0 && !recovering) {                   // playback just ended → recover the dropped window
-            // Max age: a stale window is not a live turn (mute gaps, long stalls).
-            if (Date.now() - ovAt < 30000) {
+            // HALF-DUPLEX, THE SECOND DOOR — the one calls 58020 and 96316 actually leaked
+            // through. The frames we refused to append are still archived, and this is where
+            // they were resent INTO the model. For a MIND window that resend IS the echo:
+            // 96316 fired recovery 7/7 on pure leak (8.4s, 4.2s, 5.3s, 5.3s, 4.8s …) and
+            // 58020 @18:38 resent 21.8s of one MIND line, which came back as five fake "you"
+            // turns — one of them only FLAGGED by the belts, so it entered the model's context
+            // as his words. His own voice needs nothing from recovery here: the MIND barge
+            // listens at a LOWER bar than recovery does (BARGE_PEAK 1800/250ms vs RECOVER_PEAK
+            // 2000/200ms), so it catches nearly everything recovery could — the exceptions this
+            // knowingly drops are an utterance under ~250ms of sustain and anything inside the
+            // barge's 1s refractory; with APIPLAN_MIND_BARGE_PEAK=0 there is no live belt at all
+            // and the window is fully deaf. The MOUTH window keeps recovery by default as a
+            // PRECAUTION, not on measured benefit — in the 58020/31192/96316 corpus recovery
+            // never once returned genuine speech (22/22 resend-sourced turns were echo). It is
+            // kept because the mouth barge sits at a HIGHER bar than recovery and self-disarms,
+            // so removing both belts at once is not something to do blind; LIVEMIND_HALF_DUPLEX=all
+            // closes that door too (unless the mouth barge has self-disarmed — then recovery is
+            // the only belt left and stays open), and the 099e723 TEETH stay armed either way.
+            const hdBlock = HD_ON && !bargeOn && (ovSrc === "mind" || (HD_MODE === "all" && mouthBargeArmed));
+            const hdSecs = (ovEnd - ovStart) / 2 / RATE;
+            if (hdBlock) {
+              if (hdSecs >= 0.4) say("info", `half-duplex: ${ovSrc || "playback"} overlap window NOT resent (${hdSecs.toFixed(1)}s — archived only, never fed back to the model)`,
+                { half_duplex_no_resend: true, src: ovSrc || "playback", window_s: Number(hdSecs.toFixed(2)) });
+            } else if (Date.now() - ovAt < 30000) {            // a stale window is not a live turn (mute gaps, long stalls)
               recovering = true;
               recoverOverlap(ovPath, ovStart, ovEnd);          // async; never blocks the mic pump
             }
-            ovStart = -1; ovEnd = 0; ovPath = "";
+            ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";
           }
           if (ws.readyState !== WebSocket.OPEN) break;
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
