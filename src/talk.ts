@@ -179,6 +179,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
   let mindBusy = false;                       // a MIND narrator line is generating or playing (serializes the queue)
   let mindPlayer: any = null;                 // the MIND voice's own ffplay child (killed on barge/exit)
+  // USER-BARGES-MIND bookkeeping (fire17's law, voice, 2026-08-20: "אם אני אומר הודעה,
+  // אתה חייב לתת לפה להתפרץ ולעצור את מה שהמיינד מדבר... המוח חייב לקטוע את עצמו ולהבין
+  // איפה הוא נקטע"): the line now playing, so an interrupt can estimate how much was
+  // actually heard (cut) and re-queue the unspoken remainder for re-weave.
+  let mindLine: { text: string; ms: number; startAt: number; cut: number } | null = null;
+  let pendingMouthReply = false;              // a VAD auto-reply cancelled only because MIND audio was playing — release it after
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
   // response.create we send, cleared on response.created / response.done / cancel. Without it,
@@ -445,6 +451,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // surface only after it ends — chunked mid-playback recovery is the revisit.
     let ovStart = -1; let ovEnd = 0; let ovPath = "";
     let recovering = false;
+    // USER BARGES MIND (fire17's law: his voice outranks everything, including the MIND's
+    // own audio). While the MIND narrator plays, mic frames are gated (echo-safe) but still
+    // observed LOCALLY: sustained loud audio well above speaker-leak level means the human
+    // is talking over the MIND → kill the MIND's player mid-word, unblock the mic so his
+    // words reach transcription, and re-queue the unspoken remainder as STALE for re-weave.
+    // Echo-safety (the absolute invariant): nothing is ever SENT to the model while gated —
+    // detection is local peak-scanning only, and the leak source (mindPlayer) is dead
+    // before frames flow, so the model can never transcribe MIND/mouth speaker audio.
+    // Worst mis-tune (leak peaks above threshold, e.g. very loud speakers): the MIND cuts
+    // itself spuriously — degraded, but no loop and nothing speaks on its own. Tune with
+    // APIPLAN_MIND_BARGE_PEAK (0 disables) / APIPLAN_MIND_BARGE_MS.
+    const BARGE_PEAK = Number(process.env.APIPLAN_MIND_BARGE_PEAK ?? 6500);
+    const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 300;
+    let bargeMs = 0;
+    let mutedSpeechMs = 0; let mutedWarnAt = 0;
+    const framePeak = (v: Uint8Array) => {
+      let pk = 0;
+      for (let i = 0; i + 1 < v.length; i += 32) {           // sparse scan — same cost profile as the archive's
+        const s = Math.abs((v[i] | (v[i + 1] << 8)) << 16 >> 16);
+        if (s > pk) pk = s;
+      }
+      return pk;
+    };
     let savedSuppress = false; let suppressRestoreAt = 0;
     async function recoverOverlap(path: string, start: number, end: number) {
       try {
@@ -479,14 +508,45 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           const { done: rdone, value } = await reader.read();
           if (rdone) break;
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
-          if (micMuted) continue;                              // muted: drop mic frames so the model never hears them
+          if (micMuted) {                                      // muted: drop mic frames so the model never hears them
+            // Talking into a stuck/forgotten mute is silent deafness (root cause of the
+            // 13:37 "הפה לא עונה לי" — mic muted, never unmuted, zero feedback). Say so.
+            if (value?.length) {
+              if (framePeak(value) >= 4000) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
+              if (mutedSpeechMs > 1000 && Date.now() - mutedWarnAt > 10000) {
+                mutedWarnAt = Date.now(); mutedSpeechMs = 0;
+                say("info", "speaking while muted — the mouth cannot hear you");
+              }
+            }
+            continue;
+          }
           if (stillAudible() && !o.barge) {
             if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; }
               if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
             }
+            // User-barges-MIND: local detection only (nothing sent), MIND playback only —
+            // during MOUTH playback a kill would be a mouth-barge, which no-barge mode
+            // forbids for echo reasons; the overlap recovery above covers those words.
+            if (mindPlayer && mindLine && value?.length && BARGE_PEAK > 0) {
+              if (framePeak(value) >= BARGE_PEAK) bargeMs += (value.length / 2 / RATE) * 1000; else bargeMs = 0;
+              if (bargeMs >= BARGE_SUSTAIN) {
+                bargeMs = 0;
+                const L = mindLine;
+                L.cut = Math.min(L.text.length, Math.round(((Date.now() - L.startAt) / L.ms) * L.text.length));
+                try { mindPlayer.kill("SIGKILL"); } catch {}   // exited handler records the spoken prefix only
+                playingUntil = 0;                              // unblock the mic NOW — his words flow to transcription
+                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
+                const rest = L.text.slice(L.cut).trim();
+                if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
+                ovStart = -1; ovEnd = 0; ovPath = "";          // his live speech supersedes overlap recovery here
+              }
+              continue;
+            }
+            bargeMs = 0;
             continue;
           }
+          bargeMs = 0;
           if (ovStart >= 0 && !recovering) {                   // playback just ended → recover the dropped window
             recovering = true;
             recoverOverlap(ovPath, ovStart, ovEnd);            // async; never blocks the mic pump
@@ -587,14 +647,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", f],
           { stdout: "ignore", stderr: "ignore" });
+        mindLine = { text, ms, startAt: Date.now(), cut: -1 };
         say("model", text);   // the exact words now audible — the monitor/GUI see the true line
         mindPlayer.exited.then(() => {
+          // If the user barged (pumpMic set cut), only the SPOKEN PREFIX goes into the
+          // mouth's history — recording words that were never heard corrupts its context.
+          const cut = mindLine?.cut ?? -1;
+          const spoken = cut >= 0 ? text.slice(0, cut) : text;
+          mindLine = null;
           mindPlayer = null; mindBusy = false;
           try { unlinkSync(f); } catch {}
           // Record the line in the mouth's conversation so it KNOWS it was said (one
           // answer, no repeats) — safe now, because the mouth never renders this item.
-          try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
-            type: "message", role: "assistant", content: [{ type: "output_text", text }] } })); } catch {}
+          if (spoken.trim()) {
+            try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+              type: "message", role: "assistant", content: [{ type: "output_text", text: spoken }] } })); } catch {}
+          }
+          // MOUTH FIRST (fire17, 2026-08-20: "עכשיו נראה שהפה לא עונה לי"): a user turn
+          // whose auto-reply was cancelled only because MIND audio was on the air gets
+          // its reply NOW, before any more MIND lines flow.
+          if (pendingMouthReply && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+            say("info", "mouth reply released (was held behind mind audio)");
+            try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
+          }
+          pendingMouthReply = false;
           flushInjectQueue();
         });
       }).catch(() => {
@@ -806,6 +882,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
+              // Starvation fix (fire17, 2026-08-20): a REAL user turn whose auto-reply was
+              // cancelled only because MIND audio was playing still deserves its answer —
+              // mark it and release it the moment the MIND's audio ends (mouth first).
+              if (mindBusy && !suppressAuto && !noiseBlip) {
+                pendingMouthReply = true;
+                say("info", "mouth reply held behind mind audio — will release");
+              }
               break;
             }
           }
@@ -820,6 +903,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
+          pendingMouthReply = false;   // a NEW turn supersedes a held reply — its own VAD auto-reply covers him
           // Barge-in done RIGHT (R7): cancel generation, tell the server how much was
           // actually heard, and drop the cancelled response's still-in-flight deltas —
           // otherwise the model's context keeps words the user never heard, and ghost
