@@ -606,9 +606,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         say("info", "persona updated live");
                       }
                     } else if (typeof j.mute === "boolean") {   // mic mute toggle — stop/resume sending mic audio to the model
-                      micMuted = j.mute;
-                      archRoll(micMuted ? "mute flip" : "unmute flip");
-                      say("info", micMuted ? "mic muted" : "mic unmuted");
+                      // lm-ptt re-asserts the same state every 5s (heartbeat) — roll and echo
+                      // only on a real CHANGE, or the archive fragments into 5s slivers.
+                      if (micMuted !== j.mute) {
+                        micMuted = j.mute;
+                        archRoll(micMuted ? "mute flip" : "unmute flip");
+                        say("info", micMuted ? "mic muted" : "mic unmuted");
+                      }
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
                       suppressAuto = !j.autospeak;
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
