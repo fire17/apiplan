@@ -106,7 +106,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // `extra` rides into the LOG event only, never into the emitted text — that is how a turn is
   // ANNOTATED without one of his words being changed, held, or dropped. SPREAD FIRST: the
   // canonical fields win, so an annotation is structurally incapable of altering what he said.
-  const say = (kind: "you" | "model" | "info", text: string, extra?: Record<string, unknown>) => { emit(kind, text); rec({ ...extra, ev: kind, text }); };
+  // ROTATION CONTEXT CARRY (canon 024, requirement (b)): the tail of the conversation, in
+  // memory, so a successor session can be SEEDED with what was actually said and the handover
+  // stays invisible — no greeting reset, no lost thread. Bounded; never audio, never the token.
+  const convTail: string[] = [];
+  const say = (kind: "you" | "model" | "info", text: string, extra?: Record<string, unknown>) => {
+    emit(kind, text); rec({ ...extra, ev: kind, text });
+    if (kind !== "info" && text.trim()) { convTail.push(`${kind === "you" ? "He" : "You"}: ${text.trim()}`); if (convTail.length > 20) convTail.shift(); }
+  };
 
   // Inbound control channel — where injected context (monitor reports, mid-call context)
   // is read from. Exported in the env so an in-process tool (set_monitor) knows where a
@@ -114,7 +121,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const injectPath = o.injectFile || process.env.APIPLAN_TALK_INJECT || (logPath ? logPath + ".inject" : "");
   if (injectPath) process.env.APIPLAN_TALK_INJECT = injectPath;
 
-  const ws = o.socket ?? openRealtime(c.token, model);
+  // `let`, not `const`: at a rotation the microphone, every response.create, the heartbeat, the
+  // inject flush and the tool replies must ALL follow the new socket in one assignment. Every
+  // `ws.` site in this file is therefore "the socket that is live right now" — see the ROTATION
+  // block below close(), and the one rule that keeps it honest: inside a handler `sock` is who
+  // spoke and `ws` is who may be spoken to; they are never conflated.
+  let ws = o.socket ?? openRealtime(c.token, model);
   rec({ ev: "info", text: `talk start model=${model} voice=${o.voice || "cedar"}${o.socket ? " (parked socket)" : ""}${o.tools?.length ? ` tools=${o.tools.length}` : ""}` });
   // Which voice-field mode actually engaged (stereo / mono-sum / off) — a silently collapsed
   // field sounds exactly like a working one, so it is stated in the log at every call start.
@@ -201,6 +213,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       ...(process.env.APIPLAN_VAD_CREATE_RESPONSE === "0" ? { create_response: false } : {}),
     },
   };
+
+  /** The session config in ONE place. The LIVE variant and the PARKED variant differ only by
+   *  SUBTRACTION, so they can never drift apart — and the two drifts that matter are both fatal
+   *  in silence: a parked session that kept `idle_timeout_ms` would SELF-PROMPT into a live
+   *  conversation after a stretch of being parked (the warm daemon's own config hardcodes it),
+   *  and one that lost `transcription` would sound perfect while writing an EMPTY record. */
+  const sessionBody = (input: Record<string, unknown>, instructions?: string) => ({
+    type: "realtime",
+    output_modalities: ["audio"],
+    ...(instructions ? { instructions } : {}),
+    ...(o.tools?.length ? { tools: o.tools, tool_choice: "auto" } : {}),
+    audio: { input, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } },
+  });
+  /** PARKED input. It still TRANSCRIBES (so the successor is not born mute-of-record the moment
+   *  it takes over) but it may never answer and may never self-prompt. It is also never appended
+   *  to — that is the structural half of the one-ACTIVE invariant; this is the belt. */
+  const parkedInput = (() => {
+    const td: Record<string, unknown> = { ...(audioInput.turn_detection as Record<string, unknown>), create_response: false };
+    delete td.idle_timeout_ms;
+    return { ...audioInput, turn_detection: td };
+  })();
 
   // Whisper finishes transcribing your turn AFTER the model has already answered, so
   // printing each line as it arrives shows the reply above the question. Hold the reply
@@ -676,11 +709,116 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let closed = false;
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
+
+  // ─── CALL ROTATION: THE 60-MINUTE CAP IS A SCHEDULE, NOT A SURPRISE ──────────────
+  // MEASURED on this rig, five capped calls: the server closes the session exactly
+  // session_start + 3600.00s (3600.005 / 3600.013 / 3600.034 / 3600.018 / 3599.996 — spread
+  // 40ms), anchored on the SOCKET, not on process start. Today `apiplan talk` simply DIES there
+  // (error -> ws.onclose -> done -> close -> the process exits) and a human or the MIND notices
+  // and relaunches by hand. The measured holes between consecutive calls: 27.0s and 45.0s of
+  // real deafness (Eva's 23s/41s are the LAUNCH gap; the socket needs another ~4.2s before the
+  // microphone even exists), and once 21m38s when nobody noticed. NOTHING is captured in that
+  // window — micLoop() is started from onOpen, so with no socket there is no mic child, no
+  // archive and no transcript: those seconds do not exist anywhere. That is the SACRED
+  // violation this block removes, and it is unbounded, which is the real severity.
+  //
+  // HIS DESIGN (canon 024, voice: "שהיוזר אפילו לא ישים לב שמשהו השתנה ברקע... אסור ששום דבר
+  // ייפול בין המקטעים האלה", and the addendum "אולי אפילו לקרוא ל[חדשה] ולראות שזה רץ בשקט רגע
+  // לפני שמחליפים את הערוץ"): overlap-then-cut, never cut-then-start. Before the cap, open the
+  // NEXT session PARKED (deaf + silent), watch it run quietly, seed it with the conversation so
+  // far, and hand the microphone over in ONE synchronous assignment at a quiet moment.
+  //
+  // WHY IN-PROCESS AND NOT A SECOND `apiplan talk`. Every control-plane consumer resolves a call
+  // by its --log path from `ps` (lm-calls, lm-remind's active_call, the hub registry, lm-ptt).
+  // Rotating in place keeps the pid, the LOG, the .inject path, the archive dir, the mic child,
+  // the player and the mind-state file CONSTANT, so the rotation is invisible above this file:
+  // a reminder written 1ms before the swap and one written 1ms after land in the same queue and
+  // both get spoken. Two processes would move the call's identity at exactly the instant his
+  // words are most at risk, orphan any in-flight inject line, and leave lm-ptt's mic gate armed
+  // on the wrong call. This is also NOT a restart in canon 007's sense — nothing is killed and
+  // nothing is relaunched; the call continues and only its transport is renewed.
+  //
+  // THE ONE-ACTIVE INVARIANT, structurally: mic frames are appended at exactly ONE send site
+  // (in pumpMic) and it targets `ws`; every response.create in this file targets `ws`. So a
+  // socket that is not `ws` is mechanically DEAF — no audio in, therefore no transcript out,
+  // therefore it can never produce a duplicate turn — and mechanically MUTE. Parking adds
+  // create_response:false and the removal of idle_timeout_ms on top of that.
+  //
+  // ROLLBACK LADDER — degraded is exactly TODAY, never worse. R1 successor won't connect ->
+  // backoff and retry, the live call is never disturbed. R2 the cap fires with no successor ->
+  // reconnect IN PLACE (the mic never stopped, the gap is archived and re-fed). R3 the successor
+  // dies right after the swap -> the predecessor socket is deliberately HELD OPEN past its drain
+  // for the whole revert window (ROT_REVERT_MS), so taking the floor back is a real option and
+  // not just a comment. R3b opening the
+  // successor KILLS the live session -> promote it, write the verdict to disk and never attempt
+  // the overlap again on this machine. R4 everything fails -> the call ends exactly where it
+  // ends today and the launcher takes over.
+  //
+  // ARMING — OPT-IN, and it stays opt-in until a live rotation has actually been watched.
+  // LIVEMIND_ROTATE=1 (or on/true/yes) arms the engine. With the variable ABSENT — which is every
+  // launcher on this machine today, `~/Creations/LiveMind/livemind` included — or set to 0,
+  // nothing below runs: no successor socket is ever opened, no rotation timer is ever started,
+  // no rotation line is ever emitted, and the next restart behaves byte for byte like ec768e4.
+  // An overlap that has never once been proven on a real call must not arm itself on his.
+  const ROT_ON = /^(1|on|true|yes)$/i.test(process.env.LIVEMIND_ROTATE ?? "");
+  // The cap, in minutes. LIVEMIND_ROTATE_MIN=2 proves a whole rotation on a throwaway 3-minute
+  // call instead of burning an hour of his; every marker below scales with it.
+  const ROT_CAP_MS = Math.max(30000, (Number(process.env.LIVEMIND_ROTATE_MIN) || 60) * 60000);
+  // Pre-open lead: 180s at the real cap — the same lead the warm daemon already chose. It is a
+  // straight tax on the SUCCESSOR's own hour (its cap starts when ITS socket opens), which is
+  // why it is bounded rather than generous. Steady-state period becomes ~58 min.
+  const ROT_LEAD_MS = Math.min(Number(process.env.LIVEMIND_ROTATE_LEAD_MS) || 180000, Math.max(3000, Math.round(ROT_CAP_MS * 0.05)));
+  // HARD FLOOR — swap by here whether or not a quiet moment ever came. 58:00 of a 60:00 cap is
+  // 120s of margin under the earliest cap ever measured, and that margin is also what the
+  // swap-back rollback needs: a still-live predecessor to fall back into.
+  const ROT_FLOOR_MS = Math.round(ROT_CAP_MS * (58 / 60));
+  // Only if he is literally mid-utterance AT the floor: a little grace beats a split turn.
+  const ROT_GRACE_MS = Math.round(ROT_CAP_MS * (0.5 / 60));
+  // How far under a server-stated expires_at we insist on being.
+  const ROT_EXP_MARGIN_MS = Math.min(60000, Math.round(ROT_CAP_MS / 60));
+  const ROT_VERIFY_MS = 2000;    // "see it run quietly for a moment" before the channel moves
+  const ROT_ACK_MS = 3000;       // wait for the un-park to be acknowledged before swapping
+  const ROT_CONNECT_MS = 12000;  // a successor that has not configured itself by here is dropped
+  const ROT_DRAIN_MS = 5000;     // how long the predecessor may finish speaking / reporting
+  // R3 SWAP-BACK WINDOW — and, because it is longer than the drain, how long the predecessor
+  // SOCKET is kept open (silent) after its drain ends. The two used to disagree: the revert was
+  // gated on 10s while the socket was closed at 5s, so a successor dying in between fell through
+  // to a reconnect while the log claimed a zero-gap fallback existed. The window is now real.
+  const ROT_REVERT_MS = 10000;
+  const ROT_QUIET_MS = 2500;     // the same sustained-silence bar the MIND's own stack gate uses
+  let rotState: "off" | "armed" | "opening" | "parked" | "seeded" | "unparking" | "done" = ROT_ON ? "off" : "done";
+  let rotGap = false;            // there is NO live session right now (cap fired without a swap)
+  let succ: WebSocket | null = null;    // the PARKED successor — deaf and silent until the swap
+  let prevWs: WebSocket | null = null;  // the outgoing socket, draining its last seconds
+  let sessT0 = 0;                // when THIS session's cap clock started (session.created)
+  let sessExpiresAt = 0;         // the server's own deadline in ms, when it states one
+  let rotN = 0;
+  let rotResending = false;      // a resend is streaming — a swap would split it in half
+  let rotTimer: ReturnType<typeof setInterval> | null = null;
+  // R3b self-demotion: if opening a successor ever kills the live session, overlap is disabled
+  // for this call AND for every future call on this machine.
+  const rotConcPath = `${process.env.HOME}/.livemind/rotation-concurrency.json`;
+  let rotConcurrent = true;
+  // Off-mode purity: with rotation unarmed nothing in this block runs — the demotion verdict
+  // is only ever read by rotTick, which never ticks when off (W39 verify LOW).
+  if (ROT_ON) try { if (fs.existsSync(rotConcPath)) rotConcurrent = JSON.parse(fs.readFileSync(rotConcPath, "utf8")).concurrent !== false; } catch {}
+  /** unix SECONDS or ms -> ms. The server states expires_at in seconds; a future shape change to
+   *  ms must not be read as 1970 (the same guard the warm daemon uses). */
+  const expiresMs = (v: unknown) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? (n < 1e12 ? n * 1000 : n) : 0; };
+
   const close = () => {
     if (closed) return; closed = true;
     if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
     try { ws.close(); } catch {}
+    // ROTATION: a parked successor and a draining predecessor are real sockets. A call that ends
+    // mid-rotation must leak neither past process exit (the warm daemon's own orphaned-socket
+    // warning is about exactly this).
+    if (rotTimer) { clearInterval(rotTimer); rotTimer = null; }
+    rotState = "done";
+    try { succ?.close(); } catch {}
+    try { prevWs?.close(); } catch {}
+    succ = null; prevWs = null;
     const m = micProc;
     try { m?.kill(); } catch {}
     if (m) setTimeout(() => { try { m.kill(9); } catch {} }, 500);   // escalate if ffmpeg ignores TERM
@@ -768,17 +906,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           else if (GREET_PRESENCE) openerArmed = true;   // held until his first unflagged turn
         }
       } else {
-        ws.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            type: "realtime",
-            output_modalities: ["audio"],
-            ...(o.direction ? { instructions: o.direction } : {}),
-            ...(o.tools?.length ? { tools: o.tools, tool_choice: "auto" } : {}),
-            audio: { input: audioInput, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } },
-          },
-        }));
+        ws.send(JSON.stringify({ type: "session.update", session: sessionBody(audioInput, o.direction) }));
       }
+      // ROTATION: the cap clock belongs to the SOCKET, not to the process — measured, the server
+      // closes exactly 3600.00s after the connection and session.created lands ~2ms after it. Arm
+      // here so even a parked-socket call rotates, and let session.created refine the anchor with
+      // the server's own numbers.
+      if (!sessT0) sessT0 = Date.now();
+      if (ROT_ON && !rotTimer) rotTimer = setInterval(rotTick, 1000);
       // The mode is ANNOUNCED: under presence/off the mouth is silent at connect by design,
       // and a silence nobody can tell from a dead mouth is how an outage runs undetected.
       // LOUD by policy (W36): presence is the DEFAULT and the launcher does not export
@@ -812,7 +947,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         micProc = Bun.spawn(mic, { stdout: "pipe", stderr: "ignore" });
         const startedAt = Date.now();
         await pumpMic(micProc);
-        if (closed || ws.readyState !== WebSocket.OPEN) return;
+        // ROTATION: a socket that is BETWEEN sessions is not a dead call. Keeping the mic child
+        // alive across a handover is the entire reason the successor has no deaf window — kill it
+        // here and the fix would manufacture the very hole it exists to remove.
+        if (closed || (ws.readyState !== WebSocket.OPEN && !rotHold())) return;
         if (Date.now() - startedAt > 10000) tries = 0;   // ran a while → fresh budget
         if (++tries > 6) { say("info", "microphone gone — ending call"); done({ reason: "mic-lost" }); return; }
         say("info", `microphone restarting (try ${tries})`);
@@ -1632,7 +1770,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
             ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";
           }
-          if (ws.readyState !== WebSocket.OPEN) break;
+          // ROTATION: while a handover or an in-place reconnect is in flight the socket may be
+          // CLOSED for a beat. Do NOT break the pump — every frame above was already archived
+          // (archWrite runs before every drop), and breaking here kills the mic child.
+          if (ws.readyState !== WebSocket.OPEN) { if (rotHold()) continue; break; }
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
           ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: Buffer.from(value).toString("base64") }));
         }
@@ -1644,6 +1785,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // mute BYPASSED (an explicit resend IS intent to be heard), 700ms silence tail so the
     // server VAD closes the turn and the mouth answers as if it was just spoken.
     async function resendAudio(path: string) {
+      // ROTATION: a resend streams over seconds. Swapping in the middle would send its head to one
+      // session and its tail to another — half a recording heard, half lost. The quiet gate reads
+      // this flag, so a rotation simply waits for the resend to finish.
+      rotResending = true;
       try {
         if (!(await Bun.file(path).exists())) { say("info", `audio resend failed: not found ${path}`); return; }
         const p = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
@@ -1668,12 +1813,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         recoveredItemId = null;                                                  // re-arm: the NEXT commit is this resend's item
         say("info", `audio resent (${(sent / (RATE * 2)).toFixed(1)}s): ${basename(path)}`);
       } catch (e) { say("info", `audio resend failed: ${String(e).slice(0, 120)}`); }
+      finally { rotResending = false; }
     }
 
     /** Dispatch ONE declared tool call, reply with its output, and let the model speak
      *  the result. Failures become a sentence the model can just say — a tool error must
      *  never take the call down. */
     const runTool = async (item: any) => {
+      // ROTATION: capture the socket that ASKED. A tool can take seconds, and a rotation in that
+      // window would send the result to a session that has never heard of this call_id — a server
+      // error, and a result the model never sees. The reply belongs to the session that asked.
+      const asked = ws;
       let output: string;
       try {
         const args = item.arguments ? JSON.parse(item.arguments) : {};
@@ -1688,6 +1838,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // the call can SEE what a tool did — e.g. the exact command a set_monitor armed.
       rec({ ev: "info", text: `tool ${item.name} → ${output.slice(0, 200).replace(/\s+/g, " ")}` });
       if (closed || ws.readyState !== WebSocket.OPEN) return;
+      if (asked !== ws) {
+        // The session that asked is gone. Hand the answer to the live one as CONTEXT instead of
+        // as a reply to a call_id it never made — nothing is lost, nothing errors.
+        say("info", `tool ${item.name} result stranded by a rotation — carried into the new session as context`, { rotation: true, tool_stranded: item.name });
+        try {
+          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system",
+            content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: result of ${item.name}: ${output}` }] } }));
+        } catch {}
+        return;
+      }
       ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output } }));
       if (!closing) { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
     };
@@ -1787,12 +1947,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // response.create below carries awaitingResponse). Same predicate as `emptyRoom`
           // itself (`!GREET_LEGACY && speechStartedAt === 0`), so LEGACY is byte-identical: an
           // attended restart has a listener by definition.
+          // ROTATION DRAIN (W37 verify): a predecessor session may still be finishing its sentence
+          // into the SHARED player. Releasing here would start a second voice in it, and clearing
+          // the flag would leave his turn unanswered — the "הוא לא מגיב לי" class this file has
+          // closed twice. So the hold is KEPT, and rotDrainRelease() fires it the instant the
+          // predecessor's last word is out (≤ the drain window, never longer).
+          if (pendingMouthReply && prevRespId) say("info", "mouth reply still held — the previous session is finishing its sentence (rotation drain)", { rotation: true, drain_hold: true });
+          else {
           if (pendingMouthReply && !(!GREET_LEGACY && speechStartedAt === 0)
               && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
             say("info", "mouth reply released (was held behind mind audio)");
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
           }
           pendingMouthReply = false;
+          }
           flushInjectQueue();
         });
       }).catch(() => {
@@ -1830,6 +1998,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // additionally cancels/truncates the response when one is still generating. No agent has to
     // know any of this — the code enforces it on every MIND utterance.
     const silenceMouth = () => {
+      // ROTATION DRAIN (W37 verify). A draining predecessor writes its last deltas into the SAME
+      // player, and it is not `responseActive` — the swap cleared that. Killing only the player
+      // would cut his sentence AND let rotQuiesce respawn one underneath the MIND's voice (it
+      // restarts a dead player on the next delta). The MIND's priority law is absolute, so the
+      // mouth must END here, not race: dropping prevRespId makes every further predecessor delta
+      // fall out of the drain handler, and the player dies once, for good.
+      if (prevRespId) { prevRespId = null; speaking = false; rec({ ev: "info", rotation: true, text: "predecessor drain cut — the MIND is taking the floor", drain_cut: true }); }
       if (responseActive && !mindResponse) bargeNow();       // still generating: cancel + truncate + stop
       else { stopPlayer(); speaking = false; playingUntil = 0; }   // done generating, still AUDIBLE: kill the tail
     };
@@ -1870,7 +2045,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         return;
       }
       if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
-      if (!responseActive && !awaitingResponse && !mindBusy) { sendInjected(text); return; }
+      // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
+      // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
+      // speaking over the tail of the old voice.
+      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text); return; }
       injectQueue.push(text);
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
@@ -1894,7 +2072,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
-      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy) sendInjected(injectQueue.shift()!);
+      // `prevRespId` — the ONE-ACTIVE INVARIANT ACROSS A ROTATION (W37 verify). A predecessor
+      // finishing its sentence is still audible in the shared player, and the swap force-clears
+      // responseActive/awaitingResponse, so without this term a held line would flush into the
+      // successor while the old voice is still speaking: two voices, one player, interleaved PCM.
+      // Held, not dropped — rotDrainRelease() calls this again the moment the drain ends.
+      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) sendInjected(injectQueue.shift()!);
     };
     function startInjectLoop() {
       if (!injectPath) return;
@@ -1972,7 +2155,478 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       setTimeout(tick, 150);
     }
 
-    ws.onmessage = (e: any) => {
+    // ─── ROTATION ENGINE (design, invariants and rollback ladder: see the block above close) ───
+    let succOpenedAt = 0;                    // when the successor socket was created
+    let succQuietAt = 0;                     // when it last acknowledged something we asked for
+    let succUpdN = 0;                        // session.updated events it has acknowledged
+    let succUnparkSeq = -1;                  // succUpdN at the moment the un-park was sent
+    let succUnparkAt = 0;
+    let succT0 = 0;                          // the successor's OWN cap clock (its session.created)
+    let succExpiresAt = 0;
+    let succRetryAt = 0;                     // backoff gate after a failed pre-open
+    let succTries = 0;
+    let rotOpenAt = 0;                       // when a successor was last opened (takeover detector)
+    let prevRespId: string | null = null;    // the ONE response the predecessor may finish speaking
+    let prevUntil = 0;                       // its drain deadline
+    let prevHoldUntil = 0;                   // and how long the socket stays OPEN after it, for R3
+    let prevSpanning = false;                // the swap cut through an OPEN user turn
+    let prevT0 = 0;                          // the predecessor's own cap clock — kept so R3 can go back
+    let prevExpires = 0;
+    let rotSwapAt = 0;                       // when the last swap happened (the R3 window)
+    const prevTail: string[] = [];           // his words that landed on the predecessor AFTER the swap
+
+    /** True while a handover is possible at all — a non-OPEN socket must not kill the mic pump
+     *  while rotation can still produce a live one. Fails safe: close() sets rotState "done". */
+    const rotHold = () => ROT_ON && !closed && rotState !== "done";
+    /** The moment we MUST swap by. A server-stated expires_at may only ever TIGHTEN this: a field
+     *  we have never once observed on this endpoint must not be able to EXTEND our exposure. */
+    const rotFloorAt = () => {
+      const base = sessT0 + ROT_FLOOR_MS;
+      return sessExpiresAt > 0 ? Math.min(base, sessExpiresAt - ROT_EXP_MARGIN_MS) : base;
+    };
+    /** A quiet, relevant moment — his own words for the trigger. Every clause is an existing gate
+     *  of this engine, reused rather than reinvented: nobody is speaking, nothing is generating,
+     *  nothing is audible, nothing is held, and the room has been silent for the same 2.5s the
+     *  MIND's own stack gate demands before it may speak. */
+    const rotQuiet = () =>
+      !userSpeaking && !latchTimedOut && !responseActive && !awaitingResponse && !mindBusy
+      && !mindPlayer && !speaking && !stillAudible() && !recovering && !rotResending && !closing
+      && injectQueue.length === 0 && Date.now() - lastSpeechStopAt >= ROT_QUIET_MS;
+
+    const rotBackoff = () => { succTries++; succRetryAt = Date.now() + Math.min(15000, 2000 * 2 ** Math.min(3, succTries - 1)); };
+    /** R1 — the successor failed. The LIVE call is never touched by this path. */
+    const rotDrop = (why: string) => {
+      const s = succ; succ = null;
+      if (s) { try { s.onmessage = null; s.onclose = null; s.onerror = null; } catch {} try { s.close(); } catch {} }
+      rotBackoff();
+      rotState = "armed";
+      say("info", `rotation: successor dropped (${why}) — retrying in ${Math.round((succRetryAt - Date.now()) / 1000)}s; the live session is untouched`,
+        { rotation: true, rot_drop: why, rot_tries: succTries });
+    };
+
+    /** S1 — PRE-OPEN, parked. The socket is born deaf (nothing ever appends to it) and silent
+     *  (create_response:false, no idle_timeout_ms). If this promotion ever happens before the
+     *  socket opens (the takeover path), its onopen sends the LIVE config instead — `s === succ`
+     *  is exactly the question "is this still the parked one". */
+    const rotOpen = () => {
+      if (succ || closed) return;
+      let s: WebSocket;
+      try { s = openRealtime(openai.creds().token, model); }   // fresh creds: the OAuth token may have been refreshed mid-call
+      catch (e: any) {
+        rotBackoff();
+        say("info", `rotation: cannot open a successor — ${String(e?.message ?? e).slice(0, 160)}`, { rotation: true, rot_open_failed: true });
+        return;
+      }
+      succ = s; succOpenedAt = rotOpenAt = Date.now(); succQuietAt = 0; succUpdN = 0;
+      succUnparkSeq = -1; succUnparkAt = 0; succT0 = 0; succExpiresAt = 0;
+      rotState = "opening";
+      s.onopen = () => { try { s.send(JSON.stringify({ type: "session.update", session: sessionBody(s === succ ? parkedInput : audioInput, o.direction) })); } catch {} };
+      s.onmessage = (e: any) => rotParked(s, e);
+      s.onerror = () => { if (s === succ) rotDrop("connection failed"); };
+      s.onclose = (e: any) => { if (s === succ) rotDrop(`closed (${e?.code ?? "?"})`); };
+      say("info", `rotation: opening the successor session — PARKED (deaf and silent)${rotGap ? " to replace the session that just ended" : ` at ${Math.round((Date.now() - sessT0) / 1000)}s of this session`}`,
+        { rotation: true, rot_n: rotN + 1, rot_gap: rotGap || undefined });
+    };
+
+    /** The parked successor's own, deliberately tiny handler. It is not the conversation
+     *  pipeline: a parked session must volunteer NOTHING, and anything that means it is
+     *  listening or answering is a park that did not take — abort rather than swap into it. */
+    const rotParked = (sock: WebSocket, e: any) => {
+      let ev: any; try { ev = JSON.parse(String(e.data)); } catch { return; }
+      if (closed || sock !== succ) return;
+      rec({ ws: ev.type, rot: "succ" });
+      if (ev.type === "session.created") {
+        succT0 = Date.now(); succExpiresAt = expiresMs(ev.session?.expires_at);
+        say("info", `rotation: successor session ${ev.session?.id ?? "?"} created — expires_at ${ev.session?.expires_at ?? "(not stated)"}`,
+          { rotation: true, rot_expires_at: succExpiresAt || undefined });
+        return;
+      }
+      if (ev.type === "session.updated") {
+        succUpdN++; succQuietAt = Date.now();
+        if (rotState === "opening") { rotState = "parked"; say("info", "rotation: successor configured and parked — watching it run quietly before the channel moves", { rotation: true }); }
+        return;
+      }
+      if (ev.type === "error") { rotDrop(`server error ${ev.error?.code ?? ev.error?.message ?? "?"}`); return; }
+      if (/^(response\.|input_audio_buffer\.|conversation\.item)/.test(String(ev.type))) rotDrop(`parked session was not silent (${ev.type})`);
+    };
+
+    /** S3 — CONTEXT CARRY. The successor inherits the persona AND the tail of the conversation,
+     *  so the handover is invisible: no greeting, no "who are you", no restart of the thread.
+     *  `instructions`, not twenty conversation items — it is the proven live path (the MIND's own
+     *  {"session":...} swap uses exactly this) and it costs one round-trip. Still deaf, still
+     *  silent: nothing here can make a parked session speak. */
+    const rotSeed = () => {
+      const s = succ; if (!s || s.readyState !== WebSocket.OPEN) return;
+      let recap = "";
+      for (let i = convTail.length - 1; i >= 0 && recap.length < 4000; i--) recap = `${convTail[i]}\n${recap}`;
+      recap = recap.trim();
+      const seed = [o.direction, recap ? `RECENT CONVERSATION (you are mid-call with him — continue it seamlessly; never greet, never restart, never mention any technical change):\n${recap}` : ""].filter(Boolean).join("\n\n");
+      try { s.send(JSON.stringify({ type: "session.update", session: { type: "realtime", ...(seed ? { instructions: seed } : {}) } })); } catch { return; }
+      rotState = "seeded";
+      say("info", `rotation: successor seeded with ${convTail.length} turns (${recap.length} chars) of context — still deaf, still silent`,
+        { rotation: true, rot_seed_turns: convTail.length, rot_seed_chars: recap.length });
+    };
+
+    /** S4b — UN-PARK, while the successor still has ZERO audio. The live input config lands
+     *  first and its VAD cannot fire on an empty buffer, so the instant the microphone moves it
+     *  is already able to answer. Un-parking AFTER the swap leaves a window where his finished
+     *  turn draws no reply. Partial update: the seeded instructions stay. */
+    const rotUnpark = () => {
+      const s = succ; if (!s || s.readyState !== WebSocket.OPEN) return;
+      try {
+        s.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
+          audio: { input: audioInput, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
+      } catch { return; }
+      succUnparkSeq = succUpdN; succUnparkAt = Date.now();
+      rotState = "unparking";
+    };
+
+    /** THE PREDECESSOR, DRAINING. It stays OPEN for a few seconds after the swap and is allowed
+     *  exactly two things: to finish the one response that was already in flight (so a sentence
+     *  in progress is not cut in half at his ear), and to deliver the transcript of a turn it had
+     *  already committed (so HIS LAST WORDS before the swap still land in the record). Everything
+     *  else is recorded raw and dropped. It is never appended to and never asked to speak, so the
+     *  one-ACTIVE invariant holds through the whole drain. */
+    const rotQuiesce = (sock: WebSocket, e: any) => {
+      let ev: any; try { ev = JSON.parse(String(e.data)); } catch { return; }
+      if (closed || sock === ws) return;
+      if (ev.type !== "response.output_audio.delta" && ev.type !== "response.audio.delta") rec({ ws: ev.type, rot: "prev" });
+      switch (ev.type) {
+        case "response.output_audio.delta":
+        case "response.audio.delta": {
+          if (!ev.delta || !prevRespId || (ev.response_id && ev.response_id !== prevRespId)) return;
+          if (!player || player.exitCode !== null) startPlayer();
+          const buf = Buffer.from(ev.delta, "base64");
+          queueAudio(buf.length);
+          try { player!.stdin!.write(stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth")); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
+          return;
+        }
+        case "response.done":
+          // `speaking` belongs to the PROCESS, not to the socket: the live handler's response.done
+          // will never fire for this reply, so if it is not cleared here the flag latches true and
+          // the NEXT rotation's quiet gate can never open again.
+          if (prevRespId && ev.response?.id === prevRespId) { prevRespId = null; speaking = false; endPlayer(); rotDrainRelease(); }
+          return;
+        case "conversation.item.input_audio_transcription.completed": {
+          const t = ev.transcript?.trim(); if (!t) return;
+          // SACRED — HIS WORDS ARE NEVER WITHHELD, not even at a mid-utterance swap. The
+          // predecessor only ever received audio UP TO the swap and the successor only what came
+          // AFTER it: the two transcripts are DISJOINT HALVES of one sentence, not two copies of
+          // it, so suppressing this one deletes a fragment that has no duplicate anywhere — the
+          // exact loss this engine exists to prevent, on the one path it deliberately allows to
+          // cut a live utterance. It is emitted as a real `you` turn, annotated when it spans the
+          // swap so the record says plainly that it is a half.
+          //
+          // ECHO JUDGEMENT, THE SAME ONE THE LIVE DOOR USES. A turn committed just before the swap
+          // can be speaker echo of our own mouth (22/22 resend-sourced turns in the corpus were),
+          // and this handler is outside the live pipeline where the belts live. Score it against
+          // the same recentSpoken corpus at the same LIVE bar, and FLAG — never drop: the turn
+          // prints and reaches the record byte-identical, carrying the evidence, exactly as a
+          // flagged live turn does. What a flag DOES change is teaching: a tail we believe is our
+          // own voice is not carried into the successor as his words (see rotDrainEnd).
+          const m = echoScore(t, 45000);
+          const echoish = m.score >= ECHO_LIVE_BAR;
+          if (echoish) say("info", `possible speaker echo on the predecessor tail — turn FLAGGED, not removed (text${prevSpanning ? ", spans the swap" : ""}); it is kept out of the successor's context, never out of the log`);
+          say("you", t, { src: "predecessor-tail", rotation: true, rot_n: rotN,
+            ...(prevSpanning ? { partial_before_swap: true } : {}),
+            ...(echoish ? { echo_suspect: true, echo_sim: Number(m.score.toFixed(2)), echo_belt: "text", echo_src: m.src.slice(0, 200) } : {}) });
+          if (!echoish) prevTail.push(t);
+          return;
+        }
+        case "error":
+          rec({ ev: "info", rotation: true, text: `predecessor error after rotation (its own cap — expected): ${ev.error?.message ?? ev.error?.code ?? "?"}` });
+          rotDrainEnd();
+          return;
+      }
+    };
+
+    /** THE DRAIN IS OVER — the predecessor's voice is out of the shared player. Everything that was
+     *  held ONLY because firing it would have put a second voice in that player may flow now: the
+     *  mouth reply parked behind MIND audio, and the MIND's own queue. HELD, NEVER DROPPED is the
+     *  whole point of those gates — a turn of his that goes unanswered is the failure he notices. */
+    const rotDrainRelease = () => {
+      if (closed || closing) return;
+      if (pendingMouthReply && !mindBusy) {
+        // Same predicate the mind-audio release uses (W38): a hold may never discharge into a room
+        // where nobody has spoken yet. LEGACY greeting is byte-identical — an attended restart has
+        // a listener by definition.
+        if (!(!GREET_LEGACY && speechStartedAt === 0) && !suppressAuto && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+          say("info", "mouth reply released (was held behind the rotation drain)", { rotation: true });
+          try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
+        }
+        pendingMouthReply = false;
+      }
+      if (injectQueue.length) setTimeout(flushInjectQueue, 0);
+    };
+
+    /** Let the predecessor socket GO, for good. Deliberately separate from the drain end: the two
+     *  finish at different times. The drain — its last sentence and its last transcript — is over in
+     *  seconds, but the socket stays OPEN and silent for the whole R3 swap-back window, because a
+     *  live fallback to swap back into is exactly what the 120s floor under the cap was bought for. */
+    function rotPrevRelease() {
+      const p = prevWs; prevWs = null; prevUntil = 0; prevHoldUntil = 0;
+      if (p) { try { p.onmessage = null; p.onclose = null; p.onerror = null; } catch {} try { p.close(); } catch {} }
+    }
+
+    /** End the drain and carry the tail forward — his last words before the swap become the
+     *  successor's first knowledge, silently, exactly like the MIND's own {"context"} push. The
+     *  socket itself is NOT closed here while the revert window is still open (see rotPrevRelease):
+     *  it is merely made mute and deaf to us, which is all the drain promised. */
+    function rotDrainEnd() {
+      const p = prevWs; if (!p) return;
+      prevUntil = 0;
+      // Belt for the case above: a predecessor that dies mid-reply never sends response.done.
+      if (prevRespId) { prevRespId = null; speaking = false; }
+      try { p.onmessage = null; p.onerror = null; } catch {}
+      if (prevHoldUntil <= Date.now()) rotPrevRelease();   // the revert window closed with it
+      const tail = prevTail.splice(0).join(" ");
+      if (tail && !closed && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system",
+            content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: he said this a moment ago, just before the connection was renewed: ${tail}` }] } }));
+          say("info", `rotation: predecessor tail carried into the successor (${tail.length} chars)`, { rotation: true, rot_tail_chars: tail.length });
+        } catch {
+          // Visibility, not recovery: his words were already emitted as src:"predecessor-tail"
+          // you-turns before they reached prevTail — only the successor's context missed them.
+          rec({ ev: "info", rotation: true, text: `rotation: predecessor tail (${tail.length} chars) could NOT be carried into the successor — the send failed; the turns are in the log as src=predecessor-tail`, rot_tail_dropped: true });
+        }
+      } else if (tail) {
+        rec({ ev: "info", rotation: true, text: `rotation: predecessor tail (${tail.length} chars) could NOT be carried into the successor — the socket was not open; the turns are in the log as src=predecessor-tail`, rot_tail_dropped: true });
+      }
+      rotDrainRelease();
+      try { logw?.flush?.(); } catch {}
+    }
+
+    /** The frames captured while there was NO session are on disk. Hand them to the SAME recovery
+     *  path an overlap window uses — loudness-gated, quiet-gated, auto-reply suppressed, both echo
+     *  belts armed — so his words during a gap reach the model instead of merely surviving as a
+     *  WAV. Only ever called on a segment that contains the gap and nothing else. */
+    const rotRefeedGap = () => {
+      const p = archPath; const n = archBytes;
+      archRoll("rotation gap end");
+      if (!p || n < RATE * 2 * 0.4 || recovering || closed) return;
+      let there = false; try { there = fs.existsSync(p); } catch {}
+      if (!there) return;                      // pure room noise: archRoll already deleted it
+      recovering = true;
+      setTimeout(() => recoverOverlap(p, 0, n), 0);   // off the swap block; async by design
+    };
+
+    /** THE SWAP. ONE synchronous block: JavaScript cannot preempt it, so a mic frame, a timer, an
+     *  inject line or a server event can never interleave between these assignments — the
+     *  atomicity is free and needs no lock. NOTHING in here may await. */
+    const rotCommit = (s: WebSocket, forced: boolean, refeed: boolean) => {
+      const old = ws;
+      const oldT0 = sessT0;
+      const quiet = rotQuiet();
+      const unparkAcked = succUpdN > succUnparkSeq;
+      flushReply();                                  // print anything held for a transcript that will never come
+      // W4 — the MIND's own line. A reply consumed by the outgoing session is NOT re-sent: the
+      // ledger-first law of lm-remind is the precedent (a room that hears a reminder twice is the
+      // failure he would actually notice). It is announced loudly instead, so the MIND re-decides
+      // from the log. His words are sacred; the MIND's line is re-derivable.
+      if (awaitingResponse || responseActive) {
+        say("info", `rotation: a reply was in flight at the swap — ${responseActive ? "it finishes on the predecessor" : "it was never born"}; it is NOT re-sent, the MIND re-decides from the log`,
+          { rotation: true, inflight_at_swap: true, was_generating: responseActive });
+      }
+      prevWs = old;
+      prevT0 = oldT0; prevExpires = sessExpiresAt;
+      rotSwapAt = Date.now();
+      prevRespId = responseActive ? curResponseId : null;
+      prevSpanning = !!(userSpeaking || latchTimedOut);
+      prevUntil = Date.now() + ROT_DRAIN_MS;
+      // R3 — the socket outlives its drain by the length of the swap-back window, silent and
+      // untouched, so a successor that dies at birth has somewhere real to go back to.
+      prevHoldUntil = Date.now() + Math.max(ROT_DRAIN_MS, ROT_REVERT_MS);
+      prevTail.length = 0;
+      ws = s;                                        // ←—— THE HANDOVER. Everything follows this one word:
+      succ = null;                                   //      the mic's single send site, every response.create,
+      rotBindLive(s);                                //      the heartbeat, the inject flush, the tool replies.
+      old.onmessage = (e: any) => rotQuiesce(old, e);
+      old.onerror = () => {};
+      old.onclose = (e: any) => { rec({ ev: "info", rotation: true, text: `predecessor socket closed (${e?.code ?? "?"}) after rotation` }); rotDrainEnd(); rotPrevRelease(); };   // a CLOSED predecessor is no fallback: end the revert window with it
+      // Per-SESSION state names ids that died with the old socket. Per-PROCESS state is UNTOUCHED
+      // — above all the inject queue: a MIND line in flight is never dropped by a rotation (the
+      // queue is process state, not socket state). Mute, autospeak, the echo corpus, the archive,
+      // the latch, his last-spoken record and the leak calibration all carry across unchanged.
+      curResponseId = null; curItemId = null; itemFirstDeltaAt = 0; itemQueuedMs = 0;
+      responseActive = false; awaitingResponse = false; mindResponse = false;
+      pendingMindHistory = ""; recoveredItemId = null; recoverSentAt = 0;
+      archLastResp = ""; speechTurns.length = 0; cancelledResponses.clear();
+      ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";
+      sessT0 = succT0 || Date.now(); sessExpiresAt = succExpiresAt;
+      rotN++; rotState = "off"; rotGap = false; succTries = 0; succRetryAt = 0;
+      // W2(b/c) — NEVER LEAVE A SUCCESSOR HALF-CONFIGURED. If the un-park was not acknowledged
+      // before we had to swap, the session may still be carrying create_response:false: it would
+      // hear him perfectly and never answer, and a mouth that is silently shut is exactly the
+      // outage class that runs for minutes undetected. Re-send it now, on the live socket, with
+      // no response in flight (the abort this engine once saw came from resending turn_detection
+      // MID-RESPONSE, which this is not).
+      if (!unparkAcked) {
+        try {
+          ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
+            audio: { input: audioInput, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } } } }));
+          say("info", "rotation: un-park was unacknowledged at the swap — live input config re-sent on the new session", { rotation: true, unpark_resent: true });
+        } catch {}
+      }
+      if (refeed) rotRefeedGap(); else archRoll("rotation");   // safe at quiet: no word is split, and the mic never stopped
+      say("info", `call rotated (#${rotN}) — the microphone moved to the successor session ${refeed ? "after an in-place reconnect" : forced ? "at the hard floor" : "at a quiet moment"}${prevSpanning ? ", MID-UTTERANCE" : ""}; log, pid, inject path and archive are unchanged`,
+        { rotation: true, rot_n: rotN, forced, quiet, spanning: prevSpanning, reconnected: refeed,
+          prev_session_s: oldT0 ? Math.round((Date.now() - oldT0) / 1000) : undefined,
+          next_expires_at: sessExpiresAt || undefined });
+    };
+
+    /** R2 — the cap fired and no successor was ready. The socket is gone but the CALL is not: one
+     *  process, one mic child that never stopped, one archive still being written frame by frame.
+     *  Open a fresh session in place. Worst case (every attempt fails) this ends exactly where
+     *  today's engine ends — the call closes and the launcher takes over. Never worse than today. */
+    function rotReconnect(why: string) {
+      // onerror is normally followed by onclose: enter the emergency ONCE. The tick owns retries.
+      if (closed || rotGap || rotState === "done") return;
+      rotGap = true;
+      // Roll FIRST, unconditionally: the gap segment must contain the gap and nothing else, or
+      // the refeed would replay words the predecessor already heard as if they were new.
+      archRoll("rotation gap");
+      say("info", `session ended (${why}) — the CALL continues: the microphone never stopped, every frame is archived, and a session is being opened in place${succ ? " (a successor was already parked)" : ""}`,
+        { rotation: true, rot_reconnect: true, had_successor: !!succ });
+      // The retry budget is per-EMERGENCY, not cumulative: pre-opens that failed harmlessly
+      // during the quiet window must not spend the budget that now keeps the call alive.
+      succTries = 0; succRetryAt = 0;
+      if (!succ) { rotState = "armed"; rotOpen(); }
+      // A successor that was already parked or seeded is swapped in by the next tick (≤1s).
+    }
+
+    /** R3b — SELF-DEMOTION. Opening the successor killed the live session, so this endpoint
+     *  serves one realtime session at a time and takes the newest. Promote the successor (it is
+     *  the only socket left) and write the verdict to disk: no call on this machine attempts the
+     *  overlap again — they all use the reconnect path, which needs no concurrency at all. One
+     *  incident, a couple of archived seconds, permanently self-healing. */
+    function rotDemote() {
+      rotConcurrent = false;
+      try { ensureDir(dirname(rotConcPath)); fs.writeFileSync(rotConcPath, JSON.stringify({ concurrent: false, observed: new Date().toISOString(), call: callId })); } catch {}
+      say("info", "rotation: opening a successor TOOK OVER the live session — this endpoint allows only one realtime session at a time. Overlap is now DISABLED for every future call on this machine (~/.livemind/rotation-concurrency.json); rotations fall back to reopening in place, which needs no concurrency. The seconds since the takeover are archived AND re-fed into the promoted session automatically — nothing he said in them is lost.",
+        { rotation: true, rot_takeover: true });
+      const s = succ;
+      if (!s) { rotReconnect("successor takeover"); return; }   // rotReconnect rolls + refeeds the gap itself
+      // THE TAKEOVER GAP IS WORDS. Between the live socket dying and the successor being OPEN the
+      // mic pump has nowhere to send frames (up to ~1.3s if it was still connecting, longer if it
+      // still has to be configured) — archived, but archived is not heard. Roll FIRST so the
+      // segment contains the gap and NOTHING the predecessor already heard, then commit with
+      // refeed on: the same roll-then-refeed pair R2 uses, for the same reason. Without it this
+      // rung would drop words today's engine keeps, which is the one thing rollback may never do.
+      archRoll("takeover gap");
+      rotUnpark();                       // a no-op if it has not opened yet — its onopen then sends the LIVE config
+      rotCommit(s, true, true);
+    }
+
+    function rotTick() {
+      if (closed || !ROT_ON || rotState === "done") return;
+      const now = Date.now();
+      if (prevWs && prevUntil && now > prevUntil) rotDrainEnd();
+      if (prevWs && !prevUntil && prevHoldUntil && now > prevHoldUntil) rotPrevRelease();   // R3 window over
+      if (!sessT0 && !rotGap) return;
+      const floorAt = rotFloorAt();
+      // NOT A GOOD MOMENT — a little grace beats a split anything. Never past the grace window:
+      // the floor still lands 90s under the earliest cap ever measured, which is what keeps the
+      // swap-back rung possible. The set is deliberately wider than "he is mid-utterance":
+      //  · rotResending — a resend is audio that ALREADY failed to reach the model once, streamed
+      //    as live speech over seconds; a swap through it lands half on each session and the
+      //    second loss is the worst instance of this whole class.
+      //  · responseActive / stillAudible() — the mouth is mid-sentence. Swapping here is legal
+      //    (the drain finishes it) but waiting a beat is free, and it keeps two voices away from
+      //    the shared player entirely.
+      //  · awaitingResponse — a reply the ledger already calls `fired` is born but not yet
+      //    speaking; it resolves in a few hundred ms, and letting it be born on the predecessor
+      //    means the drain can finish it audibly instead of it dying with the socket.
+      const midTurn = () => (userSpeaking || latchTimedOut || rotResending || responseActive || awaitingResponse || stillAudible())
+        && now < floorAt + ROT_GRACE_MS;
+      switch (rotState) {
+        case "off":
+          if (now < floorAt - ROT_LEAD_MS) return;
+          rotState = "armed";
+          say("info", `rotation armed — this session is ${Math.round((now - sessT0) / 1000)}s old; the successor opens now and the swap takes the next quiet moment, hard floor in ${Math.round((floorAt - now) / 1000)}s`,
+            { rotation: true, rot_n: rotN, floor_in_s: Math.round((floorAt - now) / 1000), expires_at: sessExpiresAt || undefined });
+          return;
+        case "armed":
+          if (!rotGap && !rotConcurrent) return;    // self-demoted: no overlap — wait for the cap, then reconnect
+          if (now < succRetryAt) return;
+          if (rotGap && succTries >= 6) {
+            rotState = "done";
+            say("info", "rotation: could not reopen a session after 6 tries — ending the call so the launcher can take over (exactly today's behaviour)", { rotation: true, rot_giveup: true });
+            done(result ?? { reason: "closed", detail: "rotation reconnect failed" });
+            return;
+          }
+          rotOpen();
+          return;
+        case "opening":
+          if (now - succOpenedAt > ROT_CONNECT_MS) rotDrop("no session.updated within the connect window");
+          return;
+        case "parked":
+          // S2 — his own instruction: see it run quietly for a moment before the channel moves.
+          if (!rotGap && now - succQuietAt < ROT_VERIFY_MS) return;
+          rotSeed();
+          return;
+        case "seeded":
+          if (!rotGap && ((now < floorAt && !rotQuiet()) || (now >= floorAt && midTurn()))) return;
+          rotUnpark();
+          return;
+        case "unparking": {
+          const acked = succUpdN > succUnparkSeq;
+          if (!acked && now - succUnparkAt < ROT_ACK_MS && (rotGap || now < floorAt)) return;   // never swap into an unconfirmed session
+          if (!rotGap && ((now < floorAt && !rotQuiet()) || (now >= floorAt && midTurn()))) return;
+          const s = succ; if (!s) { rotState = "armed"; return; }
+          rotCommit(s, now >= floorAt, rotGap);
+          return;
+        }
+      }
+    }
+
+    /** Bind the full conversation pipeline to ONE socket. The guard is the assertion net for the
+     *  single bug this design can have: a handler bound to the old socket that closes over the
+     *  bare name `ws` would, after the swap, act on the NEW one. Here `sock` is who spoke and `ws`
+     *  is who may be spoken to — an event from anything else is recorded and dropped, never acted
+     *  on, and never emitted as one of his turns. */
+    function rotBindLive(sock: WebSocket) {
+      sock.onmessage = (e: any) => {
+        if (sock !== ws) { rec({ ev: "info", rotation_anomaly: true, text: "event from a socket that is no longer live — recorded and ignored" }); return; }
+        onServerMessage(e);
+      };
+      sock.onerror = () => {
+        if (sock !== ws) return;
+        say("info", "connection failed");
+        if (ROT_ON && !closed && !closing && rotState !== "done") { rotReconnect("connection failed"); return; }
+        done(result ?? { reason: "error", detail: "connection failed" });
+      };
+      sock.onclose = (e: any) => {
+        if (sock !== ws) { rec({ ev: "info", rotation: true, text: `socket closed (${e?.code ?? "?"}) — not the live one` }); return; }
+        rec({ ev: "info", text: `socket closed (${e?.code ?? "?"})` });
+        // R3b — TAKEOVER. The live socket died within seconds of opening a successor: opening the
+        // second session is what killed the first.
+        if (!rotGap && succ && rotOpenAt && Date.now() - rotOpenAt < 4000) { rotDemote(); return; }
+        // R3 — SWAP BACK. The session we JUST handed the microphone to died at birth, and the
+        // predecessor is still open and still well under its own cap. Take the floor back instead
+        // of reconnecting: no gap at all, not even the ~1.3s one. This is what the 120s of margin
+        // under the cap is FOR — it is the only reason a live fallback still exists at this
+        // moment. The tick re-arms immediately and tries a fresh successor.
+        // The window is REAL, not merely claimed: rotCommit holds the predecessor socket open for
+        // ROT_REVERT_MS (≥ the drain), so `readyState === OPEN` here means what it says.
+        if (prevWs && prevWs.readyState === WebSocket.OPEN && rotSwapAt && Date.now() - rotSwapAt < ROT_REVERT_MS) {
+          const heldFor = Date.now() - rotSwapAt;
+          const back = prevWs; prevWs = null; prevUntil = 0; prevHoldUntil = 0; prevRespId = null; prevTail.length = 0;
+          ws = back; rotBindLive(back);
+          sessT0 = prevT0 || Date.now(); sessExpiresAt = prevExpires;
+          rotState = "off"; rotGap = false; rotSwapAt = 0; speaking = false;
+          say("info", `rotation REVERTED — the successor died ${Math.round(heldFor / 1000)}s after taking over; the microphone is back on the previous session (${Math.round((Date.now() - sessT0) / 1000)}s old, which is why the floor sits two minutes under the cap) and a new successor will be opened`,
+            { rotation: true, rot_reverted: true, held_ms: heldFor });
+          rotDrainRelease();   // the drain is over by definition: nothing may stay held on a socket that no longer exists
+          return;
+        }
+        // R2 — the cap fired with no swap. Reconnect in place rather than ending the call.
+        if (ROT_ON && !closed && !closing && rotState !== "done") { rotReconnect(`socket closed (${e?.code ?? "?"})`); return; }
+        done(result ?? { reason: closing ? "hangup" : "closed", detail: String(e?.code ?? "") });
+      };
+    }
+
+    const onServerMessage = (e: any) => {
       let ev: any;
       try { ev = JSON.parse(String(e.data)); } catch { return }
       if (!connected) { connected = true; if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; } }
@@ -2013,6 +2667,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
       }
       switch (ev.type) {
+        case "session.created":
+          // ROTATION ANCHOR. The cap belongs to the SESSION, not to the process: measured on five
+          // capped calls, the server closes exactly 3600.00s (±20ms) after the socket opened,
+          // while process-start times scatter over 11s of connect latency. This event also
+          // carries `expires_at` — the server's own deadline — which this engine logged the TYPE
+          // of and then threw the payload away, so the one number that ends the guessing has
+          // never once been on disk. It is recorded here and it may only TIGHTEN the floor.
+          sessT0 = Date.now();
+          sessExpiresAt = expiresMs(ev.session?.expires_at);
+          {
+            // OFF-MODE PURITY. With rotation unarmed this handler must add nothing to the turn
+            // stream the MIND and the monitor read — the whole worth of an opt-in knob is that it
+            // is trustworthy without re-reading the diff. The expires_at value (the one number
+            // that has never been on disk) is still CAPTURED above and RECORDED here; only the
+            // emission waits for the engine to be armed.
+            const line = `session ${ev.session?.id ?? "?"} created — expires_at ${ev.session?.expires_at ?? "(not stated)"}${sessExpiresAt ? ` (in ${Math.round((sessExpiresAt - Date.now()) / 1000)}s)` : ""}; rotation ${ROT_ON ? `arms at ${Math.round((ROT_FLOOR_MS - ROT_LEAD_MS) / 1000)}s, hard floor ${Math.round(ROT_FLOOR_MS / 1000)}s` : "OFF (set LIVEMIND_ROTATE=1 to arm)"}`;
+            const extra = { rotation: true, session_id: ev.session?.id ?? null, expires_at: sessExpiresAt || undefined };
+            if (ROT_ON) say("info", line, extra);
+            else rec({ ...extra, ev: "info", text: line });
+          }
+          break;
         case "session.updated":
           // Only now are the instructions live, so an opening line spoken before this
           // would be in the default assistant persona rather than yours. (Parked sockets
@@ -2437,7 +3112,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // guarantees the mouth never answers a recovered turn on its own — is untouched,
                 // and the MIND has all three pieces from the log line above either way.
                 if (!wasRecovered && !inRecoveryWindow && !suppressAuto && !closing
-                    && !responseActive && !awaitingResponse && !mindBusy && ws.readyState === WebSocket.OPEN) {
+                    && !responseActive && !awaitingResponse && !mindBusy && !prevRespId && ws.readyState === WebSocket.OPEN) {
                   const resume = `[He cut you off mid-reply — absorb silently, never mention or read out this note.]`
                     + (tail ? ` He heard you only up to: "…${tail}".` : ` He heard almost none of that reply.`)
                     + (b.remainder ? ` You never said the rest: "${b.remainder}".` : ` Nothing of that reply was left unsaid.`)
@@ -2481,7 +3156,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           flushReply();
           // Hangup is irreversible — require REAL speech behind it, not a noise hallucination.
-          if (!closing && ev.transcript && isHangup(ev.transcript) && lastSpeechMs >= 400) {
+          if (!closing && ev.transcript && isHangup(ev.transcript) && lastSpeechMs >= 400 && !prevRespId) {
             closing = true;
             say("info", "heard a goodbye — closing after the reply");
             // Let it sign off in its own voice, then the response.done below hangs up.
@@ -2609,15 +3284,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             break;
           }
           if (awaitingResponse && !responseActive) awaitingResponse = false;   // same latch, any other refusal
+          // ROTATION: the 60-minute cap is not a call failure, it is a SCHEDULE — and the socket
+          // behind it is replaceable in place. The message is still logged verbatim, but `result`
+          // is left UNSET so the close handler reconnects instead of ending the call. Without
+          // this the reconnect path would be unreachable exactly at the one moment it is for.
+          if (ROT_ON && !closed && !closing && rotState !== "done" && /maximum duration/i.test(String(ev.error?.message ?? ""))) {
+            say("info", `error: ${ev.error?.message ?? "unknown"} — session cap reached; rotating in place, the call continues`,
+              { rotation: true, cap_hit: true, session_s: sessT0 ? Math.round((Date.now() - sessT0) / 1000) : undefined });
+            break;
+          }
           say("info", `error: ${ev.error?.message ?? "unknown"}`);
           if (!result) result = { reason: "error", detail: ev.error?.code ?? ev.error?.message };
           break;
       }
     };
-    ws.onerror = () => { say("info", "connection failed"); done(result ?? { reason: "error", detail: "connection failed" }); };
-    ws.onclose = (e: any) => {
-      rec({ ev: "info", text: `socket closed (${e?.code ?? "?"})` });
-      done(result ?? { reason: closing ? "hangup" : "closed", detail: String(e?.code ?? "") });
-    };
+    // The live pipeline is BOUND, not hard-wired: a rotation re-points it at the successor in the
+    // same synchronous block that moves the microphone. rotBindLive also carries the two
+    // rollback rungs — takeover detection and the in-place reconnect at the cap.
+    rotBindLive(ws);
   });
 }
