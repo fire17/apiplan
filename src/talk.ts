@@ -156,6 +156,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let speechStartedAt = 0;
   let lastSpeechMs = 0;
   let userSpeaking = false;   // VAD says the human is mid-turn — MIND lines HOLD (stack law)
+  let lastSpeechStopAt = 0;   // sustained-silence gate: MIND may speak only after ~2.5s of real quiet
 
   let greeted = false;
   // Audio arrives far faster than it plays, so "the model stopped generating" is NOT
@@ -593,6 +594,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // hold is echoed, so the watching MIND can re-weave them against what he just said
       // ({"drop_queue":true} + one fresh line). Enforced here so it works from any
       // session — nobody has to remember. 120s failsafe in case speech_stopped is lost.
+      queueStale = false;   // a new inject IS the re-weave — it releases the stale hold
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
         injectQueue.push(text);
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
@@ -605,7 +607,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
     // ordered instead of firing every item at once (which the server would reject all-but-first).
-    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !userSpeaking) sendInjected(injectQueue.shift()!); };
+    // SUSTAINED-SILENCE GATE (fire17, voice, 2026-08-20: the 1.2s flush caught him
+    // mid-pause and the MIND talked over him): held lines flow only after ~2.5s of
+    // continuous quiet — a short breath is NOT the end of his turn. If blocked, one
+    // timer self-reschedules until the quiet arrives; caps state is irrelevant here.
+    // STALE-QUEUE RE-WEAVE (fire17, voice, 2026-08-20: "היא משתגרת מהר מדי... בלי
+    // שהמוח מנתח את מה שאמרתי עכשיו"): once a NEW user turn completes while lines sit
+    // in the queue, those lines are STALE — they never auto-flush. Only {"drop_queue"}
+    // (MIND re-weaves and sends fresh) or a new inject releases the hold.
+    let queueStale = false;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushInjectQueue = () => {
+      flushTimer = null;
+      if (queueStale) return;
+      if (userSpeaking || Date.now() - lastSpeechStopAt < 2500) {
+        if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+        return;
+      }
+      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy) sendInjected(injectQueue.shift()!);
+    };
     function startInjectLoop() {
       if (!injectPath) return;
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
@@ -655,6 +675,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (j.drop_queue) {   // MIND re-weave: discard held/unspoken lines before sending a fresh one
                       say("info", `queue dropped (${injectQueue.length} lines)`);
                       injectQueue.length = 0;
+                      queueStale = false;
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
@@ -761,12 +782,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_stopped":
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
           userSpeaking = false;
-          // Held MIND lines flow once his turn lands — after the VAD auto-reply (if any)
-          // claims its slot, so the queue naturally waits for response.done instead.
-          if (injectQueue.length) setTimeout(flushInjectQueue, 1200);
+          lastSpeechStopAt = Date.now();
+          // Held MIND lines flow once his turn REALLY lands — the sustained-silence gate
+          // inside flushInjectQueue re-holds if he resumes within 2.5s.
+          if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
+          // Stale-queue law: a completed user turn makes every held MIND line stale —
+          // it must be re-woven against these new words, never auto-fired (echo once).
+          if (ev.transcript?.trim() && injectQueue.length && !queueStale) {
+            queueStale = true;
+            say("info", "mind queue STALE (new user turn) — awaiting re-weave");
+          }
           // Noise gate, layer 2 — MECHANISTIC. Long ambient noise (>= minSpeech, so it passed
           // the blip gate) transcribes to an EMPTY string; a VAD auto-reply born from it is a
           // ramble at nothing. Cancel it the moment the empty transcript lands — but never a
