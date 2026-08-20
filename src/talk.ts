@@ -175,6 +175,42 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   };
   const stillAudible = () => Date.now() < playingUntil + 250;   // + a little room for the speaker's own latency
 
+  // ── LANE 18 (canon 014): mac output-mute awareness — "אני צריך שתדע לזהות מתי המחשב
+  // שלי על ווליום השתק ומתי לא, כדי שהבלבולים האלה לא יקרו יותר". Design law (E107 +
+  // EVA amendment): NO standing poll — one async osascript read ONLY at speak moments,
+  // cached 5s, never blocking the mouth path (fire-and-forget; warn uses last-known
+  // state, ≤5s stale). While muted/vol0, mind/mouth speech is likely UNHEARD: mark it
+  // in the LOG (ev:info spoken-while-muted) so nobody diagnoses a broken chain from
+  // silence, and announce on unmute how many lines he may have missed (replay = MIND's
+  // call from the LOG). ponytail: osascript on demand; CoreAudio listener only if this
+  // ever needs to be event-driven.
+  let spkState = "unknown"; let spkAt = 0; let mutedSpoken = 0;
+  const speakerCheck = () => {
+    if (Date.now() - spkAt < 5000) return;
+    spkAt = Date.now();
+    try {
+      const p = Bun.spawn(["osascript", "-e", "get volume settings"], { stdout: "pipe", stderr: "ignore" });
+      new Response(p.stdout).text().then((out) => {
+        const vol = Number(/output volume:(\d+)/.exec(out)?.[1] ?? NaN);
+        const muted = /output muted:true/.test(out);
+        const prev = spkState;
+        spkState = muted ? "muted" : vol === 0 ? "vol0" : Number.isNaN(vol) ? "unknown" : vol <= 15 ? "low" : "ok";
+        if (prev !== spkState && (spkState === "muted" || spkState === "vol0"))
+          say("info", `mac output ${spkState} — speech from here is likely UNHEARD`);
+        if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && mutedSpoken) {
+          say("info", `mac output audible again — ${mutedSpoken} line(s) were spoken while ${prev}; he may have missed them (replay from LOG if he asks)`);
+          mutedSpoken = 0;
+        }
+      }).catch(() => { spkState = "unknown"; });
+    } catch { spkState = "unknown"; }
+  };
+  const warnIfUnheard = (who: string) => {
+    if (spkState === "muted" || spkState === "vol0") {
+      mutedSpoken++;
+      say("info", `spoken-while-muted — output ${spkState}, ${who} speech likely UNHEARD`);
+    }
+  };
+
   // Barge-in bookkeeping (R7): to interrupt CORRECTLY we must tell the server how much
   // was actually heard (conversation.item.truncate) and drop the cancelled response's
   // in-flight deltas — otherwise the model's context contains words the user never heard,
@@ -738,6 +774,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
         // Low-latency flags: without them ffplay holds a read-ahead buffer that stays
         // audible ~40-100ms after SIGKILL — the post-barge self-hear window (verified).
+        speakerCheck(); warnIfUnheard("mind");                        // LANE 18: async, cached 5s
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
           "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0", f],
           { stdout: "ignore", stderr: "ignore" });
@@ -1131,6 +1168,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (ev.response_id && cancelledResponses.has(ev.response_id)) break;
             if (ev.response_id && ev.response_id !== archLastResp) {   // mouth reply begins = user turn done
               archLastResp = ev.response_id; archRoll("mouth reply");
+              speakerCheck(); warnIfUnheard("mouth");                  // LANE 18: async, never blocks the reply
             }
             speaking = true;
             if (!player || player.exitCode !== null) startPlayer();   // dead/absent → fresh player
