@@ -102,6 +102,47 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     if (sha) rec({ ev: "info", text: `engine ${sha}` });
   } catch { /* never block a call on git */ }
 
+  // ── LANE 15 (canon 011): SPEECH SURVIVES A RESTART ───────────────────────────
+  // fire17's law: a restart that cuts the mouth mid-sentence must not lose the sentence —
+  // resume from where it stopped on the new call, and "הפה ידע מה הדבר האחרון שנאמר"
+  // (the new mouth must know the last thing actually spoken).
+  // Everything the engine knew about a MIND line — its text, how much of it was actually
+  // HEARD, and what was still queued behind it — lived in memory and died with the call
+  // (measured 2026-08-20: of 13 real calls, 5 ended while the last MIND line was still
+  // playing and 5 more died with a line HELD in the queue, with nothing recording either).
+  // No second player process: ONE small JSON on disk, rewritten at every start / progress /
+  // end / cut of a MIND line, plus ONE line in the NEXT call's log at start. The MIND
+  // already reads the log, so it learns the last thing actually spoken and the exact
+  // unspoken remainder. The engine never writes an inject and never re-speaks on its own —
+  // resuming stays the MIND's judgement, and mouth immediacy is untouched.
+  const mindStatePath = process.env.APIPLAN_MIND_STATE === "" ? "" :
+    (process.env.APIPLAN_MIND_STATE || `${process.env.HOME}/.livemind/mind-last-spoken.json`);
+  const callId = logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`;
+  let carry: any = null;   // LANE 15 review fix 0: previous call's mind fields survive mouth-only writes
+  try {
+    if (mindStatePath && fs.existsSync(mindStatePath)) {
+      const s = JSON.parse(fs.readFileSync(mindStatePath, "utf8"));
+      const age = Date.now() - (Number(s.t) || 0);
+      // Gate on the LINE's own clock (review fix 1): a later mouth-only write must not
+      // renew a stale line; started_at stays meaningful because of the carry fix.
+      const lineAge = Date.now() - (Number(s.started_at) || Number(s.t) || 0);
+      const maxAge = Number(process.env.APIPLAN_MIND_RESUME_MAX_AGE_MS) || 900000;
+      if (age >= 0 && lineAge >= 0 && lineAge < maxAge && (s.text || s.mouth_last || s.queued?.length)) {
+        carry = s;
+        const spokeAge = Math.round(lineAge / 1000);
+        // review fix 3: the barged remainder is already in `remainder` — never list it twice
+        const q: string[] = Array.isArray(s.queued) ? s.queued.filter((l: string) => String(l).trim() !== String(s.remainder || "").trim()) : [];
+        say("info",
+          `last spoken ${spokeAge}s ago on ${s.call} [${s.status}] — mind ${s.spoken_chars}/${s.chars} chars`
+          + (s.spoken ? ` — HEARD-TAIL: ${String(s.spoken).slice(-160)}` : "")
+          + (s.remainder ? ` — UNSPOKEN: ${s.remainder}` : " — nothing unspoken")
+          + (s.mouth_last ? ` — MOUTH LAST: ${String(s.mouth_last).slice(-160)}` : "")
+          + (q.length ? ` — never left the queue (${q.length}): ${q.join(" ⏎ ")}` : "")
+          + ` — state ${mindStatePath}; resuming is YOUR call, the engine will not speak it`);
+      }
+    }
+  } catch { /* a bad state file must never block a call */ }
+
   // Structural allow-list: a tool name the caller never declared is never dispatched,
   // no matter what the model asks for.
   const toolNames = new Set((o.tools ?? []).map((t: any) => t?.name).filter(Boolean));
@@ -228,6 +269,56 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // איפה הוא נקטע"): the line now playing, so an interrupt can estimate how much was
   // actually heard (cut) and re-queue the unspoken remainder for re-weave.
   let mindLine: { text: string; ms: number; startAt: number; cut: number } | null = null;
+  // LANE 15: the SAME object as mindLine, but never nulled when playback ends — the state
+  // file must still know the last line and how much of it was heard after it finished.
+  let mindLast: { text: string; ms: number; startAt: number; cut: number } | null = null;
+  let mindQueue: string[] = [];   // bound to the live inject queue below — the lines never spoken
+  let mindStatus = "idle";
+  let mindStateAt = 0;
+  let mouthLast = "";             // the mouth's own last completed reply (it dies with the socket too)
+  /** How much of a line was actually HEARD: elapsed/duration, rounded DOWN to a word
+   *  boundary — the same clock the barge cut uses, so words he never heard are never
+   *  recorded as spoken. A frozen `cut` (barge / call end) always wins. */
+  const spokenChars = (L: { text: string; ms: number; startAt: number; cut: number }) => {
+    if (L.cut >= 0) return L.cut;
+    const raw = Math.min(L.text.length, Math.max(0, Math.round(((Date.now() - L.startAt) / (L.ms || 1)) * L.text.length)));
+    const wb = L.text.lastIndexOf(" ", raw);
+    return wb > 0 ? wb : raw;
+  };
+  /** Persist the MIND's speech state (atomic tmp+rename — a reader never sees half a file;
+   *  the tmp name carries the pid so two live calls can never interleave one write).
+   *  `status` undefined keeps the current one; force=false throttles to <=1/s (the mic-pump
+   *  progress marker — that is what survives a SIGKILL mid-sentence). */
+  const saveMindState = (status?: string, force = true) => {
+    if (!mindStatePath) return;
+    if (status) mindStatus = status;
+    if (!force && Date.now() - mindStateAt < 1000) return;
+    if (!mindLast && !mouthLast && !mindQueue.length) return;   // never clobber the previous call's record with blanks
+    mindStateAt = Date.now();
+    try {
+      const n = mindLast ? spokenChars(mindLast) : 0;
+      const st = mindLast ? {
+        t: Date.now(), call: callId, log: logPath, status: mindStatus,
+        text: mindLast.text, chars: mindLast.text.length, ms: Math.round(mindLast.ms),
+        started_at: mindLast.startAt, spoken_chars: n,
+        spoken: mindLast.text.slice(0, n),
+        remainder: mindLast.text.slice(n).trim(),
+        mouth_last: mouthLast, queued: mindQueue.slice(0, 8),
+        mouth: suppressAuto ? "closed" : "open",
+      } : {
+        text: "", chars: 0, ms: 0, started_at: 0, spoken_chars: 0, spoken: "", remainder: "",
+        status: mindStatus, call: callId,
+        ...(carry ?? {}),                       // review fix 0: A's mind fields survive B's mouth-only writes
+        t: Date.now(), log: logPath,
+        mouth_last: mouthLast, queued: mindQueue.slice(0, 8),
+        mouth: suppressAuto ? "closed" : "open",
+      };
+      ensureDir(dirname(mindStatePath));
+      const tmp = `${mindStatePath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(st));
+      fs.renameSync(tmp, mindStatePath);
+    } catch { /* state must never break the call */ }
+  };
   let pendingMouthReply = false;              // a VAD auto-reply cancelled only because MIND audio was playing — release it after
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
@@ -405,7 +496,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try { m?.kill(); } catch {}
     if (m) setTimeout(() => { try { m.kill(9); } catch {} }, 500);   // escalate if ffmpeg ignores TERM
     stopPlayer();
+    // LANE 15: freeze how much he ACTUALLY heard before the audio dies, so the next call
+    // resumes exactly there instead of repeating the sentence or dropping it.
+    if (mindLine) mindLine.cut = spokenChars(mindLine);
     if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; }
+    saveMindState(mindLine ? "cut-by-call-end" : "call-end");
     archRoll("call end");
     try { logw?.flush?.(); } catch {}
   };
@@ -641,6 +736,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
               if (ovPath === archPath) ovEnd = archBytes;
             }
+            saveMindState("speaking", false);   // LANE 15: <=1/s progress — a SIGKILL still leaves the spoken prefix on disk
             if (value?.length && BARGE_PEAK > 0) {
               const fMs = (value.length / 2 / RATE) * 1000;
               // Leaky accumulator — real speech dips below any bar mid-word; a strict
@@ -659,6 +755,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
+                saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
                 ovStart = -1; ovEnd = 0; ovPath = "";          // his live speech supersedes overlap recovery here
               }
             }
@@ -744,6 +841,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // lines to injectPath. Each is spoken INTO the live call: mode "graceful" waits for the
     // current sentence to finish; "interrupt" barges in so the model answers on it at once.
     const injectQueue: string[] = [];
+    mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
     const sendInjected = (text: string) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
@@ -782,7 +880,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           { stdout: "ignore", stderr: "ignore" });
         // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
         // sample) so the barge cut never over-counts words as spoken.
-        mindLine = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1 };
+        mindLine = mindLast = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1 };
+        saveMindState("speaking");   // LANE 15: on disk BEFORE the first sample — a hard kill can never erase the line
         say("model", text);   // the exact words now audible — the monitor/GUI see the true line
         rememberSpoken(text); // echo-dedupe: a recovered "you" matching this is speaker leak
         mindPlayer.exited.then(() => {
@@ -790,6 +889,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // mouth's history — recording words that were never heard corrupts its context.
           const cut = mindLine?.cut ?? -1;
           const spoken = cut >= 0 ? text.slice(0, cut) : text;
+          if (mindLast) mindLast.cut = cut >= 0 ? cut : text.length;
+          if (!closed) saveMindState(cut >= 0 ? "cut-by-user" : "done");   // LANE 15 (review fix 2): close() owns the record after call end
           mindLine = null;
           mindPlayer = null; mindBusy = false;
           try { unlinkSync(f); } catch {}
@@ -833,7 +934,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }
       stopPlayer(); speaking = false; playingUntil = 0;
       // A voice barge also silences the MIND's narrator audio (it has its own player).
-      if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; mindBusy = false; }
+      if (mindPlayer) { if (mindLine) mindLine.cut = spokenChars(mindLine); try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; mindBusy = false; }   // review fix 4: state file records the heard prefix, not the full line
     };
     // THE MOUTH IS SILENCED BY CODE WHENEVER THE MIND IS ABOUT TO SPEAK (fire17's law,
     // 2026-08-18: "כשהמוח מדבר זה חייב להשתיק מיידית מבחינת קוד את הפה" — and the MIND's voice
@@ -1210,7 +1311,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           speaking = false;
           responseActive = false;
           awaitingResponse = false;
-          if (mouthBuf.trim()) { rememberSpoken(mouthBuf); mouthBuf = ""; }   // echo-dedupe corpus
+          if (mouthBuf.trim()) { rememberSpoken(mouthBuf); mouthLast = mouthBuf.trim(); mouthBuf = ""; saveMindState(undefined, false); }   // echo-dedupe corpus + LANE 15 last-spoken
           // Now that the out-of-band MIND line has actually been spoken, record it in the
           // conversation so the mouth knows it was said (one answer, no repeats). Doing this
           // BEFORE speaking made the model skip the line as already-said.
