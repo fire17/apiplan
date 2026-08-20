@@ -155,6 +155,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // noise can't fire the IRREVERSIBLE hangup: a real "bye" needs real speech behind it.
   let speechStartedAt = 0;
   let lastSpeechMs = 0;
+  let userSpeaking = false;   // VAD says the human is mid-turn — MIND lines HOLD (stack law)
 
   let greeted = false;
   // Audio arrives far faster than it plays, so "the model stopped generating" is NOT
@@ -586,6 +587,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // the mouth NOW; graceful lets the current sentence land — and either way the moment
       // the MIND's audio is ready, sendInjected barges any mouth reply still on the air.
       // No agent has to know any of this; the code does it.
+      // THE STACK LAW (fire17, voice, 2026-08-20: "אם אתה רואה שאני מקליט, אל תתפרץ אליי
+      // בזמן דיבור... תשמור את הדברים שיש לך להגיד לי במחסנית"): while the human is
+      // mid-turn, the MIND NEVER barges — any mode. Lines are HELD in the queue and the
+      // hold is echoed, so the watching MIND can re-weave them against what he just said
+      // ({"drop_queue":true} + one fresh line). Enforced here so it works from any
+      // session — nobody has to remember. 120s failsafe in case speech_stopped is lost.
+      if (userSpeaking && Date.now() - speechStartedAt < 120000) {
+        injectQueue.push(text);
+        say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
+        return;
+      }
       if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
       if (!responseActive && !awaitingResponse && !mindBusy) { sendInjected(text); return; }
       injectQueue.push(text);
@@ -593,7 +605,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
     // ordered instead of firing every item at once (which the server would reject all-but-first).
-    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy) sendInjected(injectQueue.shift()!); };
+    const flushInjectQueue = () => { while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !userSpeaking) sendInjected(injectQueue.shift()!); };
     function startInjectLoop() {
       if (!injectPath) return;
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
@@ -640,6 +652,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         type: "message", role: "system",
                         content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: ${String(j.context)}` }] } }));
                       say("info", "context preloaded (silent)");
+                    } else if (j.drop_queue) {   // MIND re-weave: discard held/unspoken lines before sending a fresh one
+                      say("info", `queue dropped (${injectQueue.length} lines)`);
+                      injectQueue.length = 0;
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
@@ -720,6 +735,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
+          userSpeaking = true;   // stack law: MIND lines hold from this instant
           // Barge-in done RIGHT (R7): cancel generation, tell the server how much was
           // actually heard, and drop the cancelled response's still-in-flight deltas —
           // otherwise the model's context keeps words the user never heard, and ghost
@@ -744,6 +760,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "input_audio_buffer.speech_stopped":
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
+          userSpeaking = false;
+          // Held MIND lines flow once his turn lands — after the VAD auto-reply (if any)
+          // claims its slot, so the queue naturally waits for response.done instead.
+          if (injectQueue.length) setTimeout(flushInjectQueue, 1200);
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript?.trim()) say("you", ev.transcript.trim());
