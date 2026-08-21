@@ -792,13 +792,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // ── MECHANISTIC PAUSE (canon 013/014): SIGSTOP freezes every audible child inside one
   // audio callback — mouth stream, draining tails, and the MIND's file-playing narrator
   // alike — and SIGCONT resumes from the exact frozen sample. No kills, no respawns.
-  let playbackPaused = false;
   const pauseAll = () => {
-    playbackPaused = true; pace.paused = true;
+    pace.paused = true;
     for (const p of [player, ...draining, mindPlayer]) { try { p?.kill("SIGSTOP"); } catch {} }
   };
   const resumeAll = () => {
-    playbackPaused = false; pace.paused = false;
+    pace.paused = false;
     for (const p of [player, ...draining, mindPlayer]) { try { p?.kill("SIGCONT"); } catch {} }
     pacePump();
   };
