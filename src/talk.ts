@@ -632,7 +632,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // 2-minute caps-on message, 2026-08-20). Segments roll when the mouth starts a reply
   // (= the user-turn boundary per fire17), on mute flips, and at a 10-minute failsafe;
   // segments that never rise above the silence floor are deleted. APIPLAN_ARCHIVE=0 off.
-  const archOn = process.env.APIPLAN_ARCHIVE !== "0";
+  const archOn = process.env.APIPLAN_ARCHIVE !== "0" && process.env.LM_PRIVATE !== "1";
   // Privacy switch (fire17, voice, 2026-08-20): archive_mode "always" (default) keeps
   // every frame even while muted; "caps-only" archives only what the model can hear.
   // Read live from settings.json (2s cache) so the dashboard toggle applies instantly.
@@ -644,6 +644,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       try { archMode = JSON.parse(fs.readFileSync(`${process.env.HOME}/.livemind/settings.json`, "utf8")).archive_mode || "always"; }
       catch { archMode = "always"; }
     }
+    if (archMode === "off") return false;   // PRIVATE (canon 019): the app switch stops every archive write, live
     return archMode !== "caps-only" || !micMuted;
   };
   const archDir = `${process.env.HOME}/.livemind/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
@@ -1571,6 +1572,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           lastLoud = b; loudMs += 50;
         }
         if (loudMs < 200) { say("info", `overlap recovery skipped — nothing above the leak bar (${loudMs}ms loud${tailLoudMs > 0 ? `, ${tailLoudMs}ms isolated in the ${TAIL_MS}ms teardown tail — held`: ""})`); return; }
+        if (!archOn || !archAllowed()) { say("info", "overlap recovery skipped — archive off (private mode leaves no WAV to resend from)"); return; }
         const from = Math.max(0, (firstLoud - 6) * BLK);
         const to = Math.min(got, (lastLoud + 7) * BLK);
         const slice = buf.subarray(from, to);
