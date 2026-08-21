@@ -740,6 +740,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  speaker, and that tail is what the MIND used to talk over. */
   const stopPlayer = () => {
     const hadLive = !!player;
+    const droppedMs = paceClear();          // canon 013: the un-written queue dies FIRST, so the
+    pace.paused = false;                    // kill below only ever silences ≤ LOOKAHEAD ms of pipe
     try { player?.kill(9); } catch {}
     player = null;
     const n = draining.size;
@@ -747,11 +749,59 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     draining.clear();
     // Evidence in the log that the mouth was actually silenced — `n` is the tail that used to
     // keep playing under the MIND's voice (unreachable before the draining set existed).
-    if (hadLive || n) say("info", `mouth silenced (live=${hadLive ? 1 : 0} draining-tail=${n})`);
+    if (hadLive || n || droppedMs) say("info", `mouth silenced (live=${hadLive ? 1 : 0} draining-tail=${n}${droppedMs ? ` queued-dropped=${droppedMs}ms` : ""})`);
   };
   // Note: the player is spawned lazily on the first audio byte (below), NOT pre-spawned —
   // ffplay with -autoexit on a still-empty stdin exits immediately (code 123). The
   // low-latency flags on speakerCommand() still cut real audible latency once it starts.
+
+  // ── PACED PLAYER (fire17, typed, canon 013: "a built in blazingly fast responsive media
+  // player... instead of sigkills lets mechanistically pause") ────────────────────────────
+  // The engine no longer dumps a whole reply into ffplay's buffer ahead of realtime: chunks
+  // queue HERE, and a 20ms pump writes only enough to stay LOOKAHEAD ms ahead of the wall
+  // clock. Every control (pause / clear / kill) is therefore felt within that window —
+  // ffplay can never be holding seconds of future audio again. The schedule clocks
+  // (queueAudio/playingUntil/itemQueuedMs) still advance at ENQUEUE time, unchanged: they
+  // describe what is scheduled, not what has left the pipe.
+  const PACE_LOOKAHEAD_MS = Math.max(80, Number(process.env.LM_PACE_LOOKAHEAD_MS) || 240);
+  const pace = { q: [] as { pcm: Buffer; ms: number }[], aheadUntil: 0, timer: null as any, paused: false, endPending: false };
+  const pacePump = () => {
+    if (pace.timer) return;
+    pace.timer = setInterval(() => {
+      if (pace.paused) return;
+      const now = Date.now();
+      if (pace.aheadUntil < now) pace.aheadUntil = now;
+      while (pace.q.length && pace.aheadUntil - now < PACE_LOOKAHEAD_MS) {
+        const c = pace.q.shift()!;
+        if (!player || player.exitCode !== null) startPlayer();   // spawn at WRITE time — an empty-stdin ffplay exits 123
+        try { player!.stdin!.write(c.pcm); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
+        pace.aheadUntil += c.ms;
+      }
+      if (!pace.q.length) {
+        if (pace.endPending) { pace.endPending = false; endPlayer(); }
+        if (pace.aheadUntil <= Date.now()) { clearInterval(pace.timer); pace.timer = null; }
+      }
+    }, 20);
+  };
+  /** Enqueue one already-panned/trimmed PCM chunk with its MONO duration. */
+  const paceFeed = (pcm: Buffer, ms: number) => { pace.q.push({ pcm, ms }); pacePump(); };
+  /** End-of-reply: close the player's stdin only after the queue has drained through it. */
+  const paceEnd = () => { pace.endPending = true; pacePump(); };
+  /** Drop everything not yet written; returns the dropped milliseconds (for the log). */
+  const paceClear = () => { const n = pace.q.reduce((s, c) => s + c.ms, 0); pace.q.length = 0; pace.endPending = false; pace.aheadUntil = 0; return Math.round(n); };
+  // ── MECHANISTIC PAUSE (canon 013/014): SIGSTOP freezes every audible child inside one
+  // audio callback — mouth stream, draining tails, and the MIND's file-playing narrator
+  // alike — and SIGCONT resumes from the exact frozen sample. No kills, no respawns.
+  let playbackPaused = false;
+  const pauseAll = () => {
+    playbackPaused = true; pace.paused = true;
+    for (const p of [player, ...draining, mindPlayer]) { try { p?.kill("SIGSTOP"); } catch {} }
+  };
+  const resumeAll = () => {
+    playbackPaused = false; pace.paused = false;
+    for (const p of [player, ...draining, mindPlayer]) { try { p?.kill("SIGCONT"); } catch {} }
+    pacePump();
+  };
 
   let micProc: ReturnType<typeof Bun.spawn> | null = null;
   let closed = false;
@@ -2370,16 +2420,50 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     //  * GRACE / TAIL / 1s refractory — the cut stays bound to the MOUTH's own timeline, which
     //    a VP event knows nothing about, and our own teardown can never re-trigger it.
     //  * the arming gate lives in aec.ts and is re-checked in onVpBarge before we ever get here.
+    // CANON 065 (call 88608, his verbatim: "I still heard you speaking after I kept talking...
+    // the mouth like double responded"): the original single-branch gate `!responseActive`
+    // silently ate every barge landing in the AUDIBLE DRAIN TAIL — audio outlives its response
+    // (silenceMouth's own comment names the same disease), so on a long utterance the local cut
+    // never fired, the tail kept playing, and the server's fresh answer to his barge played OVER
+    // it = his double-response. Two changes, per his order ("a very simple, clean fix"):
+    //   1. TAIL BRANCH — generation done but still audible: kill the tail (stopPlayer is
+    //      already SIGKILL + draining-set), same refractory + tail gate. No new detection,
+    //      no FP surface: same armed events, convergence-arming untouched.
+    //   2. OBSERVABILITY — call 88608 had ZERO log traces of 12 speaking turns' worth of
+    //      events because every gate returned silently. Each drop now names its gate once
+    //      per second, so the next trial diagnoses itself.
+    let vpDropLogAt = 0;
+    const vpDrop = (gate: string) => {
+      const now = Date.now();
+      if (now - vpDropLogAt < 1000) return;
+      vpDropLogAt = now;
+      say("info", `vp barge dropped at gate [${gate}] — peak ${Math.round(vpEv?.peak ?? 0)}, ${Math.round(vpEv?.voiced_ms ?? 0)}ms voiced`,
+        { vp_barge_dropped: true, gate, peak: Math.round(vpEv?.peak ?? 0) });
+    };
     vpMouthCut = () => {
-      if (closed || !bargeOn || !speaking || !responseActive) return;
-      if (!stillAudible() || mindPlayer || mindBusy || mindResponse) return;
-      if (MOUTH_BARGE_PEAK <= 0 || !mouthBargeArmed) return;
-      if (Date.now() < mouthBargeTailUntil || Date.now() - lastMouthBargeAt <= 1000) return;
-      const played = itemFirstDeltaAt ? Date.now() - itemFirstDeltaAt : 0;
-      if (played < MOUTH_BARGE_GRACE || played > itemQueuedMs + MOUTH_BARGE_TAIL) return;
-      say("info", `mouth cut by VP barge${micMuted ? " while the mic is MUTED (caps off — his voice still stops the mouth; nothing he said was sent)" : ""} — peak ${Math.round(vpEv?.peak ?? 0)}, ${Math.round(vpEv?.voiced_ms ?? 0)}ms voiced on the cleaned signal`,
-        { vp_mouth_cut: true, muted: micMuted || undefined, peak: Math.round(vpEv?.peak ?? 0), voiced_ms: Math.round(vpEv?.voiced_ms ?? 0) });
-      duplexMouthCut("vp");
+      if (closed || !bargeOn) return;
+      if (mindPlayer || mindBusy || mindResponse) return vpDrop("mind-owns-the-floor");
+      if (MOUTH_BARGE_PEAK <= 0 || !mouthBargeArmed) return vpDrop("self-disarm-belt");
+      const now = Date.now();
+      if (now < mouthBargeTailUntil || now - lastMouthBargeAt <= 1000) return vpDrop("refractory");
+      if (speaking && responseActive) {
+        if (!stillAudible()) return vpDrop("not-audible");
+        const played = itemFirstDeltaAt ? now - itemFirstDeltaAt : 0;
+        if (played < MOUTH_BARGE_GRACE) return vpDrop("grace");
+        if (played > itemQueuedMs + MOUTH_BARGE_TAIL) return vpDrop("item-clock-expired");
+        say("info", `mouth cut by VP barge${micMuted ? " while the mic is MUTED (caps off — his voice still stops the mouth; nothing he said was sent)" : ""} — peak ${Math.round(vpEv?.peak ?? 0)}, ${Math.round(vpEv?.voiced_ms ?? 0)}ms voiced on the cleaned signal`,
+          { vp_mouth_cut: true, muted: micMuted || undefined, peak: Math.round(vpEv?.peak ?? 0), voiced_ms: Math.round(vpEv?.voiced_ms ?? 0) });
+        duplexMouthCut("vp");
+        return;
+      }
+      // TAIL BRANCH: nothing generating, but the speaker is still playing queued audio (live
+      // player or draining hand-offs). His voice must stop it NOW — this was the leak he heard.
+      if (!(stillAudible() || draining.size)) return vpDrop("silent");
+      say("info", `mouth TAIL cut by VP barge — audio had outlived its response (canon 065); peak ${Math.round(vpEv?.peak ?? 0)}, ${Math.round(vpEv?.voiced_ms ?? 0)}ms voiced`,
+        { vp_mouth_cut: true, tail: true, peak: Math.round(vpEv?.peak ?? 0), voiced_ms: Math.round(vpEv?.voiced_ms ?? 0) });
+      stopPlayer(); speaking = false; playingUntil = 0;
+      lastMouthBargeAt = now;
+      mouthBargeTailUntil = now + MOUTH_BARGE_TAIL;
     };
     const injectContext = (text: string, mode: string) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
@@ -2502,6 +2586,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       suppressRestoreAt = 0;                          // MIND's explicit choice outranks a pending overlap-recovery restore
                       suppressAuto = !j.autospeak;
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
+                    } else if (typeof j.pause === "boolean" || j.resume === true) {
+                      // CANON 013/014 (fire17, typed): mechanistic pause of every audible agent
+                      // voice — mouth stream, draining tails, MIND narrator — via SIGSTOP/SIGCONT.
+                      // {"pause":true} holds, {"pause":false} or {"resume":true} releases. The ESC
+                      // key (lm-ptt) writes exactly these lines.
+                      const hold = j.pause === true;
+                      if (hold) pauseAll(); else resumeAll();
+                      say("info", hold ? "playback paused (mechanistic hold — ESC/resume releases)" : "playback resumed");
                     } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
                       say("info", "pong");
                     } else if (j.context) {
@@ -2824,17 +2916,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.output_audio.delta":
         case "response.audio.delta": {
           if (!ev.delta || !prevRespId || (ev.response_id && ev.response_id !== prevRespId)) return;
-          if (!player || player.exitCode !== null) startPlayer();
           const buf = Buffer.from(ev.delta, "base64");
           queueAudio(buf.length);
-          try { player!.stdin!.write(stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth")); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
+          paceFeed(stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth"), (buf.length / 2 / RATE) * 1000);   // canon 013
           return;
         }
         case "response.done":
           // `speaking` belongs to the PROCESS, not to the socket: the live handler's response.done
           // will never fire for this reply, so if it is not cleared here the flag latches true and
           // the NEXT rotation's quiet gate can never open again.
-          if (prevRespId && ev.response?.id === prevRespId) { prevRespId = null; speaking = false; endPlayer(); rotDrainRelease(); }
+          if (prevRespId && ev.response?.id === prevRespId) { prevRespId = null; speaking = false; paceEnd(); rotDrainRelease(); }
           return;
         case "conversation.item.input_audio_transcription.completed": {
           const t = ev.transcript?.trim(); if (!t) return;
@@ -3774,7 +3865,6 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               speakerCheck(); warnIfUnheard("mouth");                  // LANE 18: async, never blocks the reply
             }
             speaking = true;
-            if (!player || player.exitCode !== null) startPlayer();   // dead/absent → fresh player
             if (!itemFirstDeltaAt) itemFirstDeltaAt = Date.now();
             if (!firstAudioReported) {
               firstAudioReported = true;
@@ -3791,7 +3881,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // The voice field is applied HERE, per chunk — so a knob edit he makes mid-sentence
             // is heard in the very next chunk. No filter graph, no restart, no added latency.
             const pcm = stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth");
-            try { player!.stdin!.write(pcm); player!.stdin!.flush?.(); } catch { playingUntil = 0; }
+            paceFeed(pcm, (buf.length / 2 / RATE) * 1000);   // canon 013: paced, never dumped
           }
           break;
         case "response.output_audio_transcript.done":
@@ -3870,8 +3960,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               type: "message", role: "assistant", content: [{ type: "output_text", text: pendingMindHistory }] } })); } catch {}
             pendingMindHistory = "";
           }
-          endPlayer();
-          // Graceful injects wait for PLAYBACK to finish, not just generation. endPlayer lets
+          paceEnd();
+          // Graceful injects wait for PLAYBACK to finish, not just generation. paceEnd lets
           // ffplay keep draining its buffer for `playingUntil - now`; firing the next
           // response.create now would spawn a second player over that tail — two voices at once.
           // Delay the flush until the buffer has drained so the injected reply starts clean.
