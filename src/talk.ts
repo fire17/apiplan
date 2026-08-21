@@ -1878,9 +1878,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // DISCARD the record so it can never attach itself to his next real turn.
                 if (MOUTH_BARGE_CONFIRM > 0) {
                   const seenAt = speechStartedAt; const resendAt = lastResendAt;
+                  // CAPS-(a) SELF-CONFIRM (reverify A2.4): same rule as the duplex belt below —
+                  // a muted-mic cut cannot be confirmed by channels the mute itself closes.
+                  const mutedAtCut = micMuted;
                   setTimeout(() => {
                     if (closed || mb.confirmed !== null) return;
-                    mb.confirmed = mb.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
+                    mb.confirmed = mutedAtCut || mb.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
                     if (mb.confirmed) { mouthBargeUnconfirmed = 0; return; }
                     // Second unconfirmed cut in a row = this rig's leak is clearing the bar.
                     // Stand the detector down for the rest of the call instead of cutting every
@@ -2331,9 +2334,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // streak counter is SHARED with the local belt on purpose: both count the same thing.
         if (MOUTH_BARGE_CONFIRM > 0) {
           const seenAt = speechStartedAt; const resendAt = lastResendAt;
+          // CAPS-(a) SELF-CONFIRM (reverify A2.4): a muted-mic cut closes every confirmation
+          // channel by construction — treating it as unconfirmed would disarm duplex on his
+          // second caps-off barge. The mute state at cut time IS the confirmation.
+          const mutedAtCut = micMuted;
           setTimeout(() => {
             if (closed || mbD.confirmed !== null) return;
-            mbD.confirmed = mbD.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
+            mbD.confirmed = mutedAtCut || mbD.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
             if (mbD.confirmed) { mouthBargeUnconfirmed = 0; return; }
             if (++mouthBargeUnconfirmed >= 2 && bargeOn) {
               bargeOn = false;
