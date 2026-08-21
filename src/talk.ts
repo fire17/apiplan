@@ -1562,7 +1562,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // exactly what the capture device produced, as it always has — minus our echo.
           // Nothing of HIS is filtered: VPIO cancels the far-end reference, never the
           // near-end talker (his cleaned speech measured 21101-27223 peak on this rig).
-          if (value?.length) vp?.note(value);                  // watchdog: liveness + all-zero (TCC) detector
+          // WATCHDOG SOURCE GUARD (live-trial defect, call 40028): note() feeds the VP
+          // liveness watchdog, so it must see ONLY the VP child's own frames. During the
+          // never-deaf handover window this pump carries FFMPEG — its first frame (~210ms)
+          // falsely marked the capture "live" and latched handedOver, arming the 200ms
+          // dead-watchdog against a child that legitimately takes ~3.5s to first audio
+          // (isolated repro: real first PCM at +3527ms). One ffmpeg jitter gap later,
+          // duplex was DISARMED at call start. Frames count only when this proc IS the child.
+          if (value?.length && proc === vp?.proc) vp.note(value); // watchdog: liveness + all-zero (TCC) detector
           // ── STUCK-LATCH TIMEOUT / RE-LATCH (bars and calibration above) ────────────
           // Rides the frames we already have, ahead of every drop below — no timer, no poll,
           // and framePeak runs only while a latch is actually open. Muted frames are skipped:
