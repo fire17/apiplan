@@ -10,6 +10,7 @@ import { dirname, basename } from "node:path";
 import { unlinkSync } from "node:fs";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
+import { VpCapture, type VpEvent } from "./aec.ts";
 
 const RATE = 24000;
 
@@ -86,7 +87,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // The LOCAL mouth-barge (canon 027, further down) is untouched by this: it is the
   // no-duplex path and it never even ran in 31192 (`stillAudible() && !o.barge` skipped it),
   // which is why that call's log carries zero "mouth interrupted" lines.
-  const bargeOn = !!o.barge && process.env.APIPLAN_BARGE_OK === "1";
+  // `let`, not `const`: the self-disarm belt below retreats a duplex call to half-duplex
+  // when its cuts stop being followed by anything he said (redteam S3).
+  let bargeOn = !!o.barge && process.env.APIPLAN_BARGE_OK === "1";
   const c = openai.creds();
   const model = o.model || process.env.APIPLAN_REALTIME_MODEL || "gpt-realtime";
   // gpt-4o-mini-transcribe hallucinates far less than whisper-1 on near-silence; override
@@ -752,6 +755,62 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
 
   let micProc: ReturnType<typeof Bun.spawn> | null = null;
   let closed = false;
+  // ── ARCH-A BARGE-IN (LM_BARGE_VP=1) — OFF by default, and OFF means byte-identical ──
+  // The capture child (aec.ts) IS the microphone: macOS VoiceProcessingIO cancels our own
+  // loudspeaker inside CoreAudio, before the sample is captured, and a Silero gate on that
+  // CLEANED signal decides what is a barge. Measured on this rig 2026-08-21 (three rounds of
+  // three, narration through the speakers, cleaned peaks 21101/27223/21926 at prob 0.95-0.998).
+  // WHAT STAYS IN THE ENGINE: the arming (below), the refractory, and every cut decision —
+  // the child scores voice, the engine decides what a barge MEANS, on machinery that exists.
+  let vp: VpCapture | null = null;
+  let vpDown = false;              // it failed once — this call never tries it again
+  let vpBargeAt = 0;               // last child event that PASSED the arming gate below
+  let vpEv: VpEvent | null = null; // that event, for the record and the log
+  // FRESHNESS, not arming — the two were one env var in v2 and they are different jobs.
+  // LM_BARGE_VP_ARM_MS now names the CONVERGENCE warmup and lives in aec.ts (default 2500ms);
+  // this is the much shorter window in which an event may still influence a frame decision.
+  const VP_FRESH_MS = Math.max(100, Number(process.env.LM_BARGE_VP_FRESH_MS) || 800);
+  /** A barge is "fresh" for one short window — long enough for the next mic frame to reach
+   *  the detectors below, short enough that a stale event can never cut a later reply. */
+  const vpFresh = () => vpBargeAt > 0 && Date.now() - vpBargeAt < VP_FRESH_MS;
+  /** The MOUTH's event-driven cut, wired inside the socket scope (it needs the mouth's own
+   *  state). DEFECT 2.2: in duplex the frame-loop disjunct `(stillAudible() && !bargeOn)` is
+   *  false by construction, so with caps OFF nothing cut a speaking mouth at all — his own
+   *  acceptance bar (canon 059, "repeated (incl. caps-off)") could not have passed. */
+  let vpMouthCut: (() => void) | null = null;
+  /** ARMING (the engine's half of the gate, redteam P1-6): evidence is banked ONLY while our
+   *  own audio is actually in the air. A voice in a quiet room is not a barge — it is a turn,
+   *  and the normal path already handles it. This is also the reference cross-check arch A
+   *  cannot get from the canceller: the engine knows exactly when it is rendering. */
+  const onVpBarge = (e: VpEvent) => {
+    if (closed || vpDown) return;
+    // CONVERGENCE ARMING belt (aec.ts owns the gate; this is the second lock on the same door).
+    if (!vp?.armed) return;
+    if (!(stillAudible() || mindPlayer)) return;
+    vpBargeAt = Date.now(); vpEv = e;
+    // CAPS DECISION (a) FOR THE MOUTH, event-driven. Everything else in this design rides a mic
+    // FRAME, and in duplex the mouth's frame branch never runs — so this is the one cut that has
+    // to be driven by the event itself. It touches PLAYBACK and the model's own item; it sends
+    // no audio anywhere, so the absolute invariant (nothing gated reaches the model) is intact.
+    try { vpMouthCut?.(); } catch { /* a barge must never break the call */ }
+  };
+  /** FAIL-SAFE (P0-5). Any failure — missing binary, TCC denial, zero frames, a dead child —
+   *  reverts to the ordinary ffmpeg mic LIVE: the child is killed, its stdout ends, and the
+   *  mic supervisor respawns micCommand() on its next turn. The call never goes deaf. */
+  const vpRevert = (why: string) => {
+    vpDown = true; vp = null; vpBargeAt = 0; vpEv = null;
+    // DEFECT 4.2 — THE FOUNDING INVARIANT. The mic path reverts to ffmpeg correctly, but the
+    // CALL did not: duplex outlived the canceller, leaving his frames flowing to a server VAD
+    // that is listening to our own speakers. That is exactly the configuration of call 31192
+    // (40/40 self-cuts). Duplex exists ONLY because arch A cancels the leak at capture; when the
+    // canceller dies, duplex must die with it. Half-duplex brings its own mic gate, local barge
+    // and overlap recovery, so nothing of his is lost — the mouth merely finishes its sentence.
+    if (bargeOn) {
+      bargeOn = false;
+      say("info", `vp capture down (${why}) — duplex DISARMED, full retreat to half-duplex for the rest of this call (duplex with no canceller IS call 31192; restart to re-arm)`,
+        { duplex_disarmed: true, reason: "vp_down", why });
+    }
+  };
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
 
@@ -989,9 +1048,57 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     async function micLoop() {
       let tries = 0;
       while (!closed) {
-        micProc = Bun.spawn(mic, { stdout: "pipe", stderr: "ignore" });
+        // ARCH A: with LM_BARGE_VP=1 the VPIO child replaces ffmpeg entirely — the OS can
+        // only cancel audio it captured itself, so the canceller has to BE the microphone.
+        // vpDown (set by the fail-safe) makes this same supervisor take ffmpeg back, live.
+        // SPAWN-ONCE (aecmic2's own mitigation note): the helper recovers from an AirPods/BT or
+        // device-format switch BY ITSELF (measured: retap + converter rebuild, 1.5-2.3s). So the
+        // child is started once per call and kept across mic respawns — respawning it would pay
+        // the ~3.5s activation cost again and fight the device for the very same unit.
+        if (vp?.down) vp = null;                 // the fail-safe already ran (or is one tick away)
+        if (!vp && !vpDown) vp = VpCapture.start(RATE, { onBarge: onVpBarge, onDown: vpRevert, log: say });
         const startedAt = Date.now();
-        await pumpMic(micProc);
+        let firstVp: Uint8Array | null = null;
+        if (vp && !vp.handedOver) {
+          // NEVER-DEAF HANDOVER (defect 3.4). The VPIO child is measured at +3 656ms to its
+          // FIRST buffer on this rig, before pipeA's python/numpy/onnxruntime import — and
+          // micLoop re-enters this on every mic respawn and every rotation. Handing it the mic
+          // immediately would leave the call deaf for that whole window, with nothing captured
+          // and therefore NOTHING ARCHIVED: a direct never-lose regression, invisible in the log.
+          // So both run: ffmpeg carries the microphone exactly as today (live in ~150ms) until
+          // the VP child's first cleaned byte lands, then the mic swaps over mid-flight and
+          // ffmpeg is killed. aec.ts reads that first byte and hands it back, so the switch
+          // drops nothing; the small overlap it can cost is a few tens of ms of DOUBLE-archived
+          // audio, which is the safe direction (a duplicate is recoverable, a gap is not).
+          const ff = Bun.spawn(mic, { stdout: "pipe", stderr: "ignore" });
+          micProc = ff;
+          vp.whenFirstByte.then((v) => {
+            if (!v || closed) return;
+            firstVp = v;
+            say("info", `mic handover: ffmpeg → VPIO cleaned capture after ${Date.now() - startedAt}ms — the activation window was NOT deaf and every frame of it is archived`,
+              { vp_handover: true, ms: Date.now() - startedAt });
+            try { ff.kill(9); } catch {}
+          }).catch(() => {});
+          await pumpMic(ff);
+          // ffmpeg died for a reason OTHER than the handover (device change, sleep/wake): fall
+          // through to the ordinary backoff below and re-enter with the SAME vp child alive.
+          if (closed) return;
+          if (!firstVp) {
+            if (ws.readyState !== WebSocket.OPEN && !rotHold()) return;
+            if (Date.now() - startedAt > 10000) tries = 0;
+            if (++tries > 6) { say("info", "microphone gone — ending call"); done({ reason: "mic-lost" }); return; }
+            say("info", `microphone restarting (try ${tries})`);
+            await Bun.sleep(Math.min(250 * 2 ** (tries - 1), 4000));
+            continue;
+          }
+        }
+        // `vp` can be nulled by the fail-safe between the handover and this line, so the VP
+        // stream is taken ONLY while the child is still the live one — otherwise ffmpeg, today.
+        const onVp = !!vp && (vp.handedOver || !!firstVp);
+        micProc = onVp ? vp!.proc : Bun.spawn(mic, { stdout: "pipe", stderr: "ignore" });
+        // The handover chunk is real microphone audio either way — it is handed to whichever
+        // pump runs, so it is archived and sent even if the VP child died in the same instant.
+        await pumpMic(micProc, firstVp ?? undefined);
         // ROTATION: a socket that is BETWEEN sessions is not a dead call. Keeping the mic child
         // alive across a handover is the entire reason the successor has no deaf window — kill it
         // here and the fix would manufacture the very hole it exists to remove.
@@ -1438,13 +1545,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       } catch { /* recovery must never break the call */ }
       finally { recovering = false; }
     }
-    async function pumpMic(proc: ReturnType<typeof Bun.spawn>) {
+    /** `first` is the handover chunk aec.ts already read off the VP child (never-lose: it is
+     *  processed here BEFORE anything else, so the switch from ffmpeg loses not one frame). */
+    async function pumpMic(proc: ReturnType<typeof Bun.spawn>, first?: Uint8Array) {
       const reader = proc.stdout.getReader();
+      let pending: Uint8Array | undefined = first;
       try {
         while (true) {
-          const { done: rdone, value } = await reader.read();
-          if (rdone) break;
+          let value: Uint8Array | undefined;
+          if (pending) { value = pending; pending = undefined; }
+          else { const r = await reader.read(); if (r.done) break; value = r.value; }
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
+          // NEVER-LOSE, UNDER ARCH A — read this before trusting an archive from a VP call:
+          // these bytes ARE the microphone, so "raw" here means the VPIO capture. macOS
+          // cancelled OUR OWN loudspeaker before the sample existed, so the archive holds
+          // exactly what the capture device produced, as it always has — minus our echo.
+          // Nothing of HIS is filtered: VPIO cancels the far-end reference, never the
+          // near-end talker (his cleaned speech measured 21101-27223 peak on this rig).
+          if (value?.length) vp?.note(value);                  // watchdog: liveness + all-zero (TCC) detector
           // ── STUCK-LATCH TIMEOUT / RE-LATCH (bars and calibration above) ────────────
           // Rides the frames we already have, ahead of every drop below — no timer, no poll,
           // and framePeak runs only while a latch is actually open. Muted frames are skipped:
@@ -1484,7 +1602,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               }
             }
           }
-          if (micMuted) {                                      // muted: drop mic frames so the model never hears them
+          // CAPS DECISION (a). A confident VP barge cuts PLAYBACK even with the mic muted —
+          // he expects caps-off to still stop the voice — while WHAT REACHES THE MODEL keeps
+          // every gate it has today. The frame is let past the mute gate ONLY when one of the
+          // two playback branches below will take it, and each of those ends in `continue`, so
+          // a muted frame still cannot reach input_audio_buffer.append. Their overlap-capture
+          // sites are muted-guarded for the same reason (muted audio is never resent either).
+          const vpCut = vpFresh() && ((!!mindPlayer && !!mindLine) || (stillAudible() && !bargeOn));
+          // DEFECT 2.3. The mute body does THREE jobs, and only one of them is "drop the frame".
+          // Letting a vpCut frame skip the whole body silenced the "speaking while muted" warning
+          // in exactly the window he is most likely to talk (it is the fix for the 13:37
+          // muted-deafness incident quoted below) and weakened the stale-window discard. So the two
+          // protections run for EVERY muted frame; only the `continue` stays behind the vpCut test.
+          if (micMuted) {
             // A mute flip rolls the archive segment — a pending overlap window into the old
             // segment is no longer a live turn (verified defect: a window resent 4.5 min
             // later as fresh speech). Discard it; the audio itself stays archived.
@@ -1498,7 +1628,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 say("info", "speaking while muted — the mouth cannot hear you");
               }
             }
-            continue;
+            if (!vpCut) continue;                              // muted: drop mic frames so the model never hears them
           }
           // MIND narrator playing: frames NEVER flow in ANY mode (o.barge only trades off
           // the MOUTH's playback — the narrator's audio must not reach the model even with
@@ -1509,7 +1639,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // the mic stay shut for HD_TAIL ms AFTER the player exits — the ffplay spin-up bias
             // means the audio is still in the air when playingUntil has already expired.
             duckFrame(value?.length ? (value.length / 2 / RATE) * 1000 : 0, "mind");
-            if (value?.length && archFd >= 0) {
+            if (value?.length && archFd >= 0 && !micMuted) {   // caps decision (a): a MUTED frame never opens a window — muted audio is never resent
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); }
               ovSrc = "mind";   // OUTSIDE the open-guard: MIND is the stricter label and always wins —
                                 // a window opened under the mouth that then carries narrator leak must
@@ -1521,9 +1651,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               const fMs = (value.length / 2 / RATE) * 1000;
               // Leaky accumulator — real speech dips below any bar mid-word; a strict
               // consecutive rule never accumulates 250ms (measured).
-              bargeMs = framePeak(value) >= scaleBar(BARGE_PEAK) ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
-              if (bargeMs >= BARGE_SUSTAIN && Date.now() - lastBargeAt > 1000) {
-                bargeMs = 0; lastBargeAt = Date.now();
+              const pkM = framePeak(value);
+              bargeMs = pkM >= scaleBar(BARGE_PEAK) ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
+              // DEFECT 5.1 — THE NARRATOR JOIN IS AN **AND**, NEVER AN OR. v2 let a VP event
+              // fire this cut with the engine's own level bar bypassed; the sibling lane measured
+              // three events during a live narrator line at peaks 19079 / 4469 / 8372, prob
+              // 0.97-1.0, and named the 4.5k/8.4k ones narrator-LEAK candidates — VPIO may not
+              // fully suppress a loud narrator through this path, and the child's VAD cannot tell
+              // that leak from him (his own quiet-end barge measured 2 574: level does not
+              // separate them). So the engine's detector keeps BOTH of its legs — the leaky
+              // sustain accumulator AND the level bar — and the VP event is only ever an extra
+              // requirement on top when the child is live. When it is off, this line is HEAD's,
+              // character for character, and the loved-state narrator barge is untouched.
+              // Worst case therefore stays the engine's stated one: a leaked narrator can at most
+              // cut the NARRATOR ITSELF (which ends the leak), never the mouth mid-reply, and it
+              // never sends gated audio. Re-fit for VPIO levels with APIPLAN_MIND_BARGE_PEAK.
+              const vpNarrOk = !vp || (vpFresh() && pkM >= scaleBar(BARGE_PEAK));
+              if (bargeMs >= BARGE_SUSTAIN && vpNarrOk && Date.now() - lastBargeAt > 1000) {
+                bargeMs = 0; vpBargeAt = 0; lastBargeAt = Date.now();
                 const L = mindLine;
                 // startAt is biased by ffplay spin-up (~250ms measured) and the cut rounds
                 // DOWN to a word boundary — never record words he did not hear as spoken.
@@ -1568,6 +1713,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               mouthBargeMs = framePeak(value) >= MOUTH_BARGE_PEAK ? mouthBargeMs + fMs : Math.max(0, mouthBargeMs - fMs);
               if (mouthBargeMs >= MOUTH_BARGE_SUSTAIN) bargeEvidenceAt = Date.now();
             }
+            // ARCH A: a VP barge IS the local proof the self-cut guard at speech_started
+            // demands — it was scored on the CLEANED signal, so by construction it cannot be
+            // our own speakers. This is the evidence call 31192 never had.
+            if (vpFresh()) bargeEvidenceAt = Date.now();
           }
           if (stillAudible() && !bargeOn) {
             // HALF-DUPLEX: the mouth's own audio, already refused by this branch at 099e723 —
@@ -1578,7 +1727,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // it disappears the instant a barge zeroes that clock. This call only labels and
             // counts the window for the forensic line.
             duckFrame(value?.length ? (value.length / 2 / RATE) * 1000 : 0, "mouth");
-            if (value?.length && archFd >= 0) {                // overlap capture: his words during mouth playback
+            if (value?.length && archFd >= 0 && !micMuted) {   // overlap capture: his words during mouth playback (never from a MUTED frame — caps decision (a))
               if (ovStart < 0) { ovStart = archBytes - value.length; ovPath = archPath; ovAt = Date.now(); ovSrc = "mouth"; }
               if (ovPath === archPath) ovEnd = archBytes;      // segment rolled mid-window → keep what we had
             }
@@ -1621,14 +1770,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // drain) played never exceeds what we queued. Past that, whatever still gates the
               // mic is not the mouth — e.g. the ~250ms of MIND gate slack after the narrator's
               // player exits — and a cut there would truncate a finished item for nothing.
-              if (mouthBargeMs >= MOUTH_BARGE_SUSTAIN && played >= MOUTH_BARGE_GRACE
+              // ARCH-A JOIN (half-duplex mouth): a VP barge — Silero on the VPIO-cleaned signal,
+              // sustained on the child's own gate — stands in for this accumulator's SUSTAIN leg,
+              // and the level leg stays in the AND for the same reason as the MIND join above:
+              // the child scores VOICE, the engine still demands the room was LOUD on this frame.
+              // EVERYTHING below then runs unchanged: the cut, the truncate, the kill tail, the
+              // mouthBarge record, saveMindState and the UNCONFIRMED self-report. No new cut path
+              // was written for arch A. GRACE and TAIL still apply: they bind the cut to the
+              // MOUTH's own timeline, which a VP event knows nothing about.
+              // HONEST SCOPE (defect 6.3, resume-design G-C): what is delivered here is the CUT
+              // and its record. The three-way "mouth-cut resume" assembly can now FIRE — but its
+              // release guard (`!responseActive && !awaitingResponse && !mindBusy && !prevRespId`)
+              // is usually already false in duplex by the time his transcript lands, so the
+              // continuation is LOGGED and not spoken. That is named debt, not a claim; the
+              // resume path below now says so out loud instead of going quiet.
+              if ((mouthBargeMs >= MOUTH_BARGE_SUSTAIN || (vpFresh() && pk >= mouthBar)) && played >= MOUTH_BARGE_GRACE
                   && played <= itemQueuedMs + MOUTH_BARGE_TAIL) {
                 // REFRACTORY. Energy accumulated while the refractory blocks must NOT bank for
                 // the next cut, or the second cut fires the instant the second expires with no
                 // sustain of its own — reset and keep listening.
-                if (Date.now() - lastMouthBargeAt <= 1000) { mouthBargeMs = 0; continue; }
-                const sustained = Math.round(mouthBargeMs);
-                mouthBargeMs = 0; lastMouthBargeAt = Date.now();
+                if (Date.now() - lastMouthBargeAt <= 1000) { mouthBargeMs = 0; vpBargeAt = 0; continue; }
+                // With a VP barge the sustain that fired is the CHILD's (voiced ms on the
+                // cleaned signal), not this accumulator's — record that number, never a zero.
+                const sustained = Math.round(mouthBargeMs || (vpEv?.voiced_ms ?? 0));
+                mouthBargeMs = 0; vpBargeAt = 0; lastMouthBargeAt = Date.now();
                 // HEARD-MS: the same clock the ws barge path uses (first audio delta vs the audio
                 // handed to the player), MINUS the player spin-up — ffplay is audible ~200-300ms
                 // after the first delta arrives (the engine's own APIPLAN_MIND_START_MS exists to
@@ -1736,6 +1901,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
             continue;
           }
+          // BELT (caps decision (a)). A muted frame is let past the gate above ONLY to reach
+          // the two playback branches, and both end in `continue`. If one of their predicates
+          // flipped between the two evaluations (playingUntil expiring mid-frame is a real
+          // race), the frame stops HERE: a muted frame can never reach the model, ever, by any
+          // path. Unreachable when the mute gate is doing its ordinary job.
+          if (micMuted) continue;
           bargeMs = 0;
           // HALF-DUPLEX TAIL. Our own audio stopped less than HD_TAIL ms ago, so these frames
           // still carry it — the speaker's own latency plus the capture pipeline's. Nothing is
@@ -1778,7 +1949,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // is now listening. Nothing of his is ever deleted, and the moment he has spoken once
             // this condition is false forever: normal mouth-window recovery is untouched.
             const hdPreTurn = !speechStartedAt;
-            const hdBlock = HD_ON && !bargeOn && (ovSrc === "mind" || hdPreTurn || (HD_MODE === "all" && mouthBargeArmed));
+            // P0-3 (risk register): `!bargeOn` made this door ALWAYS OPEN in duplex, so a MIND
+            // overlap window — pure narrator leak — was handed to recoverOverlap() and resent
+            // into the model as if it were his speech. That is the exact mechanism of calls
+            // 58020 and 96316 (7/7 recovery on pure leak; 21.8s of one MIND line came back as
+            // five fake "you" turns). AEC does not fix it — the archive holds capture audio,
+            // so recovery resends the narrator either way. The half-duplex resend POLICY is a
+            // property of HD_ON alone; duplex never had a reason to switch it off.
+            // ...and the MIND clause is independent of HD_ON as well (the redteam's exact closing
+            // action, 3.4): a narrator-leak window must never be resent in ANY configuration. With
+            // LIVEMIND_HALF_DUPLEX=off, v2 still handed pure MIND leak to recoverOverlap — the
+            // calls-58020/96316 door, left ajar.
+            const hdBlock = ovSrc === "mind" || (HD_ON && (hdPreTurn || (HD_MODE === "all" && mouthBargeArmed)));
             const hdSecs = (ovEnd - ovStart) / 2 / RATE;
             if (hdBlock) {
               // PHANTOM-CUT ACCOUNTING (W36 verify). A GENUINE barge over the greeting leaves a
@@ -2063,6 +2245,127 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (prevRespId) { prevRespId = null; speaking = false; rec({ ev: "info", rotation: true, text: "predecessor drain cut — the MIND is taking the floor", drain_cut: true }); }
       if (responseActive && !mindResponse) bargeNow();       // still generating: cancel + truncate + stop
       else { stopPlayer(); speaking = false; playingUntil = 0; }   // done generating, still AUDIBLE: kill the tail
+    };
+    /** THE DUPLEX MOUTH CUT — one body, two triggers.
+     *  `vad`  the server's speech_started (today's path, unchanged in shape and in its guard).
+     *  `vp`   the VPIO child's own barge event (DEFECT 2.2 / caps decision (a)). In duplex the
+     *         frame-loop's mouth branch is `stillAudible() && !bargeOn` — false by construction —
+     *         so with caps OFF nothing here ever ran: the frame was dropped at the mute gate, the
+     *         server never heard him, speech_started never fired, and the mouth kept talking. His
+     *         acceptance bar names that case explicitly (canon 059: "repeated (incl. caps-off)").
+     *         The event drives the cut instead of a frame. It touches PLAYBACK and the model's own
+     *         item only — response.cancel / conversation.item.truncate — and sends NO audio, so
+     *         the absolute invariant (nothing gated ever reaches the model) is untouched.
+     *  Both triggers run the SAME cancel + truncate + kill-tail + record + confirm belt. */
+    function duplexMouthCut(src: "vad" | "vp") {
+      if (responseActive) ws.send(JSON.stringify({ type: "response.cancel" }));
+      responseActive = false; awaitingResponse = false;
+      if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+      if (curItemId) {
+        const heardMs = itemFirstDeltaAt
+          ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs))
+          : 0;
+        ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) }));
+      }
+      stopPlayer();                 // no eager restart — the next reply's delta spawns fresh
+      speaking = false;
+      playingUntil = 0;
+      lastMouthBargeAt = Date.now();
+      // GAP 5.3 — SWALLOW THE KILL TAIL, in duplex too. ffplay's last ~40-100ms is still in the
+      // air after the player dies, and the local cut deliberately holds the gate for
+      // MOUTH_BARGE_TAIL so the server never transcribes OUR voice as HIS. The duplex path had
+      // no such gate: `ducked()` returns false whenever bargeOn, so setting playingUntil alone
+      // (the verdict's one-liner) would swallow nothing here. This is the same window, enforced
+      // on the one path that had none — and it is a mic GATE, not a mute: every frame is still
+      // archived above, so his opening words survive in full and reach the model through his
+      // live turn the instant the tail expires.
+      mouthBargeTailUntil = Date.now() + MOUTH_BARGE_TAIL;
+      // ── G-A + G-B (wave-2 resume-design §2) ────────────────────────────────────
+      // G-A: this duplex cut wrote NO mouthBarge record, so the three-way resume
+      // assembly ("mouth-cut resume", the `mouthBarge && tScript` branch) could never
+      // fire in the very mode barge exists for — all three pieces existed in the
+      // process and none of them were ever joined. G-B: it also never trimmed
+      // `mouthBuf`, so response.done fed rememberSpoken() and mouthLast a tail he
+      // never heard, corrupting the echo corpus the belts judge his turns against.
+      // Both are closed here with the SAME clock, the same word-boundary split and the
+      // same round-DOWN bias the local mouth-barge uses ("mouth interrupted by user"),
+      // so a word he never heard can never be recorded as spoken.
+      {
+        // DEFECT 6.4 — FRESHNESS. `vpEv` is set in onVpBarge and never cleared, so a cut driven
+        // by the RAW server VAD minutes later used to stamp an ancient VP event's numbers into
+        // this record and into the log line — and every future calibration reads those numbers.
+        // A `vad` cut with no fresh event records zeros, which is honest; a `vp` cut always has
+        // one by construction.
+        const ev = vpFresh() ? vpEv : null;
+        const played = itemFirstDeltaAt ? Date.now() - itemFirstDeltaAt : 0;
+        const spinUp = Number(process.env.APIPLAN_MIND_START_MS) || 250;
+        const heardMsRec = itemFirstDeltaAt ? Math.max(0, Math.min(played - spinUp, itemQueuedMs)) : 0;
+        const said = mouthBuf.trim() || mouthLast;
+        const full = Math.max(said.length, mouthChars);
+        const dropped = full - said.length;                 // chars the 2000-char clamp dropped
+        const rawFull = itemQueuedMs > 0 ? Math.round((heardMsRec / itemQueuedMs) * full) : 0;
+        const raw = Math.max(0, Math.min(said.length, rawFull - dropped));
+        const wb = said.lastIndexOf(" ", raw);
+        const heardChars = wb > 0 ? wb : raw;
+        mouthBuf = said.slice(0, heardChars);               // G-B — parity with the local cut
+        const mbD = {
+          at: Date.now(), heardMs: Math.round(heardMsRec), queuedMs: Math.round(itemQueuedMs),
+          itemId: curItemId, responseId: curResponseId, cancelled: true,
+          said, heard: said.slice(0, heardChars), remainder: said.slice(heardChars).trim(),
+          peak: Math.round(ev?.peak ?? 0), sustainMs: Math.round(ev?.voiced_ms ?? 0),
+          confirmed: null as boolean | null, consumed: false,
+        };
+        mouthBarge = mbD;                             // G-A — the resume can now fire in duplex
+        say("info", `mouth interrupted by user (duplex, ${src === "vp" ? "VP barge event" : "server VAD"}) — cut at ${mbD.heardMs}ms of ${mbD.queuedMs}ms`
+          + ` (${heardChars}/${full} chars${mbD.sustainMs ? `, ${mbD.sustainMs}ms voiced on the cleaned signal` : ""})`
+          + (mbD.remainder ? ` — UNSPOKEN: ${mbD.remainder.slice(0, 160)}` : ""),
+          { mouth_barge: true, duplex: true, trigger: src, heard_ms: mbD.heardMs, queued_ms: mbD.queuedMs,
+            heard_chars: heardChars, chars: full, peak: mbD.peak || undefined,
+            sustain_ms: mbD.sustainMs || undefined, item_id: curItemId });
+        saveMindState(undefined, true);   // FORCED: a cut is the one thing that must survive a SIGKILL
+        // SELF-DISARM (redteam S3). Same shape as the local cut's MOUTH_BARGE_CONFIRM belt:
+        // a REAL cut is followed by his turn, by recovered audio, or by the resume consuming
+        // the record. Two duplex cuts in a row that nothing follows means the server VAD is
+        // cutting on OUR OWN voice — retreat to half-duplex, which brings its own mic gate,
+        // local barge and overlap recovery, and say so loudly. One restart re-arms. The
+        // streak counter is SHARED with the local belt on purpose: both count the same thing.
+        if (MOUTH_BARGE_CONFIRM > 0) {
+          const seenAt = speechStartedAt; const resendAt = lastResendAt;
+          setTimeout(() => {
+            if (closed || mbD.confirmed !== null) return;
+            mbD.confirmed = mbD.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
+            if (mbD.confirmed) { mouthBargeUnconfirmed = 0; return; }
+            if (++mouthBargeUnconfirmed >= 2 && bargeOn) {
+              bargeOn = false;
+              say("info", `duplex barge DISARMED for this call — ${mouthBargeUnconfirmed} unconfirmed cuts in a row. Back to half-duplex (mic gate + local barge + recovery, all intact); restart to re-arm.`,
+                { duplex_disarmed: true, unconfirmed: mouthBargeUnconfirmed });
+            } else say("info", `duplex cut UNCONFIRMED (${src}) — nothing of his followed it within ${MOUTH_BARGE_CONFIRM}ms; record discarded`,
+              { mouth_barge_unconfirmed: true, duplex: true, trigger: src, heard_ms: mbD.heardMs });
+            if (mouthBarge === mbD) mouthBarge = null;
+          }, MOUTH_BARGE_CONFIRM);
+        }
+      }
+    }
+    // WIRE the event-driven half (DEFECT 2.2). Guards, all of them deliberate:
+    //  * bargeOn — half-duplex already cuts through the frame branch, which carries the full
+    //    existing record+resume+DISARM path; this exists only for the duplex hole.
+    //  * mindBusy / mindResponse / mindPlayer — the MIND's own lines are owned by their own
+    //    machinery (re-weave, verbatim); the local detector refuses them and so does this.
+    //  * mouthBargeArmed / MOUTH_BARGE_PEAK>0 — the self-disarm belt and the operator's OFF
+    //    switch must govern this path exactly as they govern the frame path.
+    //  * GRACE / TAIL / 1s refractory — the cut stays bound to the MOUTH's own timeline, which
+    //    a VP event knows nothing about, and our own teardown can never re-trigger it.
+    //  * the arming gate lives in aec.ts and is re-checked in onVpBarge before we ever get here.
+    vpMouthCut = () => {
+      if (closed || !bargeOn || !speaking || !responseActive) return;
+      if (!stillAudible() || mindPlayer || mindBusy || mindResponse) return;
+      if (MOUTH_BARGE_PEAK <= 0 || !mouthBargeArmed) return;
+      if (Date.now() < mouthBargeTailUntil || Date.now() - lastMouthBargeAt <= 1000) return;
+      const played = itemFirstDeltaAt ? Date.now() - itemFirstDeltaAt : 0;
+      if (played < MOUTH_BARGE_GRACE || played > itemQueuedMs + MOUTH_BARGE_TAIL) return;
+      say("info", `mouth cut by VP barge${micMuted ? " while the mic is MUTED (caps off — his voice still stops the mouth; nothing he said was sent)" : ""} — peak ${Math.round(vpEv?.peak ?? 0)}, ${Math.round(vpEv?.voiced_ms ?? 0)}ms voiced on the cleaned signal`,
+        { vp_mouth_cut: true, muted: micMuted || undefined, peak: Math.round(vpEv?.peak ?? 0), voiced_ms: Math.round(vpEv?.voiced_ms ?? 0) });
+      duplexMouthCut("vp");
     };
     const injectContext = (text: string, mode: string) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
@@ -3075,18 +3378,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // detector and with it this gate, leaving duplex trusting the VAD alone (loop risk).
           if (speaking && bargeOn && responseActive
               && (MOUTH_BARGE_PEAK <= 0 || Date.now() - bargeEvidenceAt < 1500)) {
-            ws.send(JSON.stringify({ type: "response.cancel" }));
-            responseActive = false; awaitingResponse = false;
-            if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
-            if (curItemId) {
-              const heardMs = itemFirstDeltaAt
-                ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs))
-                : 0;
-              ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) }));
-            }
-            stopPlayer();                 // no eager restart — the next reply's delta spawns fresh
-            speaking = false;
-            playingUntil = 0;
+            duplexMouthCut("vad");
           }
           break;
         case "input_audio_buffer.speech_stopped":
@@ -3373,6 +3665,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // NOT for a recovered turn: the older invariant — the response.created cancel
                 // guarantees the mouth never answers a recovered turn on its own — is untouched,
                 // and the MIND has all three pieces from the log line above either way.
+                // DEFECT 6.3 (resume-design G-C, NAMED DEBT — not closed here). In duplex with
+                // server-VAD create_response on, the server has already created its own reply by
+                // the time this transcript lands (measured margin 250-900ms), so `responseActive
+                // || awaitingResponse` is true and this guard refuses. v2's comment implied the
+                // continuation was delivered; it is not. What IS delivered is the CUT, the record
+                // and the log line above — he gets an answer to his interjection, without the
+                // rest of the sentence he cut. Closing it needs resume-design's A4+A5 (a
+                // `resumeHold` in the cancel-at-birth disjunction, with the
+                // APIPLAN_VAD_CREATE_RESPONSE=0 interlock), which is rung-2 work and carries its
+                // own silence risk. Until then the refusal is SAID, out loud, with the reason —
+                // silence is what made this invisible in the first place.
+                const resumeBlocked = !wasRecovered && !inRecoveryWindow && !suppressAuto && !closing
+                  && (responseActive || awaitingResponse || mindBusy || !!prevRespId);
+                if (resumeBlocked) say("info", `mouth-cut resume LOGGED but NOT spoken — ${responseActive || awaitingResponse ? "the mouth is already answering his interjection (duplex server-VAD)" : mindBusy ? "the MIND is on the air" : "a predecessor session is still speaking"}; the unspoken ${b.remainder.length} chars are in this record and in the state file, not in his ears (resume-design G-C, rung-2)`,
+                  { mouth_resume_blocked: true, reason: responseActive || awaitingResponse ? "reply-active" : mindBusy ? "mind-busy" : "rotation-drain", unspoken_chars: b.remainder.length });
                 if (!wasRecovered && !inRecoveryWindow && !suppressAuto && !closing
                     && !responseActive && !awaitingResponse && !mindBusy && !prevRespId && ws.readyState === WebSocket.OPEN) {
                   const resume = `[He cut you off mid-reply — absorb silently, never mention or read out this note.]`
