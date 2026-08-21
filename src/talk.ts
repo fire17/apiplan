@@ -418,7 +418,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
   let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
   let mindBusy = false;                       // a MIND narrator line is generating or playing (serializes the queue)
-  let mindPlayer: any = null;                 // the MIND voice's own ffplay child (killed on barge/exit)
+  let mindPlayer: any = null;                 // the MIND voice's own ffplay child (frozen-then-reaped on barge; killed on exit)
+  /** CANON 016 graceful stop for the file-playing narrator: SIGSTOP silences it inside one
+   *  audio callback (to the ear, a kill); the brief deferred SIGKILL only reaps the already-
+   *  silent player so its `exited` bookkeeping (spoken prefix, unlink, history) still runs. */
+  const mindStop = (p: any) => { try { p.kill("SIGSTOP"); } catch {} setTimeout(() => { try { p.kill("SIGKILL"); } catch {} }, 400); };
   // USER-BARGES-MIND bookkeeping (fire17's law, voice, 2026-08-20: "אם אני אומר הודעה,
   // אתה חייב לתת לפה להתפרץ ולעצור את מה שהמיינד מדבר... המוח חייב לקטוע את עצמו ולהבין
   // איפה הוא נקטע"): the line now playing, so an interrupt can estimate how much was
@@ -738,18 +742,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  which is exactly the "two voices at once" overlap when an injection interrupts.
    *  Kills the DRAINING players too — a finished-generating reply is still coming out of the
    *  speaker, and that tail is what the MIND used to talk over. */
+  /** GRACEFUL MEDIA-STOP (fire17, voice, canon 016: "אני לא רוצה שזה יהרוג... לעשות stop
+   *  ולסמלץ כאילו הריגה, אבל לא צריך להרוג process"). The pacer IS the media controller:
+   *  drop the un-written queue, let the ≤LOOKAHEAD ms already in the pipe drain, and the
+   *  player process LIVES — the next reply writes into the same stdin, no respawn. To the
+   *  ear this is a kill; to the system nothing died. (Legacy draining corpses — stdin
+   *  already closed, unreachable by any control — are still reaped; none exist under the
+   *  persistent-player flow.) */
   const stopPlayer = () => {
     const hadLive = !!player;
-    const droppedMs = paceClear();          // canon 013: the un-written queue dies FIRST, so the
-    pace.paused = false;                    // kill below only ever silences ≤ LOOKAHEAD ms of pipe
-    try { player?.kill(9); } catch {}
-    player = null;
+    const droppedMs = paceClear();
+    pace.paused = false;
     const n = draining.size;
     for (const p of draining) { try { p.kill(9); } catch {} }
     draining.clear();
-    // Evidence in the log that the mouth was actually silenced — `n` is the tail that used to
-    // keep playing under the MIND's voice (unreachable before the draining set existed).
-    if (hadLive || n || droppedMs) say("info", `mouth silenced (live=${hadLive ? 1 : 0} draining-tail=${n}${droppedMs ? ` queued-dropped=${droppedMs}ms` : ""})`);
+    if (hadLive || n || droppedMs) say("info", `mouth media-stop (graceful): queue dropped ${droppedMs}ms, pipe remnant ≤${PACE_LOOKAHEAD_MS}ms drains, player persists${n ? ` (legacy drain-tail reaped=${n})` : ""}`);
+  };
+  /** Hard teardown (call end / rotation death) — the ONLY place a player process dies. */
+  const killPlayers = () => {
+    paceClear(); pace.paused = false;
+    try { player?.kill(9); } catch {}
+    player = null;
+    for (const p of draining) { try { p.kill(9); } catch {} }
+    draining.clear();
   };
   // Note: the player is spawned lazily on the first audio byte (below), NOT pre-spawned —
   // ffplay with -autoexit on a still-empty stdin exits immediately (code 123). The
@@ -763,7 +778,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // ffplay can never be holding seconds of future audio again. The schedule clocks
   // (queueAudio/playingUntil/itemQueuedMs) still advance at ENQUEUE time, unchanged: they
   // describe what is scheduled, not what has left the pipe.
-  const PACE_LOOKAHEAD_MS = Math.max(80, Number(process.env.LM_PACE_LOOKAHEAD_MS) || 240);
+  const PACE_LOOKAHEAD_MS = Math.max(60, Number(process.env.LM_PACE_LOOKAHEAD_MS) || 120);
   const pace = { q: [] as { pcm: Buffer; ms: number }[], aheadUntil: 0, timer: null as any, paused: false, endPending: false };
   const pacePump = () => {
     if (pace.timer) return;
@@ -785,8 +800,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   };
   /** Enqueue one already-panned/trimmed PCM chunk with its MONO duration. */
   const paceFeed = (pcm: Buffer, ms: number) => { pace.q.push({ pcm, ms }); pacePump(); };
-  /** End-of-reply: close the player's stdin only after the queue has drained through it. */
-  const paceEnd = () => { pace.endPending = true; pacePump(); };
+  /** End-of-reply. PERSISTENT PLAYER (canon 016): stdin is never closed between replies —
+   *  the same ffplay carries the whole call, so there is nothing to end; the pump simply
+   *  drains what remains. (endPlayer stays for the legacy/teardown path only.) */
+  const paceEnd = () => { pacePump(); };
   /** Drop everything not yet written; returns the dropped milliseconds (for the log). */
   const paceClear = () => { const n = pace.q.reduce((s, c) => s + c.ms, 0); pace.q.length = 0; pace.endPending = false; pace.aheadUntil = 0; return Math.round(n); };
   // ── MECHANISTIC PAUSE (canon 013/014): SIGSTOP freezes every audible child inside one
@@ -976,7 +993,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const m = micProc;
     try { m?.kill(); } catch {}
     if (m) setTimeout(() => { try { m.kill(9); } catch {} }, 500);   // escalate if ffmpeg ignores TERM
-    stopPlayer();
+    killPlayers();   // teardown proper — the one path where the player process actually dies (canon 016)
     // LANE 15: freeze how much he ACTUALLY heard before the audio dies, so the next call
     // resumes exactly there instead of repeating the sentence or dropping it.
     if (mindLine) mindLine.cut = spokenChars(mindLine);
@@ -1732,8 +1749,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 const raw = Math.min(L.text.length, Math.round(((Date.now() - L.startAt) / L.ms) * L.text.length));
                 const wb = L.text.lastIndexOf(" ", raw);
                 L.cut = wb > 0 ? wb : Math.max(0, raw);
-                try { mindPlayer.kill("SIGKILL"); } catch {}   // exited handler records the spoken prefix only
-                playingUntil = Date.now() + 250;               // swallow the kill tail — reopening at 0 lets the tail transcribe
+                mindStop(mindPlayer);                          // canon 016: freeze NOW (audibly a kill), reap the silent player after; exited handler records the spoken prefix
+                playingUntil = Date.now() + 250;               // swallow the stop tail — reopening at 0 lets the tail transcribe
                 say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
@@ -2285,7 +2302,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }
       stopPlayer(); speaking = false; playingUntil = 0;
       // A voice barge also silences the MIND's narrator audio (it has its own player).
-      if (mindPlayer) { if (mindLine) mindLine.cut = spokenChars(mindLine); try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; mindBusy = false; }   // review fix 4: state file records the heard prefix, not the full line
+      if (mindPlayer) { if (mindLine) mindLine.cut = spokenChars(mindLine); mindStop(mindPlayer); mindPlayer = null; mindBusy = false; }   // canon 016 graceful; review fix 4: state file records the heard prefix, not the full line
     };
     // THE MOUTH IS SILENCED BY CODE WHENEVER THE MIND IS ABOUT TO SPEAK (fire17's law,
     // 2026-08-18: "כשהמוח מדבר זה חייב להשתיק מיידית מבחינת קוד את הפה" — and the MIND's voice
