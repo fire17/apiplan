@@ -520,6 +520,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       fs.renameSync(tmp, mindStatePath);
     } catch { /* state must never break the call */ }
   };
+  let recoveryHeldReply = false;              // a VAD auto-reply cancelled ONLY by the overlap-recovery window — released once the echo discriminator has ruled (call 3357)
   let pendingMouthReply = false;              // a VAD auto-reply cancelled only because MIND audio was playing — release it after
   let pendingMouthAt = 0;                     // when it was parked — canon 044: a hold that never releases is a mute
   // THE ORGAN FLOOR (fire17, canon 029, from a live bug: the mouth cut EVA off mid-sentence).
@@ -3900,6 +3901,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             const evaTurn = Date.now() - evaAddressedAt < 3000;
             const organFloor = Date.now() < organFloorUntil;   // canon 029: never cut an organ off
             const xconv = xconvHeld();                         // canon 045: a conversation we are not in
+            // The recovery half of suppressAuto, told apart from the MIND's explicit {"autospeak":false}
+            // (which leaves suppressRestoreAt at 0). Only the recovery half is deferrable.
+            const recoveryWindow = suppressAuto && suppressRestoreAt > 0;
             if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom || evaTurn || organFloor || xconv)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
@@ -3952,6 +3956,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               } else if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
                 pendingMouthReply = true; pendingMouthAt = Date.now();
                 say("info", "mouth reply held behind mind audio — will release");
+              } else if (recoveryWindow && !mindBusy && !noiseBlip && !selfEcho && !emptyRoom && !organFloor && !xconv) {
+                // HELD, NOT SWALLOWED — the 22% fix (call 3357: this cancel fired 10x in 7 minutes
+                // and the engine's OWN discriminator afterwards refused to call 7 of those turns an
+                // echo; 7 of 32 turns of his were answered with nothing. His words 18:44: he speaks
+                // the instant the mouth stops and gets no reply).
+                //
+                // Timing cannot decide this at birth, and a measured replay proved it: the resent
+                // clip plays through the speaker and re-enters the mic, so ITS speech_started also
+                // lands after the resend committed (+297ms, +142ms, +206ms on the three CONFIRMED
+                // echoes of call 3357 — indistinguishable from his live turns at +170/+169/+192ms).
+                // A speech_started > recoverSentAt rule would have released all three true echoes.
+                //
+                // The only thing that can decide it is the echo discriminator, and it needs the
+                // transcript, which lands ~300ms LATER. So the reply is not killed here — it is
+                // parked, exactly as it is behind MIND audio, and released below the moment the
+                // discriminator declines to call the turn an echo. A confirmed echo never reaches
+                // that release: its own path deletes the item and clears the hold.
+                recoveryHeldReply = true;
+                say("info", "mouth reply held behind overlap recovery — released unless the turn proves to be our own echo", { recovery_hold: true });
               } else if (mindBusy && emptyRoom && !suppressAuto && !noiseBlip && !selfEcho) {
                 // NOT INVISIBLE EITHER. The empty-room notice above reports only when nothing
                 // else is in play (`!mindBusy`), and this cancel is no longer claimed as a held
@@ -4036,6 +4059,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // Recovery is now the identity of the item the server built from the resent audio;
             // the suppressAuto restore keeps the old window key, because it must fire even if
             // that commit event never arrives.
+            // Read-and-clear: whatever this transcript turns out to be, the hold is consumed here.
+            // A turn the discriminator deletes therefore never reaches the release below.
+            const heldForRecovery = recoveryHeldReply; recoveryHeldReply = false;
             const inRecoveryWindow = !!(suppressRestoreAt && recoverSentAt);
             if (inRecoveryWindow) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
             const wasRecovered = !!ev.item_id && ev.item_id === recoveredItemId;
@@ -4185,6 +4211,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 echo_recovered: wasRecovered, echo_residual: residual.slice(0, 200),
                 resent_ms: Math.round(lastResendMs), speech_ms: turnMs,
               } : undefined);
+              // RELEASE THE PARKED REPLY (call 3357). Reaching this line means the turn was
+              // KEPT — the discriminator either found no echo or declined to call it one, and
+              // it is now in the model's context. The answer it was owed is created here.
+              if (heldForRecovery && !mindBusy && !suppressAuto && !responseActive && !awaitingResponse
+                  && !closing && ws.readyState === WebSocket.OPEN) {
+                say("info", `mouth reply released — overlap recovery did not claim this turn${suspect ? " (flagged, not removed)" : ""}`, { recovery_release: true, echo_suspect: suspect });
+                try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
+              }
               // ── PRESENCE GATE: the opening line waits for a proven listener ────────────
               // This is the ONE place the engine learns a human is really there. A you-turn
               // that arrives with none of the echo annotations — `suspect` is exactly
