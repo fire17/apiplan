@@ -220,9 +220,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
   } catch { /* a bad state file must never block a call */ }
 
+  // THE MOUTH'S OWN VOICE SWITCH (fire17, canons 035/040): he can tell the mouth to be quiet
+  // and it stays quiet — "אתה צריך לשתוק" — and it can bring ITSELF back when he addresses it
+  // again — "אתה יכול לדבר". Both directions, because a mouth that can only be silenced by
+  // someone else has to wait for the MIND to notice he wants it back.
+  // It lives HERE rather than in the tools module because suppressAuto lives here: a tool that
+  // wrote a file and hoped somebody read it would be one more race in a night full of them.
+  // The persona still carries the behaviour (his dual-layer law: mechanism AND knowing); this is
+  // the mechanism half, and it works even if the persona forgets.
+  const MOUTH_TOOL = {
+    type: "function", name: "mouth_voice",
+    description: "Your own voice switch. Call with state='mute' when the human tells you to be "
+      + "quiet, state='unmute' when he tells you to speak again or addresses you directly after "
+      + "silencing you, and state='read' to check whether you are currently muted. When muted you "
+      + "produce no spoken replies at all; the human can always still be heard.",
+    parameters: { type: "object", additionalProperties: false, required: ["state"],
+      properties: { state: { type: "string", enum: ["mute", "unmute", "read"] } } },
+  };
   // Structural allow-list: a tool name the caller never declared is never dispatched,
-  // no matter what the model asks for.
-  const toolNames = new Set((o.tools ?? []).map((t: any) => t?.name).filter(Boolean));
+  // no matter what the model asks for. The mouth's own switch is always declared.
+  const toolNames = new Set([MOUTH_TOOL.name, ...(o.tools ?? []).map((t: any) => t?.name).filter(Boolean)]);
 
   // The microphone-input half of the session config.
   // Transcription stays at connect time: hot-adding it mid-response required resending the
@@ -263,7 +280,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     type: "realtime",
     output_modalities: ["audio"],
     ...(instructions ? { instructions } : {}),
-    ...(o.tools?.length ? { tools: o.tools, tool_choice: "auto" } : {}),
+    tools: [MOUTH_TOOL, ...(o.tools ?? [])], tool_choice: "auto",
     audio: { input, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } },
   });
   /** PARKED input. It still TRANSCRIBES (so the successor is not born mute-of-record the moment
@@ -423,11 +440,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // אתה חייב לתת לפה להתפרץ ולעצור את מה שהמיינד מדבר... המוח חייב לקטוע את עצמו ולהבין
   // איפה הוא נקטע"): the line now playing, so an interrupt can estimate how much was
   // actually heard (cut) and re-queue the unspoken remainder for re-weave.
-  let mindLine: { text: string; ms: number; startAt: number; cut: number } | null = null;
+  let mindLine: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
   // LANE 15: the SAME object as mindLine, but never nulled when playback ends — the state
   // file must still know the last line and how much of it was heard after it finished.
-  let mindLast: { text: string; ms: number; startAt: number; cut: number } | null = null;
-  let mindQueue: string[] = [];   // bound to the live inject queue below — the lines never spoken
+  let mindLast: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
+  let mindQueue: { text: string; who?: string }[] = [];   // bound to the live inject queue below — the lines never spoken
   let mindStatus = "idle";
   let mindStateAt = 0;
   let mouthLast = "";             // the mouth's own last completed reply (it dies with the socket too)
@@ -487,14 +504,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         started_at: mindLast.startAt, spoken_chars: n,
         spoken: mindLast.text.slice(0, n),
         remainder: mindLast.text.slice(n).trim(),
-        mouth_last: mouthLast, queued: mindQueue.slice(0, 8), ...mb,
+        mouth_last: mouthLast, queued: mindQueue.slice(0, 8).map((q) => q.text), ...mb,
         mouth: suppressAuto ? "closed" : "open",
       } : {
         text: "", chars: 0, ms: 0, started_at: 0, spoken_chars: 0, spoken: "", remainder: "",
         status: mindStatus, call: callId,
         ...(carry ?? {}),                       // review fix 0: A's mind fields survive B's mouth-only writes
         t: Date.now(), log: logPath,
-        mouth_last: mouthLast, queued: mindQueue.slice(0, 8), ...mb,
+        mouth_last: mouthLast, queued: mindQueue.slice(0, 8).map((q) => q.text), ...mb,
         mouth: suppressAuto ? "closed" : "open",
       };
       ensureDir(dirname(mindStatePath));
@@ -504,6 +521,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     } catch { /* state must never break the call */ }
   };
   let pendingMouthReply = false;              // a VAD auto-reply cancelled only because MIND audio was playing — release it after
+  let pendingMouthAt = 0;                     // when it was parked — canon 044: a hold that never releases is a mute
+  // THE ORGAN FLOOR (fire17, canon 029, from a live bug: the mouth cut EVA off mid-sentence).
+  // His law: the MIND may interrupt the mouth — and the reason he GAVE is currency, not rank
+  // ("כי הוא בעצם אומר דברים יותר עדכניים מהפה") — but EVA never cuts the mouth and the mouth
+  // never cuts EVA: both JOIN THE QUEUE and speak after. One signal serves both halves of that
+  // (EVA's own analysis, E368/E369): while any organ's audio is in the room the floor is TAKEN,
+  // so (1) the mouth holds its reply instead of talking over her, and (2) mic frames are dropped
+  // so her voice is never transcribed as HIS turn — the same protection the narrator already has.
+  // Organs publish a claim to ~/.livemind/floor.json: {"who":"eva","until":<epoch ms>}.
+  // Only holders in INTERRUPT_OK may cut a voice already speaking; everyone else waits for quiet
+  // in their own process. Adding an organ is a line in that set, not a new arbitration layer.
+  const FLOOR_FILE = `${process.env.HOME}/.livemind/floor.json`;
+  const INTERRUPT_OK = new Set(["mind"]);     // currency, not rank — extend only for fresher-info organs
+  const FLOOR_MAX_MS = Number(process.env.APIPLAN_FLOOR_MAX_MS) || 30000;   // canon 044 cap
+  // THE EXTERNAL CONVERSATION (fire17, canon 045): "אני מדבר פה עם חבר שלי עכשיו בחדר ואנחנו
+  // בשיחה משלנו, ופתאום האייג'נטים מתחילים לדבר ופותים אותי ובעצם סתם נכנסים במילים שלי...
+  // שיהיה איזשהו flag כזה שהמערכת תבין שיש שיחות אחרות שקורות במקביל, ולשים לב טוב לא להתפרץ".
+  // Caps is OFF while that happens, so this engine sees NOTHING — no VAD, no transcript, no
+  // turn. EARS (its own capture) publishes the acoustic fact and nothing else:
+  //     ~/.livemind/external-conversation.json  {"v":1,"active":true,"since":<ms>,"until":<ms>}
+  // A boolean and timestamps by design: the audio behind it is Side Tangent (canon 047) and no
+  // content, level or transcript of it may exist anywhere in this system.
+  // It is a HARD HOLD, not a drop: MIND lines queue exactly as they do for his own turn, and
+  // they flow the moment the room is his again. `until` is a LEASE the producer refreshes ~2x/s,
+  // so a dead EARS frees the mouth within 1.5s — the flag can never latch the call into silence.
+  const XCONV_FILE = `${process.env.HOME}/.livemind/external-conversation.json`;
+  let xconvUntil = 0, xconvSince = 0;
+  const xconvHeld = () => Date.now() < xconvUntil;
+  const HOLD_MAX_MS = Number(process.env.APIPLAN_HOLD_MAX_MS) || 12000;     // a hold is not a mute
+  let organFloorUntil = 0, organFloorWho = "", floorBogusAt = 0;
+  let mutedSinceAt = 0, lastMutedNoteAt = 0;   // canon 044: a closed mouth announces itself
   // responseActive only flips true on the SERVER's response.created echo, which lags our
   // response.create send. awaitingResponse bridges that gap: set true synchronously at every
   // response.create we send, cleared on response.created / response.done / cancel. Without it,
@@ -604,6 +652,34 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // own Hebrew mis-transcribed) that no text belt can ever match. Each new flag re-arms it.
   const ECHO_HOLD_MS = Math.max(0, Number(process.env.APIPLAN_ECHO_HOLD_MS) || 2500);
   let echoHoldUntil = 0;        // until this wall clock a VAD auto-reply is an answer to our own voice
+  // ── LEAK-FRAGMENT QUARANTINE (call 96642 @ 02:15:53 — three fake "you" turns) ─────────
+  // Overlap recovery resent 8.4s of speaker leak (`audio resent (8.4s): overlap-...wav`) and
+  // the recogniser turned it into "Hallo." / "Ismét elő." / "我不会。" — garbage in three
+  // languages this call never spoke. The TEXT belt scored 0.00 on all three (garbled leak
+  // matches no line we said), the TIMING belt fired alone, and a lone timing belt may only
+  // FLAG — so all three entered the model's context as if he had said them. The same machinery
+  // that DID remove the 02:17:04 turn (sim 0.87) was blind here by construction.
+  // THE BELT: a SHORT fragment carved out of a resend that carries not one character of the
+  // script this call is actually spoken in is the recogniser guessing at our own loudspeaker,
+  // never his speech. The profile is LEARNED from his own unflagged turns, so an English-only
+  // call never arms it and no setting can lie about which language he is speaking.
+  // HIS WORDS NEVER LEAVE THE LOG: identical treatment to the sim path — removed from the
+  // MODEL'S context only, still emitted, still archived, byte-identical, with the evidence.
+  const LEAK_FRAG_CHARS = Math.max(0, Number(process.env.APIPLAN_LEAK_FRAG_CHARS) || 24);   // 0 disables the belt
+  const LEAK_FRAG_MIN_TURNS = Math.max(1, Number(process.env.APIPLAN_LEAK_FRAG_MIN_TURNS) || 8);
+  // Load-bearing short words are NEVER explained away (the same instinct as echoResidual's floor).
+  const LEAK_FRAG_KEEP = new Set(["ok", "yes", "no", "stop", "wait", "mute", "כן", "לא"]);
+  const hasHebrew = (t: string) => /[\u0590-\u05FF]/.test(t);
+  let cleanTurns = 0, cleanHebrew = 0;   // language profile, learned from his OWN unflagged turns
+  /** True when a transcript is a short fragment with no character of the script the call is
+   *  spoken in. Consulted ONLY for resend-carved turns, and only once the profile has real
+   *  evidence — before that, and on a call he speaks Latin-script in, it always returns false. */
+  const leakFragment = (t: string) => {
+    if (!LEAK_FRAG_CHARS) return false;
+    const n = echoNorm(t);
+    if (!n || n.length > LEAK_FRAG_CHARS || LEAK_FRAG_KEEP.has(n)) return false;
+    return cleanTurns >= LEAK_FRAG_MIN_TURNS && cleanHebrew / cleanTurns >= 0.2 && !hasHebrew(t);
+  };
   /** What the transcript says that our own recent speech does NOT explain. Clause by clause: a
    *  clause we clearly said is stripped, everything else survives. A SHORT clause is never
    *  explained away — "כן" is one bigram and would match any line containing it, yet a yes/no
@@ -646,6 +722,72 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
     if (archMode === "off") return false;   // PRIVATE (canon 019): the app switch stops every archive write, live
     return archMode !== "caps-only" || !micMuted;
+  };
+
+  // ── CANON 048 (fire17, voice, 2026-08-22): CAPS ON + he is speaking + the mic is MUTED
+  // → unmute IMMEDIATELY, "באופן מכניסטי אוטומטית". Caps ON *is* his standing order to be
+  // heard; a mute that survives it is always a bug (a park, a forgotten {"mute":true}, a
+  // stale gate) and today it costs him a whole sentence until lm-ptt's 5s heartbeat heals it.
+  // WHY HERE AND NOT IN lm-ptt: the speech evidence lives ONLY in this process (the muted-frame
+  // accumulator below + the VP child); lm-ptt is a blind keyboard gate and a second capture is
+  // a recorded dead end (device contention). NO FIGHT WITH THE HEARTBEAT BY CONSTRUCTION: this
+  // fires only while caps is ON, and lm-ptt asserts mute=false in exactly that state — both
+  // writers push the same direction. Caps OFF → this never fires and his mute stands.
+  // The caps fact reaches us the way stereo.json / settings.json do: a small file lm-ptt
+  // publishes (~/.livemind/caps.json, 150ms cadence), read here with a 500ms cache.
+  //   { caps: bool, inject: "<the inject path lm-ptt gates>", ts: epoch_ms,
+  //     audio_out: [ { pid, ppid, bundle } ] }   // CoreAudio processes running OUTPUT right now
+  // SOLE EXCEPTION (his): other media playing — he may have silenced the mic on purpose to
+  // listen to it. OUR OWN playback must never count: every player we spawn (mouth ffplay,
+  // MIND narrator ffplay) is a DIRECT CHILD of this process, so ppid === process.pid is the
+  // exact exclusion (verified live: narrator pid 31270 ppid 96642 = the engine). corespeechd
+  // is excluded too — measured, it flips to output-running WITH our own playback and never
+  // independently, so counting it would disable this law permanently.
+  const AUTOUNMUTE_MS = Number(process.env.APIPLAN_AUTOUNMUTE_MS ?? 400);   // 0 disables the law
+  const CAPS_PATH = `${process.env.HOME}/.livemind/caps.json`;
+  const AUDIO_OUT_IGNORE = new Set(["com.apple.CoreSpeech"]);
+  let capsJson: any = null; let capsReadAt = 0; let autoUnmutedAt = 0;
+  const capsNow = () => {
+    const now = Date.now();
+    if (now - capsReadAt > 500) {
+      capsReadAt = now;
+      try { capsJson = JSON.parse(fs.readFileSync(CAPS_PATH, "utf8")); } catch { capsJson = null; }
+    }
+    return capsJson;
+  };
+  // true only when we can SEE foreign audio output. An absent/old file is "unknown", and the
+  // law wins over the unknown (his exception names media he can hear, not a missing sensor) —
+  // it is logged either way so a wrong unmute is never a mystery.
+  const foreignAudioOut = (j: any): { on: boolean; who: string } => {
+    const list = Array.isArray(j?.audio_out) ? j.audio_out : null;
+    if (!list) return { on: false, who: "unknown (no audio_out in caps.json)" };
+    const foreign = list.filter((a: any) => a && a.pid !== process.pid && a.ppid !== process.pid
+      // ppid is the general rule (our players are direct children), and the two live player
+      // handles are the belt: a reparented child (ppid 1) was reproduced in test and would
+      // otherwise read as foreign media.
+      && a.pid !== player?.pid && a.pid !== mindPlayer?.pid
+      && !AUDIO_OUT_IGNORE.has(String(a.bundle || "")));
+    return { on: foreign.length > 0, who: foreign.map((a: any) => `${a.bundle || "pid " + a.pid}`).join(", ") };
+  };
+  // Called from the muted-frame path the moment speech evidence crosses the bar.
+  const autoUnmuteIfCapsOn = (evidence: string) => {
+    if (AUTOUNMUTE_MS <= 0 || !micMuted) return;
+    if (Date.now() - autoUnmutedAt < 3000) return;              // anti-flap if something re-mutes us
+    const j = capsNow();
+    if (!j || j.caps !== true) return;                          // no publisher, or caps is OFF → his mute stands
+    if (Date.now() - (Number(j.ts) || 0) > 4000) return;        // stale file: lm-ptt is dead, do not act on a ghost
+    if (j.inject && injectPath && String(j.inject) !== injectPath) return;   // caps gates ANOTHER call (parked ≠ ours)
+    const media = foreignAudioOut(j);
+    if (media.on) {
+      say("info", `auto-unmute held — caps is ON and you are speaking, but other media is playing (${media.who}); canon 048 exception`,
+        { auto_unmute_held: true, media: media.who });
+      return;
+    }
+    autoUnmutedAt = Date.now();
+    micMuted = false;
+    archRoll("auto-unmute (canon 048)");
+    say("info", `auto-unmuted — caps ON and you were talking into a muted mic (${evidence}${media.who === "unknown (no audio_out in caps.json)" ? ", media state unknown" : ""})`,
+      { auto_unmute: true, evidence, media: media.who });
   };
   const archDir = `${process.env.HOME}/.livemind/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
   let archFd = -1; let archBytes = 0; let archPeak = 0; let archN = 0; let archPath = "";
@@ -1412,6 +1554,32 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // in a row and the detector stands down for the rest of the call (his words are never
     // touched by this — the overlap-recovery path stays fully armed either way).
     let mouthBargeArmed = true; let mouthBargeUnconfirmed = 0;
+    // REDTEAM 2026-08-22 (P0-A). The two belts shared ONE counter, so a duplex phantom and a
+    // local phantom summed. Call 96642: duplex cut UNCONFIRMED 22:57:20 (1) -> duplex DISARMED
+    // 23:44:31 ("2 unconfirmed") -> the FIRST local unconfirmed cut at 00:21:24 read "3" and
+    // stood the local belt down on a streak of one. A belt must only ever judge its own path.
+    let duplexUnconfirmed = 0;
+    // LIVE sustain bar for the local cut. Starts at the configured MOUTH_BARGE_SUSTAIN and only
+    // ever RISES, and only when the belt below would otherwise have stood the last barge path
+    // down (see the ESCALATE branch). The configured value stays the number the bars line
+    // reports, so a raised bar is always visibly a runtime decision, never a silent default.
+    let mouthBargeSustain = MOUTH_BARGE_SUSTAIN;
+    /** THE BARGE FLOOR — he can always cut the mouth. The local detector is live whenever it is
+     *  armed OR duplex is down, because a ducked mic makes it the only path there is. Stated
+     *  here at the USE site rather than as a re-arm at each disarm: duplex is stood down from
+     *  three places (the two belts and the vp-capture-down retreat, which cannot even see this
+     *  flag), and only a use-site rule is immune to the ORDER they fire in. Call 96642 died of
+     *  that ordering: local belt at 00:21:24 while duplex was still up, duplex already down
+     *  since 23:44:31 — two individually-sane belts, zero barge paths, 20 minutes of ducked
+     *  mic, and at 02:16 "ניסיתי להתפרץ לפה וזה לא עבד ההתפרצות". */
+    const localBargeLive = () => mouthBargeArmed || !bargeOn;
+    // REDTEAM (P1-D). `Math.max(x*4, 800)` is 4x only for the default 200ms; a rig tuned to
+    // APIPLAN_MOUTH_BARGE_MS=20 would escalate 40x. The cap is a multiple of what the operator
+    // chose, full stop — and it is bounded above so it can never exceed a short reply's whole
+    // playable window (grace 400ms + a 500ms item + tail 250ms = 750ms of cuttable time; a
+    // sustain past that makes short replies uncuttable BY CONSTRUCTION, which is his law
+    // inverted). See MOUTH_BARGE_GRACE / itemQueuedMs in the cut gate below.
+    const MOUTH_BARGE_SUSTAIN_MAX = Math.min(MOUTH_BARGE_SUSTAIN * 4, 600);
     let mutedSpeechMs = 0; let mutedWarnAt = 0;
     // ── VOLUME-SCALED BARS (lane b) ───────────────────────────────────────────────
     // Every bar above is an ABSOLUTE PCM peak calibrated at ONE output volume. His volume moves:
@@ -1452,6 +1620,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // A bar must always clear the leak it sits above. This rig's leak/speech margin is only ~1.15×
     // (leak max 1789, his speech p90 1642) — 1.25 sits just over the leak and just under his voice.
     const LEAK_MARGIN = mouthKnob("LIVEMIND_LEAK_MARGIN", 1.25);
+    // REDTEAM (P0-B). How far above the measured leak floor a cut's peak must sit before the
+    // belt stops calling it leak. 3x is deliberately generous: this rig's leak/speech margin
+    // is ~1.15x at the TOP of the leak distribution, but leakRef is its MEDIAN (128 in call
+    // 96642 against a 2000 bar), so 3x still sits far under his voice.
+    const LEAK_ESCALATE_RATIO = mouthKnob("LIVEMIND_LEAK_ESCALATE_RATIO", 3);
     const leakRing: number[] = [];
     let leakRef = 0, barScale = 1, gracePeak = 0, graceReply = 0, leakLogAt = 0, leakLogged = 0;
     /** One grace-window frame of our own audio. `pk` is already computed by the caller — free. */
@@ -1681,12 +1854,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // 13:37 "הפה לא עונה לי" — mic muted, never unmuted, zero feedback). Say so.
             if (value?.length) {
               if (framePeak(value) >= scaleBar(MUTEDWARN_PEAK, true)) mutedSpeechMs += (value.length / 2 / RATE) * 1000; else mutedSpeechMs = Math.max(0, mutedSpeechMs - 200);
-              if (mutedSpeechMs > 1000 && Date.now() - mutedWarnAt > 10000) {
+              // CANON 048: two independent speech witnesses, either is enough — the level
+              // accumulator above (same bar the warning already trusts) and a fresh VP barge
+              // (the cleaned-signal detector, the stronger "that was HIM"). Firing at
+              // AUTOUNMUTE_MS (400ms default) instead of the warning's 1000ms is the whole
+              // point: he must lose a word, not a sentence.
+              if (mutedSpeechMs >= AUTOUNMUTE_MS || vpFresh()) {
+                autoUnmuteIfCapsOn(vpFresh() ? "VP voice detected" : `${Math.round(mutedSpeechMs)}ms of speech above the bar`);
+                if (!micMuted) { mutedSpeechMs = 0; mutedWarnAt = 0; }   // unmuted: the warning is moot, the frame now flows below
+              }
+              if (micMuted && mutedSpeechMs > 1000 && Date.now() - mutedWarnAt > 10000) {
                 mutedWarnAt = Date.now(); mutedSpeechMs = 0;
                 say("info", "speaking while muted — the mouth cannot hear you");
               }
             }
-            if (!vpCut) continue;                              // muted: drop mic frames so the model never hears them
+            if (micMuted && !vpCut) continue;                  // muted: drop mic frames so the model never hears them (canon 048: an auto-unmute one branch up lets THIS frame through — the mute is gone, so the gate is gone with it)
           }
           // MIND narrator playing: frames NEVER flow in ANY mode (o.barge only trades off
           // the MOUTH's playback — the narrator's audio must not reach the model even with
@@ -1737,7 +1919,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 playingUntil = Date.now() + 250;               // swallow the kill tail — reopening at 0 lets the tail transcribe
                 say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
                 const rest = L.text.slice(L.cut).trim();
-                if (rest) { injectQueue.push(rest); queueStale = true; }   // remainder is STALE — re-weave against his words
+                if (rest) { injectQueue.push({ text: rest, who: L.who }); queueStale = true; }   // remainder is STALE — re-weave against his words
                 saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
                 ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";   // his live speech supersedes overlap recovery here
               }
@@ -1814,7 +1996,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // itself. Bounded and self-reporting — nothing loops, nothing speaks on its own, his
             // words are never lost (the overlap window stays armed), and an unfollowed cut is
             // announced UNCONFIRMED and discarded. Tune APIPLAN_MOUTH_BARGE_PEAK (0 disables).
-            if (value?.length && MOUTH_BARGE_PEAK > 0 && mouthBargeArmed && !mindBusy && !mindResponse && Date.now() >= mouthBargeTailUntil) {
+            // HONEST NOTE (2026-08-22, found by red-team, and it was an ERROR not a design):
+            // this whole block is nested inside `if (stillAudible() && !bargeOn)`, so
+            // localBargeLive() is CONSTANT TRUE here and mouthBargeArmed gates nothing. The floor
+            // was written as if this expression carried it; it does not. The local self-disarm
+            // belt is therefore GONE on this path, not bounded, and the `else if` disarm branch
+            // below is unreachable. What actually bounds a leak cascade now is the LEAK-SHAPED
+            // test in the confirm timer — a cut far above the measured leak floor is his voice
+            // and must never raise the bar against him; only a leak-shaped one escalates.
+            if (value?.length && MOUTH_BARGE_PEAK > 0 && localBargeLive() && !mindBusy && !mindResponse && Date.now() >= mouthBargeTailUntil) {
               const fMs = (value.length / 2 / RATE) * 1000;
               const pk = framePeak(value);
               const played = itemFirstDeltaAt ? Date.now() - itemFirstDeltaAt : 0;
@@ -1842,7 +2032,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // is usually already false in duplex by the time his transcript lands, so the
               // continuation is LOGGED and not spoken. That is named debt, not a claim; the
               // resume path below now says so out loud instead of going quiet.
-              if ((mouthBargeMs >= MOUTH_BARGE_SUSTAIN || (vpFresh() && pk >= mouthBar)) && played >= MOUTH_BARGE_GRACE
+              if ((mouthBargeMs >= mouthBargeSustain || (vpFresh() && pk >= mouthBar)) && played >= MOUTH_BARGE_GRACE
                   && played <= itemQueuedMs + MOUTH_BARGE_TAIL) {
                 // REFRACTORY. Energy accumulated while the refractory blocks must NOT bank for
                 // the next cut, or the second cut fires the instant the second expires with no
@@ -1942,13 +2132,64 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                   setTimeout(() => {
                     if (closed || mb.confirmed !== null) return;
                     mb.confirmed = mutedAtCut || mb.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
-                    if (mb.confirmed) { mouthBargeUnconfirmed = 0; return; }
+                    if (mb.confirmed) {
+                      mouthBargeUnconfirmed = 0;
+                      // REDTEAM (P1-D). Escalation was one-way for the life of the call: one
+                      // early phantom raised HIS bar permanently, even after the room proved
+                      // itself (he lowers the volume, plugs headphones, the leak drops). A
+                      // confirmed cut is evidence the current bar works — walk it back down.
+                      if (mouthBargeSustain > MOUTH_BARGE_SUSTAIN) {
+                        mouthBargeSustain = Math.max(MOUTH_BARGE_SUSTAIN, Math.round(mouthBargeSustain / 2));
+                        say("info", `mouth barge de-escalated to ${MOUTH_BARGE_PEAK}/${mouthBargeSustain}ms — a confirmed cut proves the bar is not leak`,
+                          { mouth_barge_deescalated: true, sustain_ms: mouthBargeSustain });
+                      }
+                      return;
+                    }
+                    // REDTEAM (P0-B) — DO NOT ESCALATE AGAINST HIM. "Unconfirmed" means the three
+                    // confirmation channels stayed quiet; it does NOT mean leak. The engine already
+                    // measures the leak floor (leakRef, the median grace-window peak of our own
+                    // audio). Call 96642's disarming cut: pk 2584, leakRef 128 — twenty times the
+                    // leak. That was not the speakers, it was a confirmation channel that failed
+                    // (his words landed under a ducked mic, no speech_started, no resend). Raising
+                    // the sustain there raises the bar against HIS voice and fixes nothing.
+                    // Only a cut whose peak sits within reach of the measured leak is leak-shaped.
+                    if (leakRef > 0 && pk > leakRef * LEAK_ESCALATE_RATIO) {
+                      say("info", `mouth barge UNCONFIRMED but NOT leak-shaped — peak ${pk} is ${(pk / leakRef).toFixed(1)}x the measured leak floor ${leakRef}; bar left at ${MOUTH_BARGE_PEAK}/${mouthBargeSustain}ms (a confirmation channel failed, not the speakers)`,
+                        { mouth_barge_unconfirmed: true, not_leak: true, peak: pk, leak_ref: leakRef, sustain_ms: mouthBargeSustain });
+                      if (mouthBarge === mb) mouthBarge = null;
+                      return;
+                    }
                     // Second unconfirmed cut in a row = this rig's leak is clearing the bar.
                     // Stand the detector down for the rest of the call instead of cutting every
                     // reply; the operator sees exactly why, and one restart with a raised
                     // APIPLAN_MOUTH_BARGE_PEAK (or MOUTH_BARGE_MS, see the calibration note)
                     // re-arms it. Nothing of his is lost — overlap recovery is untouched.
-                    if (++mouthBargeUnconfirmed >= 2 && mouthBargeArmed) {
+                    // HIS ONE UNCONDITIONAL LAW HAS NO OFF SWITCH — "הקול שלך מעל הכל".
+                    // Call 96642 proved these belts compose into its violation: duplex stood
+                    // itself down at 23:44:31, this belt at 00:21:24, and from then on the mouth
+                    // was uninterruptible BY CONSTRUCTION (half-duplex ducked his mic for 20
+                    // minutes across that call, so the server never heard him either). At 02:16
+                    // he reported it: "ניסיתי להתפרץ לפה וזה לא עבד ההתפרצות". Each belt is sane
+                    // alone; nothing forbade BOTH being down. So: while duplex is already down,
+                    // this detector is the ONLY path and never disarms. It ESCALATES the sustain
+                    // bar instead — the very remedy this message recommends ("sustain separates
+                    // leak from speech far better than level"), applied live instead of demanding
+                    // a restart he never gets mid-conversation. At the cap it STAYS ARMED: a
+                    // spurious cut is recoverable (remainder resumes, overlap recovery resends),
+                    // an uninterruptible mouth is not.
+                    if (++mouthBargeUnconfirmed >= 2 && mouthBargeArmed && !bargeOn) {
+                      const before = mouthBargeSustain;
+                      mouthBargeSustain = Math.min(MOUTH_BARGE_SUSTAIN_MAX, mouthBargeSustain * 2);
+                      mouthBargeUnconfirmed = 0;
+                      say("info", mouthBargeSustain > before
+                        ? `mouth barge ESCALATED ${MOUTH_BARGE_PEAK}/${before}ms -> ${MOUTH_BARGE_PEAK}/${mouthBargeSustain}ms — NOT disarmed: duplex is already down, so this is the last path by which he can cut the mouth`
+                        : `mouth barge HELD ARMED at ${MOUTH_BARGE_PEAK}/${mouthBargeSustain}ms (sustain cap) — duplex is down, so disarming would leave him unable to interrupt the mouth at all; a spurious cut is the accepted cost`,
+                        { mouth_barge_escalated: true, bar: MOUTH_BARGE_PEAK, sustain_ms: mouthBargeSustain, was_sustain_ms: before, capped: mouthBargeSustain === MOUTH_BARGE_SUSTAIN_MAX });
+                    } else if (mouthBargeUnconfirmed >= 2 && mouthBargeArmed) {
+                      // UNREACHABLE at HEAD: the cut gate above only runs while !bargeOn, and
+                      // bargeOn is monotone (set false at 893/2536, never true). Kept ONLY so the
+                      // path exists if the cut gate is ever allowed to run in duplex; if it is
+                      // still dead at the next pass, delete it rather than let it read as a belt.
                       mouthBargeArmed = false;
                       say("info", `mouth barge DISARMED for this call — ${mouthBargeUnconfirmed} unconfirmed cuts in a row at bar ${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms. Speaker leak is clearing the bar; raise APIPLAN_MOUTH_BARGE_MS (sustain separates leak from speech far better than level) and restart to re-arm.`,
                         { mouth_barge_disarmed: true, unconfirmed: mouthBargeUnconfirmed, bar: MOUTH_BARGE_PEAK, sustain_ms: MOUTH_BARGE_SUSTAIN });
@@ -1968,6 +2209,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // race), the frame stops HERE: a muted frame can never reach the model, ever, by any
           // path. Unreachable when the mute gate is doing its ordinary job.
           if (micMuted) continue;
+          // ORGAN FLOOR — the mic half (canon 029 / EVA's E366-E368: three false `you` turns from
+          // ONE line of hers). Her audio is in the room; these frames are her, not him. Dropped
+          // for the MODEL only — archWrite() above already ran, so the never-lose archive keeps
+          // every byte and anything he says over her is still recoverable from it.
+          if (Date.now() < organFloorUntil) continue;
           bargeMs = 0;
           // HALF-DUPLEX TAIL. Our own audio stopped less than HD_TAIL ms ago, so these frames
           // still carry it — the speaker's own latency plus the capture pipeline's. Nothing is
@@ -2021,7 +2267,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // action, 3.4): a narrator-leak window must never be resent in ANY configuration. With
             // LIVEMIND_HALF_DUPLEX=off, v2 still handed pure MIND leak to recoverOverlap — the
             // calls-58020/96316 door, left ajar.
-            const hdBlock = ovSrc === "mind" || (HD_ON && (hdPreTurn || (HD_MODE === "all" && mouthBargeArmed)));
+            // REDTEAM (P2-F). This read of mouthBargeArmed was the documented escape hatch:
+            // "unless the mouth barge has self-disarmed — then recovery is the only belt left and
+            // stays open". Since the floor landed, mouthBargeArmed is never written false on any
+            // reachable path, so under HD_MODE=all the hatch is welded shut forever. The condition
+            // it MEANT to express is "the local belt is still trustworthy" — which after the floor
+            // is "its bar has not been escalated away from what the operator configured".
+            const localBeltTrusted = mouthBargeArmed && mouthBargeSustain <= MOUTH_BARGE_SUSTAIN * 2;
+            const hdBlock = ovSrc === "mind" || (HD_ON && (hdPreTurn || (HD_MODE === "all" && localBeltTrusted)));
             const hdSecs = (ovEnd - ovStart) / 2 / RATE;
             if (hdBlock) {
               // PHANTOM-CUT ACCOUNTING (W36 verify). A GENUINE barge over the greeting leaves a
@@ -2104,6 +2357,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       finally { rotResending = false; }
     }
 
+    /** The mouth's own mute switch (canons 035/040). Engine-side, so it is state and not a wish.
+     *  Muting answers the call and STOPS — a mouth told to be quiet must not narrate its own
+     *  silence. Unmuting answers and lets it speak, which is the point: he addressed it again. */
+    const runMouthTool = (item: any) => {
+      let state = "read";
+      try { state = String(JSON.parse(item.arguments || "{}").state || "read"); } catch {}
+      if (state === "mute") { suppressAuto = true; suppressRestoreAt = 0; say("info", "mouth CLOSED (self-muted on his word)", { mouth_self: "mute" }); }
+      else if (state === "unmute") { suppressAuto = false; suppressRestoreAt = 0; say("info", "mouth OPEN (self-unmuted on his word)", { mouth_self: "unmute" }); }
+      if (closed || ws.readyState !== WebSocket.OPEN) return;
+      const output = state === "read"
+        ? (suppressAuto ? "You are currently MUTED." : "You are currently able to speak.")
+        : (suppressAuto ? "You are now muted. Say nothing further until he tells you to speak."
+                        : "You can speak again. Answer him briefly.");
+      try {
+        ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output } }));
+      } catch { return; }
+      // A muted mouth gets no response.create — the silence IS the answer.
+      if (!suppressAuto && !closing) { try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {} }
+    };
+
     /** Dispatch ONE declared tool call, reply with its output, and let the model speak
      *  the result. Failures become a sentence the model can just say — a tool error must
      *  never take the call down. */
@@ -2144,10 +2417,49 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Other processes (a set_monitor watcher, a mid-call context push) append {text,mode}
     // lines to injectPath. Each is spoken INTO the live call: mode "graceful" waits for the
     // current sentence to finish; "interrupt" barges in so the model answers on it at once.
-    const injectQueue: string[] = [];
+    // ADDRESSEE ROUTING (fire17, canons 027/028): when he calls EVA by name the MOUTH is
+    // SILENT — not "Eva will answer you", not an acknowledgment: nothing. Eva answers in her own
+    // voice. Mechanistic, exactly like the noise gates ("I don't want it to be up to the prompt"):
+    // the persona can forget, this cannot. A name counts as an ADDRESS only when it opens the
+    // turn, is set off by a comma, or lands in the first three words — a mid-sentence mention
+    // ("המוח אמר לאווה") leaves the mouth answering normally, because silencing it on a real
+    // question is the error he would actually hear. Organs with no voice of their own (lab,
+    // hands, coach, doctor) are deliberately NOT gated here: the mouth owes him one sentence
+    // for those (canon 028 mode 3), which is the persona's job, not this gate's.
+    const EVA_NAMES = (process.env.APIPLAN_EVA_NAMES || "אווה,איווה,אוה,איבה,אבה,איב,eva,eve").split(",");
+    const addressedToEva = (t: string): boolean => {
+      const words = (t || "").trim().split(/[^\p{L}\p{N}]+/u).filter(Boolean).map((w) => w.toLowerCase());
+      if (!words.length) return false;
+      for (const raw of EVA_NAMES) {
+        const n = raw.trim().toLowerCase(); if (!n) continue;
+        const i = words.indexOf(n);
+        if (i < 0) continue;
+        // PRE-RELAUNCH AUDIT 2026-08-22 (P1). `i <= 2` makes any mention in the first three
+        // words an address, so a QUESTION ABOUT her — "מה אווה שמרה עד עכשיו" — silences the
+        // mouth and routes to an organ that may not even be running; nothing answers him. An
+        // address is a vocative: the name OPENS the turn, or it is set off by a comma.
+        // Verified against the same case set as the original: the three real vocatives still
+        // fire, the three questions-about-Eva no longer do.
+        if (i === 0) return true;
+        const after = t.split(raw)[1]?.[0];
+        if (after === ",") return true;
+      }
+      return false;
+    };
+    let evaAddressedAt = 0;   // his last Eva-addressed turn — the mouth stays out of it
+    const injectQueue: { text: string; who?: string }[] = [];
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
-    const sendInjected = (text: string) => {
+    // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
+    // own, distinct from the MIND's). Read HERE, once per utterance, exactly like the stereo
+    // gains: writing ~/.livemind/eva-voice.txt moves her voice on her very next line — no
+    // restart, no work, and nobody has to remember it. APIPLAN_EVA_VOICE overrides the file.
+    const evaVoice = () => {
+      if (process.env.APIPLAN_EVA_VOICE) return process.env.APIPLAN_EVA_VOICE;
+      try { return fs.readFileSync(`${process.env.HOME}/.livemind/eva-voice.txt`, "utf8").trim() || "shimmer"; }
+      catch { return "shimmer"; }
+    };
+    const sendInjected = (text: string, who?: string) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
       // conversational model with "say this word for word" instructions proved FLAKY: it
@@ -2157,9 +2469,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // engine as `apiplan speak`) renders the exact words as audio in a DISTINCT voice
       // (APIPLAN_MIND_VOICE, default "ash"), and we play it directly. The mouth cannot
       // reword what it never speaks — and the human hears by ear which tier is talking.
-      say("info", "injected context");
+      // The echo string is unchanged — every MIND write→verify count-delta in the body
+      // counts this exact line. WHO rides in the sidecar record instead.
+      say("info", "injected context", who ? { who } : undefined);
       mindBusy = true;
-      const mindVoice = process.env.APIPLAN_MIND_VOICE || "ash";
+      // ORGAN VOICES: an organ line ({"text":…,"who":"eva"}) is rendered by the SAME narrator,
+      // through the SAME queue and the SAME never-interrupt gates — only the voice differs.
+      const mindVoice = who === "eva" ? evaVoice() : (process.env.APIPLAN_MIND_VOICE || "ash");
       speakRealtime(c, { text, voice: mindVoice }, 60000).then(async (r) => {
         if (closed) { mindBusy = false; return; }
         // MIND priority (code-enforced handoff): silence the mouth right as the MIND's audio is
@@ -2206,7 +2522,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           { stdout: "ignore", stderr: "ignore" });
         // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
         // sample) so the barge cut never over-counts words as spoken.
-        mindLine = mindLast = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1 };
+        mindLine = mindLast = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1, who };
         saveMindState("speaking");   // LANE 15: on disk BEFORE the first sample — a hard kill can never erase the line
         // The line is announced exactly as before — same record, same text. The flag only tells
         // convTail WHO said it, so a rotation can carry the words as conversation without teaching
@@ -2399,11 +2715,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           setTimeout(() => {
             if (closed || mbD.confirmed !== null) return;
             mbD.confirmed = mutedAtCut || mbD.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
-            if (mbD.confirmed) { mouthBargeUnconfirmed = 0; return; }
-            if (++mouthBargeUnconfirmed >= 2 && bargeOn) {
+            if (mbD.confirmed) { duplexUnconfirmed = 0; return; }
+            if (++duplexUnconfirmed >= 2 && bargeOn) {
               bargeOn = false;
-              say("info", `duplex barge DISARMED for this call — ${mouthBargeUnconfirmed} unconfirmed cuts in a row. Back to half-duplex (mic gate + local barge + recovery, all intact); restart to re-arm.`,
-                { duplex_disarmed: true, unconfirmed: mouthBargeUnconfirmed });
+              // Retreating to half-duplex means ducked() starts dropping mic frames during every
+              // mouth reply, so the SERVER can no longer hear him: the local detector is now the
+              // only barge path there is. Re-arm it even if its own belt stood it down earlier in
+              // this call (96642: it had), and clear the shared streak so the fresh path is not
+              // judged on cuts made under the old regime.
+              // REDTEAM (P1-C): the count is read for the log BEFORE it is cleared — zeroing it
+              // first made every future duplex-disarm line report "0 unconfirmed cuts in a row".
+              const streak = duplexUnconfirmed;
+              mouthBargeArmed = true; mouthBargeUnconfirmed = 0; duplexUnconfirmed = 0;
+              say("info", `duplex barge DISARMED for this call — ${streak} unconfirmed cuts in a row. Back to half-duplex (mic gate + local barge + recovery, all intact); restart to re-arm.`,
+                { duplex_disarmed: true, unconfirmed: streak });
             } else say("info", `duplex cut UNCONFIRMED (${src}) — nothing of his followed it within ${MOUTH_BARGE_CONFIRM}ms; record discarded`,
               { mouth_barge_unconfirmed: true, duplex: true, trigger: src, heard_ms: mbD.heardMs });
             if (mouthBarge === mbD) mouthBarge = null;
@@ -2416,8 +2741,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     //    existing record+resume+DISARM path; this exists only for the duplex hole.
     //  * mindBusy / mindResponse / mindPlayer — the MIND's own lines are owned by their own
     //    machinery (re-weave, verbatim); the local detector refuses them and so does this.
-    //  * mouthBargeArmed / MOUTH_BARGE_PEAK>0 — the self-disarm belt and the operator's OFF
+    //  * localBargeLive() / MOUTH_BARGE_PEAK>0 — the self-disarm belt and the operator's OFF
     //    switch must govern this path exactly as they govern the frame path.
+    //    REDTEAM CORRECTION (2026-08-22): the claim that "with the mic ducked this path is one of
+    //    the two ways he can still cut the mouth" is FALSE. vpMouthCut early-returns on !bargeOn
+    //    (first line below), so this path is DEAD in half-duplex — exactly the state the floor
+    //    exists for — and localBargeLive() here is just mouthBargeArmed. The cleaned-signal
+    //    detector is the one leak-immune path there is, and after a duplex-BELT retreat the VP
+    //    child is still alive (only vpRevert kills it). Letting the TAIL/cut branch run in
+    //    half-duplex is the real second path; it is NOT done here because duplexMouthCut() would
+    //    then race the frame-loop cut, and that needs a live trial, not a redteam's guess.
     //  * GRACE / TAIL / 1s refractory — the cut stays bound to the MOUTH's own timeline, which
     //    a VP event knows nothing about, and our own teardown can never re-trigger it.
     //  * the arming gate lives in aec.ts and is re-checked in onVpBarge before we ever get here.
@@ -2444,7 +2777,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     vpMouthCut = () => {
       if (closed || !bargeOn) return;
       if (mindPlayer || mindBusy || mindResponse) return vpDrop("mind-owns-the-floor");
-      if (MOUTH_BARGE_PEAK <= 0 || !mouthBargeArmed) return vpDrop("self-disarm-belt");
+      if (MOUTH_BARGE_PEAK <= 0 || !localBargeLive()) return vpDrop("self-disarm-belt");
       const now = Date.now();
       if (now < mouthBargeTailUntil || now - lastMouthBargeAt <= 1000) return vpDrop("refractory");
       if (speaking && responseActive) {
@@ -2466,7 +2799,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       lastMouthBargeAt = now;
       mouthBargeTailUntil = now + MOUTH_BARGE_TAIL;
     };
-    const injectContext = (text: string, mode: string) => {
+    const injectContext = (text: string, mode: string, who?: string) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
       // by construction (the chunk-splitting workaround existed only because the mouth's
       // model summarized long instruction-driven lines).
@@ -2490,10 +2823,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (queueStale && injectQueue.length) {
         say("info", `stale queue auto-replaced (${injectQueue.length}) by fresh line`);
         injectQueue.length = 0;
+        // PRE-RELAUNCH AUDIT 2026-08-22 (P1). The waited-notice describes the LINE that waited.
+        // The line just died; the flag must die with it, or the next unrelated MIND line opens
+        // with an apology for a wait that never happened — spoken, verbatim, in his ear.
+        queueHeldForHim = false;
       }
       queueStale = false;   // a new inject IS the re-weave — it releases the stale hold
+      if (xconvHeld()) {
+        // CANON 045: a conversation he is having with someone else outranks anything the MIND
+        // has to say, exactly as his own turn does. Queued, never dropped; `queueHeldForHim` is
+        // deliberately NOT set — the "I wanted to say this earlier but you were speaking"
+        // opener would be a lie about a turn that was never addressed to us.
+        injectQueue.push({ text, who });
+        say("info", `mind line HELD (external conversation — canon 045) — queue ${injectQueue.length}`);
+        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+        return;
+      }
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
-        injectQueue.push(text);
+        injectQueue.push({ text, who });
+        queueHeldForHim = true;   // mind-never-interrupts: this line waited out his speech — it will open with the waited-notice
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
         // QUEUE MERGE LAW (fire17, voice, 2026-08-20: "כמה הודעות במקביל נכנסות למחסנית
         // במקום להתעדכן... זה צריך להיות הודעה אחת"): the queue must never grow past one —
@@ -2506,8 +2854,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
       // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
       // speaking over the tail of the old voice.
-      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text); return; }
-      injectQueue.push(text);
+      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who); return; }
+      injectQueue.push({ text, who });
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
@@ -2522,11 +2870,36 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // in the queue, those lines are STALE — they never auto-flush. Only {"drop_queue"}
     // (MIND re-weaves and sends fresh) or a new inject releases the hold.
     let queueStale = false;
+    // MIND-NEVER-INTERRUPTS (fire17, voice 2026-08-21, call 96642: "תוודא שמה שהמוח רוצה
+    // להגיד לי בעצם נדחף לתור, לאחרי שגם הפה יענה לי על הדבר האחרון שסיימתי להגיד...
+    // ובחיים המוח לא יוכל לקטע אותי"): after a real turn of his, held MIND lines wait
+    // until SOMETHING answered him (a mouth response created for that turn, or the MIND's
+    // own voice) — not just until he stops talking. 20s failsafe so a mouth that never
+    // answers cannot dam the MIND forever. And a line that waited out his speech opens
+    // with a waited-notice, per his exact spec ("אה רציתי להגיד לך קודם אבל היית תוך כדי
+    // דיבור") — added here in code so no MIND session has to remember it.
+    let lastRealTurnAt = 0, lastRealTurnStart = 0, queueHeldForHim = false;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     const flushInjectQueue = () => {
       flushTimer = null;
       if (queueStale) return;
+      if (xconvHeld()) {   // canon 045 — retried, so the release needs no extra wiring
+        if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+        return;
+      }
       if (userSpeaking || Date.now() - lastSpeechStopAt < 2500) {
+        if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+        return;
+      }
+      // PRE-RELAUNCH AUDIT 2026-08-22 (P1). "Wait for the mouth to answer him first" is only
+      // meaningful when a mouth answer is POSSIBLE. With the mouth CLOSED (suppressAuto), or in
+      // MOUTHPIECE mode (LM_MOUTHPIECE=1 -> APIPLAN_VAD_CREATE_RESPONSE=0, where the server never
+      // creates a reply at all), lastResponseCreatedAt can never advance for his turn — so EVERY
+      // MIND line waits the full 20s failsafe after EVERY turn of his, in exactly the mode where
+      // the MIND is the only voice he has. Skip the wait when nothing can satisfy it.
+      const mouthCanAnswer = !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0";
+      if (mouthCanAnswer && lastRealTurnAt > 0 && lastResponseCreatedAt < lastRealTurnStart && lastMindSpokeAt < lastRealTurnAt
+          && Date.now() - lastRealTurnAt < 20000) {   // his last turn not yet answered — mouth speaks first
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
@@ -2535,7 +2908,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // responseActive/awaitingResponse, so without this term a held line would flush into the
       // successor while the old voice is still speaking: two voices, one player, interleaved PCM.
       // Held, not dropped — rotDrainRelease() calls this again the moment the drain ends.
-      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) sendInjected(injectQueue.shift()!);
+      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) {
+        const q = injectQueue.shift()!;
+        let t = q.text;
+        if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
+        sendInjected(t, q.who);
+      }
     };
     function startInjectLoop() {
       if (!injectPath) return;
@@ -2604,19 +2982,150 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       // the MIND keeps the mouth in sync continuously, not just at launch.
                       ws.send(JSON.stringify({ type: "conversation.item.create", item: {
                         type: "message", role: "system",
-                        content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this]: ${String(j.context)}` }] } }));
+                        // E415 — THE IDENTITY BOUNDARY RIDES EVERY PRELOAD, BY CONSTRUCTION.
+                        // 2026-08-22 ~03:14 the mouth recited MIND-internal detail as if it were
+                        // the mind, and he stopped the call to correct it: "you are the mouth, not
+                        // the mind". The mechanism is structural, not a wording slip — the MIND
+                        // pushes its knowledge in here, and nothing in the frame said whose
+                        // knowledge it is. "Mind here —" marks the MIND's own SPOKEN lines; there
+                        // was no equivalent mark on mind-supplied content the mouth speaks in its
+                        // own name. Per his rule 1 the fix belongs in the engine, so the boundary
+                        // is welded to the frame and no preload the MIND writes can omit it.
+                        content: [{ type: "input_text", text: `[Live state update from the MIND — absorb silently, do not mention or respond to this. You are the MOUTH. What follows is the MIND's knowledge handed to you as background: it is never your own work and never your identity. If he asks who you are, you are the mouth; if he asks who did this work, the MIND or the organs did it, not you]: ${String(j.context)}` }] } }));
                       say("info", "context preloaded (silent)");
                     } else if (j.drop_queue) {   // MIND re-weave: discard held/unspoken lines before sending a fresh one
                       say("info", `queue dropped (${injectQueue.length} lines)`);
                       injectQueue.length = 0;
                       queueStale = false;
+                      queueHeldForHim = false;   // audit P1: the notice belongs to the dropped line
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
-                    } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"));
+                    } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined);
                   } catch {}
                 }
               }
             }
+          }
+        } catch {}
+        // CANON 044 WATCHDOG — his live complaint was "לפעמים הוא לא עונה באופן עקבי", and every
+        // hold in this file is a promise to speak LATER. A promise nobody keeps is indistinguishable
+        // from a mute, so one is force-kept here rather than waiting for the path that parked it.
+        // PRE-RELAUNCH AUDIT 2026-08-22 (P0). This watchdog exists for a hold nobody is keeping.
+        // A hold an ACTIVE gate is still asserting is not that: the organ floor and the
+        // external-conversation hold are LIVE promises with their own release paths, and firing
+        // here overrides them. Not theoretical — ears/xconv.py holds for up to XCONV_MAX_HOLD_MS
+        // (180000) against this file's HOLD_MAX_MS (12000), and the response created below
+        // carries awaitingResponse=true, the exact flag that makes response.created SKIP the
+        // `xconv`/`organFloor` cancel gate. Without this term the mouth speaks into the
+        // conversation he is having with someone else in the room 12s in — canon 045's own
+        // complaint ("פתאום האייג'נטים מתחילים לדבר ופותים אותי"). The clock is RESTARTED, never
+        // consumed, so the watchdog still catches the unexplained holds it was written for the
+        // moment the gate lets go.
+        if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS
+            && (Date.now() < organFloorUntil || xconvHeld())) {
+          pendingMouthAt = Date.now();
+        } else if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS) {
+          const heldFor = Math.round((Date.now() - pendingMouthAt) / 1000);
+          pendingMouthAt = 0;
+          if (!mindBusy && !mindPlayer && !suppressAuto && !closing && !responseActive && !awaitingResponse
+              && !(!GREET_LEGACY && speechStartedAt === 0) && ws.readyState === WebSocket.OPEN) {
+            say("info", `mouth reply force-released after ${heldFor}s held — a hold that long is a mute (canon 044)`, { forced_release: true, held_s: heldFor });
+            try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
+          } else {
+            say("info", `mouth reply DROPPED after ${heldFor}s held — the room moved on (canon 044)`, { forced_drop: true, held_s: heldFor });
+            pendingMouthReply = false;
+          }
+        }
+        // A CLOSED MOUTH IS NEVER INVISIBLE (canon 044). Whoever closed it — the MIND, the model
+        // itself, an overlap suppress — it says so once a minute, with the elapsed time, so
+        // "the mouth went quiet" is always answerable from the log instead of guessed at.
+        if (suppressAuto) {
+          if (!mutedSinceAt) mutedSinceAt = Date.now();
+          if (Date.now() - lastMutedNoteAt > 60000) {
+            lastMutedNoteAt = Date.now();
+            // NOT "mouth ..." — PRE-RELAUNCH AUDIT 2026-08-22 (P0). lm-calls reads ACTIVE/PARKED
+            // from the LAST `"text":"mouth [A-Z]*` in the log; a line starting `mouth still`
+            // matches with an EMPTY capture, so this heartbeat silently flipped every PARKED
+            // call back to ACTIVE 60s after it was parked (proved: grep -ao yields `"text":"mouth `).
+            // Two ACTIVE calls breaks the one-ACTIVE-call invariant the MIND parks by.
+            say("info", `mouth-closed heartbeat — CLOSED for ${Math.round((Date.now() - mutedSinceAt) / 1000)}s (nothing it hears will be answered until it is reopened)`, { mouth_closed_s: Math.round((Date.now() - mutedSinceAt) / 1000) });
+          }
+        } else { mutedSinceAt = 0; lastMutedNoteAt = 0; }
+        // THE ORGAN FLOOR, read on the tick that already runs (canon 029) — no new timer.
+        try {
+          const held = organFloorUntil > Date.now();
+          const f = Bun.file(FLOOR_FILE);
+          if (await f.exists()) {
+            const j = JSON.parse(await f.text());
+            // CANON 044 — HIS BASELINE IS AN OPEN MOUTH. A claim is a promise about audio that
+            // is playing RIGHT NOW, so one reaching minutes into the future is a bug or a dead
+            // writer, and honouring it would hold the mouth shut exactly the way he is
+            // complaining about. Cap it: the worst a broken claim can do is 30 seconds.
+            // PRE-RELAUNCH AUDIT 2026-08-22 (P2). Clamping to now+FLOOR_MAX_MS is recomputed on
+            // EVERY 150ms tick, so a stale claim with a far-future `until` renews its own 30s
+            // window forever and the mic stays gated for the life of the call (proved in a
+            // harness: 400 ticks later, headroom still 30000ms). A claim reaching past the cap
+            // is a dead or broken writer, so IGNORE it rather than honour a rolling version of
+            // it. Live producers (eva-voiced claim_floor) lease 1500ms and are unaffected.
+            const rawUntil = Number(j?.until) || 0;
+            if (rawUntil > Date.now() + FLOOR_MAX_MS) {
+              if (Date.now() - floorBogusAt > 30000) {
+                floorBogusAt = Date.now();
+                say("info", `floor claim IGNORED — ${j?.who || "organ"} asked for ${Math.round((rawUntil - Date.now()) / 1000)}s, past the ${FLOOR_MAX_MS / 1000}s cap; a claim is about audio playing right now (canon 044)`, { floor_ignored: String(j?.who || "organ") });
+              }
+            } else
+            if (rawUntil > Date.now() && !INTERRUPT_OK.has(String(j?.who || ""))) {
+              const until = rawUntil;
+              if (!held) say("info", `floor taken by ${j.who} — mic gated, mouth queues behind it`, { floor: String(j.who) });
+              organFloorUntil = until; organFloorWho = String(j?.who || "organ");
+            }
+          }
+          // CANON 045 read on the same tick, capped by the same canon-044 rule: a claim reaching
+          // far into the future is a bug, and honouring it would be the mute he complains about.
+          // (Audit P2: this read has its OWN try — a throw in the floor read above must never
+          // take the xconv read and the two release paths down with it for every tick after.)
+          try {
+            const xf = Bun.file(XCONV_FILE);
+            if (await xf.exists()) {
+              const xj = JSON.parse(await xf.text());
+              const xu = Math.min(Number(xj?.until) || 0, Date.now() + FLOOR_MAX_MS);
+              if (xj?.active && xu > Date.now()) {
+                if (!xconvHeld()) {
+                  xconvSince = Date.now();
+                  say("info", "external conversation in the room — voices HOLD (canon 045)", { external_conversation: true });
+                }
+                xconvUntil = xu;
+              }
+            }
+          } catch {}
+          if (xconvSince && !xconvHeld()) {
+            // The room is his again. Everything parked ONLY because of it flows now — held,
+            // never dropped, the same contract the organ floor keeps.
+            say("info", `external conversation ended after ${Math.round((Date.now() - xconvSince) / 1000)}s — voices released (canon 045)`, { external_conversation: false });
+            xconvSince = 0;
+            if (injectQueue.length) setTimeout(flushInjectQueue, 0);
+            // `!prevRespId` — PRE-RELAUNCH AUDIT 2026-08-22 (P1). The canonical release path
+            // (mouth reply released — was held behind mind audio) holds on a rotation drain
+            // because the predecessor socket is still finishing its sentence in the SHARED
+            // player; releasing there starts a second voice in it. These two release sites were
+            // added without that term. Calls run past the 3600s socket cap, so it is reachable.
+            if (pendingMouthReply && !mindBusy && !mindPlayer && !prevRespId && !suppressAuto && !closing && !responseActive
+                && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+              say("info", "mouth reply released (was queued behind an external conversation)");
+              try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
+            }
+          }
+          if (held && organFloorUntil <= Date.now()) {
+            // The organ finished. Anything parked ONLY because it would have talked over that
+            // organ flows now — held, never dropped ("במקום להצטרף לקיו ולהגיד דברים אחריה").
+            say("info", `floor released by ${organFloorWho} — mouth may speak`, { floor_released: organFloorWho });
+            organFloorWho = "";
+            if (pendingMouthReply && !mindBusy && !mindPlayer && !prevRespId && !(!GREET_LEGACY && speechStartedAt === 0)
+                && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+              say("info", "mouth reply released (was queued behind organ audio)");
+              try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
+            }
+            if (injectQueue.length) setTimeout(flushInjectQueue, 0);
           }
         } catch {}
         if (!closed) setTimeout(tick, 150);
@@ -3385,13 +3894,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // can never be caught here. LM_GREET=1 keeps the old behaviour: an attended restart
             // has a listener by definition.
             const emptyRoom = !GREET_LEGACY && speechStartedAt === 0;
-            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom)) {
+            // The reply the server created for a turn he addressed to EVA (canon 027). Same
+            // reach-forward window as the echo hold, for the same reason: the transcript that
+            // names the addressee lands after the response is already alive.
+            const evaTurn = Date.now() - evaAddressedAt < 3000;
+            const organFloor = Date.now() < organFloorUntil;   // canon 029: never cut an organ off
+            const xconv = xconvHeld();                         // canon 045: a conversation we are not in
+            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom || evaTurn || organFloor || xconv)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responsesCancelled++; sessResponsesCancelled++;
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
               if (selfEcho && !suppressAuto && !noiseBlip) say("info", "auto-reply cancelled at birth — self-echo hold", { echo_suppressed: true, echo_hold: true });
+              if (evaTurn && !suppressAuto && !noiseBlip && !selfEcho) say("info", "auto-reply cancelled at birth — he addressed Eva", { addressee: "eva" });
               // THROTTLED like the suppressAuto notice below it, and for the same reason (W36
               // verify): the daemon parks with turn_detection.idle_timeout_ms=15000, so an empty
               // room self-prompts every ~15s — ~120 cancels across a 30-minute absence. The
@@ -3425,8 +3941,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // never re-judged and the mouth delivers a full turn to nobody (and teaches
               // rememberSpoken/mouth_last a line nobody heard). A response nobody asked for,
               // cancelled because nobody is in the room, is not a starved user turn.
-              if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
-                pendingMouthReply = true;
+              if (xconv && !organFloor && !mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
+                // Held, not swallowed: if that really was a turn for us, it is answered the
+                // moment the room is his again (the release above fires it).
+                pendingMouthReply = true; pendingMouthAt = Date.now();
+                say("info", "mouth reply held — an external conversation is in the room (canon 045)", { external_conversation: true });
+              } else if (organFloor && !mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
+                pendingMouthReply = true; pendingMouthAt = Date.now();   // released the moment the floor frees — queued, not swallowed
+                say("info", `mouth reply held behind ${organFloorWho} audio — will release`, { floor: organFloorWho });
+              } else if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
+                pendingMouthReply = true; pendingMouthAt = Date.now();
                 say("info", "mouth reply held behind mind audio — will release");
               } else if (mindBusy && emptyRoom && !suppressAuto && !noiseBlip && !selfEcho) {
                 // NOT INVISIBLE EITHER. The empty-room notice above reports only when nothing
@@ -3578,7 +4102,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // Bounded: the corpus (n=31) has every resend-sourced turn starting within 2s of
               // the resend, the echo verdict itself is required before any of this runs, and
               // nothing of his is touched on either path — only our answer dies.
-              const stale = door === "recovery" && speechStartedAt > turnStartedAt
+              const stale = door !== "live" && speechStartedAt > turnStartedAt
                 && !(lastResendAt && speechStartedAt >= lastResendAt && speechStartedAt - lastResendAt <= lastResendMs);
               if (!stale) {
                 echoHoldUntil = Date.now() + ECHO_HOLD_MS;   // reaches the NEXT create, not yet born
@@ -3622,6 +4146,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               flushReply();
               break;
             }
+            // LEAK FRAGMENT — the belt above needs the text to MATCH; this one needs it to be
+            // out-of-language garbage. Both doors remove the item from the model's context and
+            // both keep his log byte-identical. Measured on call 96642 (3h34m, 248 you-turns):
+            // 7 removals, every one recogniser garbage off a leak resend ("Taipujepanu.",
+            // "OK, regal.", "avouer.", "Tamam.", "Hallo.", "Ismét elő.", "我不会。"), and ZERO
+            // real turns — his three resend-carved Hebrew turns in that call (01:02:18, 01:58:58
+            // "בבקשה תגביר את הווליום של ההקלטה.", 02:13:02) all survive it.
+            if ((wasRecovered || bulkAppended) && !echoish && leakFragment(tScript)) {
+              turnsTranscribed++; sessTurnsTranscribed++;
+              say("you", tScript, {
+                echo_deleted_from_context: true, echo_leak_fragment: true,
+                echo_sim: Number(m.score.toFixed(2)), echo_recovered: wasRecovered,
+                echo_belt: `leak-fragment${bulkAppended ? "+timing" : ""}`,
+                resent_ms: Math.round(lastResendMs), speech_ms: turnMs, item_id: ev.item_id ?? null,
+              });
+              say("info", `recovered leak fragment — removed from the model's context, KEPT in the log (${echoNorm(tScript).length} chars, no in-language content, resent ${Math.round(lastResendMs)}ms vs turn ${turnMs}ms)`);
+              if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+              echoTeeth("leak-fragment");   // an answer born from garbage dies with it
+              flushReply();
+              break;
+            }
             // FLAG, NEVER DROP. Anything else that smells of leak — a live turn, a mixed or
             // partial recovery, one belt without the other, a residual that survived — is
             // ANNOTATED: additive fields on the ev:"you" record (the text stays byte-identical)
@@ -3630,6 +4175,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (tScript) {
               turnsTranscribed++; sessTurnsTranscribed++;
               const suspect = echoish || bulkAppended;
+              // LANGUAGE PROFILE: only turns NO belt suspects teach it which language he speaks,
+              // so leak garbage can never talk the belt out of firing on more leak garbage.
+              if (!suspect) { cleanTurns++; if (hasHebrew(tScript)) cleanHebrew++; }
               if (suspect) say("info", `possible speaker echo — turn FLAGGED, not removed (${echoish ? "text" : "—"}/${bulkAppended ? "timing" : "—"}${echoish && residual ? ", residual kept" : ""})`);
               say("you", tScript, suspect ? {
                 echo_suspect: true, echo_sim: Number(m.score.toFixed(2)),
@@ -3665,7 +4213,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // almost always no on a perfectly healthy call. "Was anything created since HE
               // started speaking" is the question that was meant. Guaranteed > 0 here: the
               // `turnMs >= minSpeech` bar cannot pass without a paired speech turn.
-              if (!suspect && turnMs >= minSpeech && turnStartedAt > 0) watchAnswer(Date.now(), turnStartedAt);
+              if (!suspect && turnMs >= minSpeech && turnStartedAt > 0) {
+                lastRealTurnAt = Date.now(); lastRealTurnStart = turnStartedAt;   // mind-never-interrupts: he is owed an answer before held MIND lines flow
+                watchAnswer(lastRealTurnAt, turnStartedAt);
+              }
               if (openerArmed && !suspect && turnMs >= minSpeech) {
                 // DO NOT RACE THE SERVER (W36 verify). sendGreeting sets awaitingResponse, and
                 // response.created reads it as `mindResponse = awaitingResponse` — so firing in the
@@ -3829,6 +4380,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               && curResponseBornAt < speechStartedAt) {
             say("info", "empty segment ignored — active reply belongs to the previous real turn (E128 guard)");
           }
+          // EVA-ADDRESSED TURN (canon 027): silence the mouth for it, and keep it silent for a
+          // beat — the server often creates the reply BEFORE the transcript that proves whose
+          // turn it was lands (~300ms), the same race the self-echo hold exists for.
+          if (ev.transcript?.trim() && addressedToEva(ev.transcript)) {
+            evaAddressedAt = Date.now();
+            if (responseActive && !mindResponse) {
+              try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+              if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+              responseActive = false;
+            }
+            say("info", "eva-addressed turn — mouth silenced, Eva answers in her own voice", { addressee: "eva" });
+          }
           flushReply();
           // Hangup is irreversible — require REAL speech behind it, not a noise hallucination.
           if (!closing && ev.transcript && isHangup(ev.transcript) && lastSpeechMs >= 400 && !prevRespId) {
@@ -3849,7 +4412,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.output_item.done":
           // Tool calls arrive as completed function_call items. Only names the caller
           // DECLARED are dispatched — the allow-list is structural, never the model's word.
-          if (ev.item?.type === "function_call" && o.onTool && toolNames.has(ev.item.name)) {
+          if (ev.item?.type === "function_call" && ev.item.name === MOUTH_TOOL.name) {
+            runMouthTool(ev.item);
+          } else if (ev.item?.type === "function_call" && o.onTool && toolNames.has(ev.item.name)) {
             runTool(ev.item);
           } else if (ev.item?.type === "function_call") {
             rec({ ev: "info", text: `tool ${ev.item.name} refused — not in the declared tool list` });
