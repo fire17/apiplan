@@ -748,6 +748,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const CAPS_PATH = `${process.env.HOME}/.livemind/caps.json`;
   const AUDIO_OUT_IGNORE = new Set(["com.apple.CoreSpeech"]);
   let capsJson: any = null; let capsReadAt = 0; let autoUnmutedAt = 0;
+  // CANON 041 (his voice, 2026-08-22): "אני רוצה להיות מסוגל לדבר בפרטיות כשהקפסולה סגורה."
+  // Caps closed = REAL privacy. Recordings still CONTINUE (041 keeps never-lose at full scope,
+  // and canon 047's caps-off archive keeps receiving engine turn-WAVs) — what stops is REACH.
+  // Enforced at TRANSCRIPT PRODUCTION rather than per organ (E535): if a caps-closed turn never
+  // becomes a `you` event, the mouth, every organ and the canon are compliant BY CONSTRUCTION
+  // instead of by each of them remembering. That is his "חייב להיות לפי הקוד" applied to reach.
+  //
+  // The witness is the LAST MOMENT CAPS WAS SEEN ON, sampled from the file lm-ptt publishes —
+  // never from `micMuted`, which is lm-ptt's OPINION of caps and was wrong often enough that
+  // canon 048's sensor had to be built. A turn is caps-closed only if caps was never witnessed
+  // ON at any point inside it.
+  //
+  // FAILS TOWARD PUBLISHING, on purpose: no publisher, a stale file, or a caps.json that gates a
+  // DIFFERENT call all leave `capsOnAt` fresh, so an absent sensor can never silently swallow his
+  // words. Privacy he can verify is worth more than privacy that might be a dead file.
+  let capsOnAt = Date.now();
+  const capsWitness = () => {
+    const j = capsNow();
+    if (!j) { capsOnAt = Date.now(); return; }                                   // no publisher → assume heard
+    if (Date.now() - (Number(j.ts) || 0) > 4000) { capsOnAt = Date.now(); return; }   // stale → assume heard
+    if (j.inject && injectPath && String(j.inject) !== injectPath) { capsOnAt = Date.now(); return; }  // gates another call
+    if (j.caps === true) capsOnAt = Date.now();
+  };
   const capsNow = () => {
     const now = Date.now();
     if (now - capsReadAt > 500) {
@@ -1796,6 +1819,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (pending) { value = pending; pending = undefined; }
           else { const r = await reader.read(); if (r.done) break; value = r.value; }
           if (value?.length) archWrite(value);                 // never-lose: archive BEFORE any drop below
+          if (value?.length) capsWitness();                    // canon 041: witness caps ground truth per frame, before any gate
           // NEVER-LOSE, UNDER ARCH A — read this before trusting an archive from a VP call:
           // these bytes ARE the microphone, so "raw" here means the VPIO capture. macOS
           // cancelled OUR OWN loudspeaker before the sample existed, so the archive holds
@@ -4104,6 +4128,44 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // This turn's own speech clock — never the globals, which any later turn overwrites.
             const turn = speechTurns.shift();
             const turnStartedAt = turn?.startedAt ?? 0; const turnMs = turn?.ms ?? 0;
+            // ── CANON 041 CAPS GATE — the turn never becomes a `you` event ────────────
+            // His words: "אני רוצה להיות מסוגל לדבר בפרטיות כשהקפסולה סגורה." Caps closed for the
+            // WHOLE of this turn means it reaches no responder: not the mouth, not an organ, not
+            // the canon. Placed here (E535) so compliance is structural — nothing downstream has
+            // to remember, because there is nothing downstream to remember about.
+            // The archive is UNTOUCHED and that is the point of 041: record everything, publish
+            // nothing. archWrite() ran per frame far above this, canon 047's caps-off sweeper
+            // still receives its engine turn-WAVs, and the words remain recoverable from disk.
+            // The item is deleted from the MODEL's context too — a turn the mouth must not react
+            // to must not sit in its history either.
+            if (tScript && turnStartedAt > 0 && capsOnAt < turnStartedAt) {
+              turnsTranscribed++; sessTurnsTranscribed++;
+              // Logged as a COUNT and a duration, never as text: the whole point is that these
+              // words do not enter a surface the body reads, and the LOG is such a surface.
+              say("info", `caps closed — turn withheld from every responder (${turnMs}ms, ${tScript.length} chars, recorded not published — canon 041)`,
+                { caps_withheld: true, speech_ms: turnMs, chars: tScript.length, item_id: ev.item_id ?? null });
+              if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+              // WITHHOLDING THE TRANSCRIPT IS NOT ENOUGH — the server may already have created a
+              // reply to it (the transcript routinely lands AFTER response.created), and a mouth
+              // answering a caps-closed turn is the exact thing he asked to be impossible. Two
+              // doors, because the reply can be on either side of this moment:
+              //   in flight — cancel it, guarded by curResponseBornAt >= turnStartedAt so a reply
+              //   belonging to an EARLIER turn is never collateral (the same guard the echo teeth
+              //   learned the hard way on call 31599);
+              //   not yet born — ECHO_HOLD_MS reaches forward one create, which is precisely the
+              //   job that flag already exists for.
+              if (responseActive && !mindResponse && !closing && curResponseBornAt >= turnStartedAt) {
+                try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+                if (curResponseId) cancelledResponses.add(curResponseId);
+                responsesCancelled++; sessResponsesCancelled++;
+                responseActive = false;
+              }
+              echoHoldUntil = Date.now() + ECHO_HOLD_MS;
+              pendingMouthReply = false;   // and nothing parked may be released into a caps-closed turn
+              flushReply();
+              break;
+            }
+
             // TEXT BELT. A recovered turn is judged against everything we spoke; a LIVE turn only
             // against the last 45s, at the raised bar, and only ever to be flagged.
             const m = tScript ? echoScore(tScript, wasRecovered ? Infinity : 45000) : { score: 0, src: "" };
