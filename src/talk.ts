@@ -104,7 +104,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   if (logPath) { try { ensureDir(dirname(logPath)); logw = Bun.file(logPath).writer(); } catch {} }
   const rec = (obj: Record<string, unknown>) => {
     if (!logw) return;
-    try { logw.write(JSON.stringify({ t: Date.now(), ...obj }) + "\n"); logw.flush?.(); } catch {}
+    // ENOSPC KILLED A LIVE CALL (63395, 19:54:29 — mid-word, mid-reply, on a disk at 100%).
+    // The try/catch here is real but it only catches a SYNCHRONOUS throw. Bun's FileSink.flush()
+    // returns a PROMISE, and a rejected promise nobody awaits becomes an unhandled rejection,
+    // which reaches the uncaughtException handler below, which calls close() and rethrows. So
+    // the highest-frequency write in the process — the log — could take the whole call down,
+    // while archWrite/archRoll/saveMindState (all sync, all guarded) could not.
+    // The log is EVIDENCE, never the conversation: losing a line is survivable, losing his call
+    // mid-sentence is not. Same law the archive already states — "must never break the call".
+    try {
+      logw.write(JSON.stringify({ t: Date.now(), ...obj }) + "\n");
+      const f = logw.flush?.() as any;
+      if (f && typeof f.catch === "function") f.catch(() => {});   // ENOSPC / EIO: drop the line, keep the call
+    } catch {}
   };
   const emit = o.onEvent ?? (() => {});
   // `extra` rides into the LOG event only, never into the emitted text — that is how a turn is
@@ -1149,7 +1161,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     if (mindPlayer) { try { mindPlayer.kill("SIGKILL"); } catch {} mindPlayer = null; }
     saveMindState(mindLine ? "cut-by-call-end" : "call-end");
     archRoll("call end");
-    try { logw?.flush?.(); } catch {}
+    try { const f = logw?.flush?.() as any; if (f && typeof f.catch === "function") f.catch(() => {}); } catch {}
   };
   // Clean up the child ffmpeg/ffplay on EVERY exit path, not just Ctrl-C: a leftover
   // ffmpeg keeps the mic device open and the next run fails with "device busy".
@@ -1158,7 +1170,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   if (o.manageSignals !== false) {
     for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => { close(); process.exit(0); });
     process.on("exit", () => { try { close(); } catch {} });
-    process.on("uncaughtException", (e) => { rec({ ev: "info", text: `uncaught ${String((e as any)?.message ?? e).slice(0, 200)}` }); close(); throw e; });
+    // RECORD WHERE IT CAME FROM. Call 63395 died on "uncaught ENOSPC ... write" and the line
+    // named no stack, so which of a dozen write paths threw had to be reasoned out afterwards
+    // instead of read. A fatal event is exactly the wrong place to be economical with evidence.
+    process.on("uncaughtException", (e) => {
+      rec({ ev: "info", text: `uncaught ${String((e as any)?.message ?? e).slice(0, 200)}`,
+            fatal: true, code: (e as any)?.code ?? null, stack: String((e as any)?.stack ?? "").slice(0, 800) });
+      close(); throw e;
+    });
   }
 
   return await new Promise<TalkResult>((resolve) => {
@@ -3583,7 +3602,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         rec({ ev: "info", rotation: true, text: `rotation: predecessor tail (${tail.length} chars) could NOT be carried into the successor — the socket was not open; the turns are in the log as src=predecessor-tail`, rot_tail_dropped: true });
       }
       rotDrainRelease();
-      try { logw?.flush?.(); } catch {}
+      try { const f = logw?.flush?.() as any; if (f && typeof f.catch === "function") f.catch(() => {}); } catch {}
     }
 
     /** The frames captured while there was NO session are on disk. Hand them to the SAME recovery
