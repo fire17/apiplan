@@ -1345,6 +1345,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       const v = process.env[name];
       return v === undefined || v === "" ? dflt : Number(v);   // ""≠0: only an explicit 0 disables
     };
+    // MEASURED BRACKET ON THE NARRATOR'S OWN LEAK (call 35497, his complaint 19:16). A cut
+    // fired at 4/438 chars, ~593ms into audible narrator, with no speech_started anywhere in
+    // the preceding 10s — and the engine's OWN recovery pass on that same window then logged
+    // "overlap recovery skipped — nothing above the leak bar (100ms loud)". RECOVER_PEAK is
+    // 2000. So in that window: >=250ms of frames cleared 1800, and only 100ms cleared 2000.
+    // The narrator's leak therefore lives BETWEEN THE TWO BARS, and this detector listens at
+    // the lower one — the code already says so at the mouth-barge cross-reference below. The
+    // MIND cutting itself on its own voice is the "worst mis-tune" this file names, and it is
+    // not new: 29 cuts across 101 MIND lines on 96642, the loved-state call.
+    // NOT silently retuned here. Level alone may not be able to separate them on this rig —
+    // his close-mic speech runs p90 1642-2194 against a leak band that reaches ~2000 — so
+    // raising this bar trades spurious self-cuts for missed quiet barges, which is HIS ear's
+    // call, testable with one env var (APIPLAN_MIND_BARGE_PEAK=2200) and no rebuild. The
+    // durable separator is the VPIO echo-cancelled mic (LM_BARGE_VP), currently off because
+    // its binary is unversioned — see hands/research/settings-drift-2026-08-22.md.
     const BARGE_PEAK = envBar("APIPLAN_MIND_BARGE_PEAK", 1800);
     const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 250;
     // ── MOUTH-BARGE bars (canon 027: the mic must hear him DURING the mouth's reply) ──
@@ -2524,6 +2539,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
         // sample) so the barge cut never over-counts words as spoken.
         mindLine = mindLast = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1, who };
+        // FRESH LINE, FRESH ACCUMULATOR (his complaint on air, call 35497: "המוח לא אמור
+        // להיקטע אליי אם לא התפרצתי אליו"). `bargeMs` is a LEAKY accumulator with call-long
+        // lifetime; nothing zeroed it when a narrator line begins, so leak from the mouth
+        // playback that just ended — or his own turn that just finished — was still loaded in
+        // it and spent itself on the MIND's first words. The cuts cluster exactly there:
+        // median cut at 13% of the line on 35497, 11% on 57043.
+        // This is a partial belt, and the honest measurement says so: it cannot explain a cut
+        // 593ms into audible narrator (case 4/438 chars). That one is a BAR problem — see the
+        // BARGE_PEAK note — and this line does not pretend to fix it.
+        bargeMs = 0;
         saveMindState("speaking");   // LANE 15: on disk BEFORE the first sample — a hard kill can never erase the line
         // The line is announced exactly as before — same record, same text. The flag only tells
         // convTail WHO said it, so a rotation can carry the words as conversation without teaching
