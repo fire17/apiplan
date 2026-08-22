@@ -1933,7 +1933,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 L.cut = wb > 0 ? wb : Math.max(0, raw);
                 try { mindPlayer.kill("SIGKILL"); } catch {}   // exited handler records the spoken prefix only
                 playingUntil = Date.now() + 250;               // swallow the kill tail — reopening at 0 lets the tail transcribe
-                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars`);
+                // THE PEAK THAT DID IT (MIND lane, 2026-08-22). Every cut before tonight was
+                // unfalsifiable from the log alone: the line said a cut happened, never what
+                // crossed the bar. Four calls had to be re-derived by hand to bracket the
+                // narrator's own leak, and two agents produced two different numbers (1800-2000
+                // from one window, 2441 from another) precisely because the evidence was absent.
+                // Now the trigger carries its own peak, the bar it cleared, and how far into the
+                // narrator it fired — so any future "he was cut without barging" is one grep.
+                const cutAtMs = Math.max(0, Date.now() - L.startAt);
+                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars (peak ${Math.round(pkM)} vs bar ${scaleBar(BARGE_PEAK)}, ${cutAtMs}ms into the line${vp ? ", vp live" : ""})`,
+                  { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: scaleBar(BARGE_PEAK), cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp });
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push({ text: rest, who: L.who }); queueStale = true; }   // remainder is STALE — re-weave against his words
                 saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
