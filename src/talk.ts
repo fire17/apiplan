@@ -411,11 +411,42 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // EMISSION only. The half-duplex belt also refuses to resend the greeting's overlap window
   // in legacy mode (that is defect 1's fix, by design) — same greeting on the wire, one less
   // echo door behind it.
+  //   announce (LM_GREET=announce) — THE MOUTH SAYS IT CAME UP. His order, call 25908,
+  //     you-event t=1787444645847, byte-exact from the LOG (canon 104):
+  //       "מגניב, בוא תוסיף בבקשה שהמוח יוסיף שהוא, זה טוב שהוא, ראיתי שהוא קרא על הפה בהתחלה,
+  //        אבל הפה לא קן אותי כשהוא עלה, אז גם כמובן הקונטקסט שלו צריך להמשיך מהסשן הקודם בלי
+  //        בעיות, אבל הוא כן צריך לבוא ולהעלות ולהגיד לי שהוא עלה."
+  //     Measured on that very call: ZERO model events before his first you-turn at 156.28s — the
+  //     presence opener was FOLDED into the VAD reply to his first words ("opening line folded
+  //     into his first answer"), so the mouth never announced anything; the only restart notice
+  //     either that call or 97289 ever got came from a MIND inject. announce is the mode that
+  //     answers the ask: ONE short opener per CONNECTION, fired from `session.updated` (never at
+  //     open — before the ack the persona is not live, so the line would speak in the default
+  //     assistant voice), carrying the persona + the folded NOW state so his second half —
+  //     "הקונטקסט שלו צריך להמשיך מהסשן הקודם" — holds by construction.
+  //     DERIVED, mine and not his (labelled as the god-file demands): the guards below — skip if
+  //     he is already speaking, one per connection, and the two-sentence / never-a-list cap. The
+  //     cap is L42's lesson paid for live: a greeting once read a list aloud 3x into an empty room.
+  //     HONEST COST: announce deliberately gives up presence's empty-room guarantee. That is the
+  //     trade he asked for, and it is why the connect say-info names the mode LOUDLY.
   const greetMode = (process.env.LM_GREET ?? "presence").trim().toLowerCase();
   const GREET_LEGACY = greetMode === "1" || greetMode === "legacy" || greetMode === "on" || greetMode === "true" || greetMode === "connect";
+  const GREET_ANNOUNCE = greetMode === "announce";
   const GREET_OFF = greetMode === "0" || greetMode === "off" || greetMode === "false";
-  const GREET_PRESENCE = !GREET_LEGACY && !GREET_OFF;
+  const GREET_PRESENCE = !GREET_LEGACY && !GREET_OFF && !GREET_ANNOUNCE;
   let openerArmed = false;      // presence mode: an opening line is owed, waiting for HIM
+  // ONE OPENER DECISION PER CONNECTION — and `greeted` is NOT that flag. The presence FOLD path
+  // spends the one-shot by clearing `openerArmed` while leaving `greeted` false, and the arm site
+  // in `session.updated` is gated on `!greeted` — so any LATER ack on the same live socket (a
+  // rotation promotion, or the MIND's mid-call {"session":…} swap, which sends session.update and
+  // draws a fresh session.updated) re-arms a one-shot that was already declared spent, and the
+  // mouth can open in the middle of a call. Every path that SPENDS the opener sets this instead.
+  let announcedThisConn = false;
+  /** THE EMPTY-ROOM PREDICATE — one definition, seven readers (it was inlined seven times).
+   *  announce is LEGACY-shaped here on purpose: the mode exists to speak before anybody has
+   *  spoken, so a belt that cancels replies "because nobody has spoken yet" would cancel the
+   *  very opener the mode is for. presence and legacy are byte-identical to before. */
+  const emptyRoomNow = () => !GREET_LEGACY && !GREET_ANNOUNCE && speechStartedAt === 0;
   // Audio arrives far faster than it plays, so "the model stopped generating" is NOT
   // "the speaker stopped making noise". Muting on generation-end reopened the mic while
   // seconds of reply were still coming out of the speaker — which the mic then captured
@@ -1283,15 +1314,33 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const greetInstructions = () =>
       [o.direction, typeof o.greet === "string" ? o.greet : ""].filter(Boolean).join("\n\n");
 
+    /** LM_GREET=announce, the one-off direction for the opener. Two sentences, never a list —
+     *  L42 was a greeting that read a list aloud three times into an empty room. */
+    const ANNOUNCE_DIRECTION =
+      "Right now, before anything else: say ONE short opening line, per the FIRST GREETING LAW above, "
+      + "using the NOW state you were given — say that you are UP and back on the line, and continue "
+      + "the thread from the previous session (his last words, and what is still owed him). "
+      + "AT MOST TWO SENTENCES. NEVER read a list. Then stop and listen.";
+    /** `livePersona` and not `o.direction`: it is the persona actually in force (a MIND
+     *  {"session":…} swap moves it), and on a fresh socket this payload OVERRIDES the session
+     *  instructions for the opener — so the persona has to be inside it. */
+    const announceInstructions = () =>
+      [livePersona, typeof o.greet === "string" ? o.greet : "", ANNOUNCE_DIRECTION].filter(Boolean).join("\n\n");
+
     /** Emit the opening line. The payload is EXACTLY what each path has always sent — a
      *  parked socket carries the persona in response.instructions (so the daemon's parked
      *  session stays generic), a fresh connect already has the persona live in the session
      *  and carries only a one-off direction — so LM_GREET moves WHEN it is sent, never what.
      *  One-shot by construction: `greeted` and `openerArmed` both close here. */
-    const sendGreeting = (why?: string) => {
+    const sendGreeting = (why?: string, instructions?: string) => {
       if (greeted || closed || closing || ws.readyState !== WebSocket.OPEN) return;
-      greeted = true; openerArmed = false;
-      const gi = o.skipSessionUpdate ? greetInstructions() : (typeof o.greet === "string" ? o.greet : "");
+      greeted = true; openerArmed = false; announcedThisConn = true;
+      // `instructions` is the LM_GREET=announce carrier and nothing else: on a fresh socket the
+      // realtime API treats response.instructions as an OVERRIDE of the session instructions for
+      // that one response, so the announce payload has to carry the live persona itself or the
+      // opener would speak in the default assistant voice. Every other caller passes nothing and
+      // gets the exact payload it has always sent.
+      const gi = instructions ?? (o.skipSessionUpdate ? greetInstructions() : (typeof o.greet === "string" ? o.greet : ""));
       ws.send(JSON.stringify({ type: "response.create", ...(gi ? { response: { instructions: gi } } : {}) }));
       awaitingResponse = true;
       if (why) say("info", why);
@@ -1322,11 +1371,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime",
             ...(parkPersona ? { instructions: parkPersona } : {}),
             ...(o.tools?.length ? { tools: o.tools, tool_choice: "auto" } : {}) } }));
-          if (parkPersona) say("info", `persona carried into the warm session (${parkPersona.length} chars) — no connect greeting to carry it (GREET MODE ${!o.greet ? "NONE" : GREET_OFF ? "OFF" : "PRESENCE"})`,
+          if (parkPersona) say("info", `persona carried into the warm session (${parkPersona.length} chars) — no connect greeting to carry it (GREET MODE ${!o.greet ? "NONE" : GREET_OFF ? "OFF" : GREET_ANNOUNCE ? "ANNOUNCE" : "PRESENCE"})`,
             { park_persona: true, chars: parkPersona.length });
         }
-        if (o.greet && !greeted) {
-          if (GREET_LEGACY) sendGreeting();
+        if (o.greet && !greeted && !announcedThisConn) {
+          // A parked socket never reaches session.updated, so announce fires HERE or never — and
+          // the persona travels in response.instructions on this path exactly as legacy's does.
+          if (GREET_ANNOUNCE) sendGreeting("mouth opener sent (announce) — parked socket, there is no session ack to wait for (LM_GREET=announce)",
+            [greetInstructions(), ANNOUNCE_DIRECTION].filter(Boolean).join("\n\n"));
+          else if (GREET_LEGACY) sendGreeting();
           else if (GREET_PRESENCE) openerArmed = true;   // held until his first unflagged turn
         }
       } else {
@@ -1345,8 +1398,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // the default, and the one-word escape hatch back to speak-first. A silent mouth must
       // never be indistinguishable from a dead one — or from a mode nobody chose.
       const greetSrc = process.env.LM_GREET ? `LM_GREET=${greetMode}` : "LM_GREET unset → presence DEFAULT";
-      const greetModeName = !o.greet ? "none" : GREET_LEGACY ? "legacy" : GREET_OFF ? "off" : "presence";
+      const greetModeName = !o.greet ? "none" : GREET_LEGACY ? "legacy" : GREET_ANNOUNCE ? "announce" : GREET_OFF ? "off" : "presence";
       say("info", !o.greet ? `listening — speak, and it answers. GREET MODE: NONE (no greeting requested for this call; ${greetSrc}). Ctrl-C to stop.`
+        : GREET_ANNOUNCE ? `GREET MODE: ANNOUNCE (${greetSrc}) — it SPEAKS ONE SHORT OPENER as soon as the session is acked, listener or not, and exactly once per connection. LM_GREET=presence holds the opener until you speak, LM_GREET=0 for never. Ctrl-C to stop.`
         : GREET_LEGACY ? `GREET MODE: LEGACY (${greetSrc}) — connecting, and it SPEAKS FIRST at connect, listener or not. Ctrl-C to stop.`
         : GREET_OFF ? `GREET MODE: OFF (${greetSrc}) — it NEVER opens; the mouth still answers when you speak. LM_GREET=presence to restore the held opening, LM_GREET=1 to speak first. Ctrl-C to stop.`
         : `GREET MODE: PRESENCE (${greetSrc}) — NOTHING is said at connect; the opening line is held and released by your first words. LM_GREET=1 for the old speak-first behaviour, LM_GREET=0 for never. Ctrl-C to stop.`,
@@ -2821,8 +2875,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // excludes emptyRoom, but a stale flag set before this belt existed — or by any future
           // path — would speak to nobody here, where no cancel branch can re-judge it (the
           // response.create below carries awaitingResponse). Same predicate as `emptyRoom`
-          // itself (`!GREET_LEGACY && speechStartedAt === 0`), so LEGACY is byte-identical: an
-          // attended restart has a listener by definition.
+          // itself (`emptyRoomNow()`, one definition for all seven readers), so LEGACY is
+          // byte-identical: an attended restart has a listener by definition — and so is
+          // ANNOUNCE, which speaks first by design.
           // ROTATION DRAIN (W37 verify): a predecessor session may still be finishing its sentence
           // into the SHARED player. Releasing here would start a second voice in it, and clearing
           // the flag would leave his turn unanswered — the "הוא לא מגיב לי" class this file has
@@ -2830,7 +2885,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // predecessor's last word is out (≤ the drain window, never longer).
           if (pendingMouthReply && prevRespId) say("info", "mouth reply still held — the previous session is finishing its sentence (rotation drain)", { rotation: true, drain_hold: true });
           else {
-          if (pendingMouthReply && !(!GREET_LEGACY && speechStartedAt === 0)
+          if (pendingMouthReply && !emptyRoomNow()
               && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
             say("info", "mouth reply released (was held behind mind audio)");
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
@@ -3294,7 +3349,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           const heldFor = Math.round((Date.now() - pendingMouthAt) / 1000);
           pendingMouthAt = 0;
           if (!mindBusy && !mindPlayer && !suppressAuto && !closing && !responseActive && !awaitingResponse
-              && !(!GREET_LEGACY && speechStartedAt === 0) && ws.readyState === WebSocket.OPEN) {
+              && !emptyRoomNow() && ws.readyState === WebSocket.OPEN) {
             say("info", `mouth reply force-released after ${heldFor}s held — a hold that long is a mute (canon 044)`, { forced_release: true, held_s: heldFor });
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
           } else {
@@ -3400,7 +3455,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // organ flows now — held, never dropped ("במקום להצטרף לקיו ולהגיד דברים אחריה").
             say("info", `floor released by ${organFloorWho} — mouth may speak`, { floor_released: organFloorWho });
             organFloorWho = "";
-            if (pendingMouthReply && !mindBusy && !mindPlayer && !prevRespId && !(!GREET_LEGACY && speechStartedAt === 0)
+            if (pendingMouthReply && !mindBusy && !mindPlayer && !prevRespId && !emptyRoomNow()
                 && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
               say("info", "mouth reply released (was queued behind organ audio)");
               try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
@@ -3760,7 +3815,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // Same predicate the mind-audio release uses (W38): a hold may never discharge into a room
         // where nobody has spoken yet. LEGACY greeting is byte-identical — an attended restart has
         // a listener by definition.
-        if (!(!GREET_LEGACY && speechStartedAt === 0) && !suppressAuto && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+        if (!emptyRoomNow() && !suppressAuto && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
           say("info", "mouth reply released (was held behind the rotation drain)", { rotation: true });
           try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; } catch {}
         }
@@ -4129,7 +4184,31 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // Only now are the instructions live, so an opening line spoken before this
           // would be in the default assistant persona rather than yours. (Parked sockets
           // never reach here — their greeting fires from the open path.)
-          if (o.greet && !greeted && !o.skipSessionUpdate) {
+          if (o.greet && !o.skipSessionUpdate && GREET_ANNOUNCE) {
+            // ANNOUNCE (canon 104). This is the earliest legal point to speak: the persona is
+            // live only now. Gated on the PER-CONNECTION flag, never on `greeted` — see the
+            // announcedThisConn comment at its declaration for the defect that gate closes.
+            if (greeted || announcedThisConn) {
+              say("info", "mouth opener skipped (already announced this connection) — a later session ack is not a new call (LM_GREET=announce)",
+                { opener: "skipped", reason: "already announced" });
+            } else if (speechStartedAt !== 0) {
+              // HE BEAT US TO IT. He is already talking, so an opener now would be a second
+              // voice over his own words — his floor outranks the announcement. Fall back to
+              // exactly today's presence behaviour: ARM, and let his first unflagged turn
+              // release it (or fold it into the answer he is already getting).
+              announcedThisConn = true; openerArmed = true;
+              say("info", "mouth opener skipped (user already speaking) — presence arming (LM_GREET=announce)",
+                { opener: "skipped", reason: "user already speaking" });
+            } else {
+              // Through sendGreeting and never a raw ws.send: it sets awaitingResponse, which
+              // response.created reads as `mindResponse` — that is the mindResponse-class
+              // exemption, so none of the three noise gates can cancel the opener. It is a
+              // normal response.create on the live conversation (no conversation:"none"), so
+              // the opener enters the mouth's own history by construction.
+              sendGreeting("mouth opener sent (announce) — the mouth says it came up, without waiting for him (LM_GREET=announce)",
+                announceInstructions());
+            }
+          } else if (o.greet && !greeted && !announcedThisConn && !o.skipSessionUpdate) {
             if (GREET_LEGACY) sendGreeting();
             // Presence mode ARMS here rather than at open for the same reason legacy SENDS
             // here: before session.updated the persona is not live, so an opener fired
@@ -4173,7 +4252,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // of his always sets speechStartedAt before its reply is created — so his own answer
             // can never be caught here. LM_GREET=1 keeps the old behaviour: an attended restart
             // has a listener by definition.
-            const emptyRoom = !GREET_LEGACY && speechStartedAt === 0;
+            const emptyRoom = emptyRoomNow();
             // The reply the server created for a turn he addressed to EVA (canon 027). Same
             // reach-forward window as the echo hold, for the same reason: the transcript that
             // names the addressee lands after the response is already alive.
@@ -4670,7 +4749,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                   // opening line on top of that is a second voice. THAT fold is a real discharge:
                   // he was spoken to, so the one-shot is spent.
                   const covering = responseActive || awaitingResponse || speaking || mindBusy || pendingMouthReply;
-                  if (covering) { say("info", "opening line folded into his first answer — the mouth was already speaking (LM_GREET=presence)", { opener: "folded" }); return; }
+                  if (covering) {
+                    // A fold is a real discharge — so it must spend the CONNECTION, not just the
+                    // arm. Before this line it cleared openerArmed and left `greeted` false, and
+                    // the next session.updated on this same socket re-armed a spent one-shot.
+                    announcedThisConn = true;
+                    say("info", "opening line folded into his first answer — the mouth was already speaking (LM_GREET=presence)", { opener: "folded" }); return; }
                   // ONE-SHOT ECONOMY (W36 verify). A CLOSED mouth is NOT an answer. suppressAuto is
                   // armed for the whole recovery window and for the whole call under
                   // APIPLAN_VAD_CREATE_RESPONSE=0, and the fold's premise — "his first words are
@@ -4687,6 +4771,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     // the voice — his first words ARE being answered — so the one-shot is spent,
                     // exactly like the `covering` fold above.
                     if (process.env.APIPLAN_VAD_CREATE_RESPONSE === "0") {
+                      announcedThisConn = true;   // spent for this connection, same as the fold above
                       say("info", "opening line folded — the mouth is closed for this whole call (APIPLAN_VAD_CREATE_RESPONSE=0); the MIND is the voice that answers him (LM_GREET=presence)",
                         { opener: "folded", reason: "mouth closed for the call" });
                       return;
@@ -4956,7 +5041,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // call (~240 lines per 30 minutes). Still written to the jsonl: our words are kept,
               // just not shouted. The instant he has spoken once this is false forever and every
               // stillborn reply prints exactly as before.
-              if (!GREET_LEGACY && speechStartedAt === 0) {
+              if (emptyRoomNow()) {
                 rec({ ev: "info", text: `empty-room reply never spoken — "${ev.transcript.trim().slice(0, 160)}"`, cancelled_reply: true, empty_room: true });
                 break;
               }
