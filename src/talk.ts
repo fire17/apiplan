@@ -342,9 +342,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // bounded ring means one lost transcript can never strand the pairing for long). The globals
   // above stay for the gates that legitimately mean "the latest turn" (E128, hangup); the echo
   // timing belt reads THIS turn's pair or it does not fire at all.
-  const speechTurns: Array<{ startedAt: number; ms: number }> = [];
+  const speechTurns: Array<{ startedAt: number; ms: number; stopAt: number; prevStopAt: number }> = [];
   let userSpeaking = false;   // VAD says the human is mid-turn — MIND lines HOLD (stack law)
   let lastSpeechStopAt = 0;   // sustained-silence gate: MIND may speak only after ~2.5s of real quiet
+  let prevSpeechStopAt = 0;   // the quiet clock BEFORE the current turn overwrote it — an echo turn puts it back
+  // P9 (hands verify pass): a resend raises SEVERAL segments back to back — four on 97289 inside
+  // 800ms — so putting back only the ONE clock this echo turn overwrote leaves the 2.5s quiet gate
+  // measuring from the PREVIOUS echo, not from his last genuine turn, which is what the MIND's
+  // order says ("release the latch so HELD lines flow after the normal 2.5s quiet gate measured
+  // from the last GENUINE turn"). Bounded ring of recent turn-end clocks, each marked the moment a
+  // transcript proves it was our own voice; the rule then states itself: lastSpeechStopAt is the
+  // newest stop no echo verdict has claimed. Order-independent — a verdict landing out of order
+  // walks the clock back one more hop each time.
+  const stopHistory: Array<{ stopAt: number; echo: boolean }> = [];
+  // ── P9: this turn's echo verdict, carried OUT of the transcript block ──────────────
+  // THE MIND's order, verbatim (bus 2026-08-23 03:00:56, call 97289): "a you-turn flagged as echo
+  // must NOT count as 'user speaking' / 'new user turn' for the stack law, and the mouth must not
+  // auto-reply to it." The verdict is computed deep inside the transcript handler; the stale-queue
+  // law and the auto-reply gates live outside that block, so the verdict travels in these.
+  let echoTurnSuspect = false;   // echoish || bulkAppended — the SAME `suspect` the annotation stamps
+  let echoTurnEchoish = false;   // text belt alone — the narrower bar the reply-cancel belt uses
+  let echoTurnTeeth = false;     // echoTeeth() already ruled on this turn's reply; never second-guess it
+  let echoTurnShort = false;     // under the min-transcript bar (the MIND's +1, measured below)
+  let echoTurnChars = 0;         // that turn's non-space character count, for the echo line
 
   let greeted = false;
   // ── PRESENCE-GATED OPENING (LM_GREET) ─ call 31599, 2026-08-20 ──────────────────
@@ -664,6 +684,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // cascade — including the ASR-garbage turns ("Yalla.", "Metsuya ?", "אני שומע." — the mouth's
   // own Hebrew mis-transcribed) that no text belt can ever match. Each new flag re-arms it.
   const ECHO_HOLD_MS = Math.max(0, Number(process.env.APIPLAN_ECHO_HOLD_MS) || 2500);
+  // ── MIN-TRANSCRIPT BAR (the MIND's +1, bus 2026-08-23 03:01:58) ───────────────────
+  // "a 1-character you-turn ('A', 97289) got a full mouth reply — the empty-transcript gate lets
+  // <=2-char transcripts through; add a min-transcript-length gate." MEASURED BEFORE CHOSEN
+  // (hands, corpus = 3 call logs, 155 you-turns): length 1 → 3 turns, every one machine junk
+  // ("A" ×1 on 97289, the very turn that drew this order; "E" ×2 on 88125, one already flagged
+  // echo_leak_fragment); length 2 → ZERO turns; length 3 → ZERO. So the bar is ONE character, not
+  // three: he answers in two-character Hebrew words constantly ("כן", "לא", "אה") and a blind <3
+  // would have killed real answers for a class the corpus never shows. APIPLAN_SHORT_OK is the
+  // allow-list that protects those answers for anyone who raises the bar — stated honestly, at the
+  // default bar of 2 it is never consulted, so it is safety, not measurement.
+  const SHORT_MIN_CHARS = Math.max(0, Number(process.env.APIPLAN_MIN_TRANSCRIPT_CHARS ?? 2));
+  const SHORT_OK = new Set((process.env.APIPLAN_SHORT_OK ?? "כן לא אה או מה זה לך בו נו OK ok yes no").split(/\s+/).filter(Boolean));
   let echoHoldUntil = 0;        // until this wall clock a VAD auto-reply is an answer to our own voice
   // ── LEAK-FRAGMENT QUARANTINE (call 96642 @ 02:15:53 — three fake "you" turns) ─────────
   // Overlap recovery resent 8.4s of speaker leak (`audio resent (8.4s): overlap-...wav`) and
@@ -4124,11 +4156,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_stopped":
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
           userSpeaking = false;
+          // P9: remember the quiet clock this turn is about to overwrite. If the turn turns out to
+          // be our own speaker echo, the stack law must measure its 2.5s of silence from the last
+          // GENUINE turn — so the echo verdict can put this number back exactly as it was.
+          prevSpeechStopAt = lastSpeechStopAt;
           lastSpeechStopAt = Date.now();
           latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;   // the server closed the turn — the local latch is moot
           // This turn's own clock, for the echo timing belt (consumed by its transcript below).
-          speechTurns.push({ startedAt: speechStartedAt, ms: lastSpeechMs });
+          speechTurns.push({ startedAt: speechStartedAt, ms: lastSpeechMs, stopAt: lastSpeechStopAt, prevStopAt: prevSpeechStopAt });
           if (speechTurns.length > 4) speechTurns.shift();
+          // P9: every turn-end enters the history as GENUINE. Only a transcript can demote it.
+          stopHistory.push({ stopAt: lastSpeechStopAt, echo: false });
+          if (stopHistory.length > 8) stopHistory.shift();
           // Held MIND lines flow once his turn REALLY lands — the sustained-silence gate
           // inside flushInjectQueue re-holds if he resumes within 2.5s.
           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
@@ -4154,6 +4193,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             const wasRecovered = !!ev.item_id && ev.item_id === recoveredItemId;
             if (wasRecovered) recoveredItemId = null;
             const tScript = ev.transcript?.trim() ?? "";
+            // P9: this turn's verdicts start clean. They are read further down the same event —
+            // outside this block, where the stale-queue law and the auto-reply gates live — and a
+            // verdict left over from the previous transcript would silence a real turn.
+            echoTurnSuspect = false; echoTurnEchoish = false; echoTurnTeeth = false;
+            echoTurnChars = tScript.replace(/\s+/g, "").length;
+            echoTurnShort = echoTurnChars > 0 && echoTurnChars < SHORT_MIN_CHARS && !SHORT_OK.has(tScript);
             // This turn's own speech clock — never the globals, which any later turn overwrites.
             const turn = speechTurns.shift();
             const turnStartedAt = turn?.startedAt ?? 0; const turnMs = turn?.ms ?? 0;
@@ -4216,6 +4261,47 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // anything is removed, strip the part our own speech explains and require NOTHING to
             // be left. Any residue at all — a short answer, a question mark — and it is FLAGGED.
             const residual = echoish ? echoResidual(tScript, m.src) : "";
+            // ── ECHO TURNS DO NOT DRIVE THE STACK LAW (P9, call 97289) ────────────────
+            // THE MIND's order, verbatim (bus 2026-08-23 03:00:56): "a you-turn flagged as echo
+            // must NOT count as 'user speaking' / 'new user turn' for the stack law, and the mouth
+            // must not auto-reply to it. two MIND lines sat unspoken for ~4 min while the mouth
+            // answered its own echoes."
+            // WHY IT HAS TO BE UNDONE RATHER THAN PREVENTED: measured on 97289, the engine's own
+            // 11.9s resend raised input_audio_buffer.speech_started 194ms after `audio resent`,
+            // and the echo verdict landed 290ms after THAT. The latch and the quiet clock are
+            // therefore set by OUR audio before anything can know it was ours — by construction,
+            // on every call. So the verdict reverses them here, at the first instant it exists.
+            // THE ENGINE'S OWN VERDICT, NOT A NEW HEURISTIC: `echoish || bulkAppended` is exactly
+            // the `suspect` the annotation branch below stamps as echo_sim / echo_belt. One
+            // definition, read twice. RELEASE-ONLY: this can undo a hold, never create one.
+            echoTurnSuspect = !!tScript && (echoish || bulkAppended);
+            echoTurnEchoish = !!tScript && echoish;
+            if (echoTurnSuspect) {
+              let holdReleased = false;
+              // (a) the latch. Ours to clear only while it is still THIS turn's latch: a genuine
+              // turn that started later owns it now, and clearing that would drop a MIND line
+              // straight over his voice — the one thing the stack law exists to prevent.
+              if (userSpeaking && turnStartedAt > 0 && speechStartedAt === turnStartedAt) { userSpeaking = false; holdReleased = true; }
+              // (b) the 2.5s quiet clock, restored to the last GENUINE turn — same identity test,
+              // so a later real turn's clock is never rolled back underneath it, and the walk-back
+              // crosses a whole echo storm rather than one hop (stopHistory, declared above).
+              if (turn && turn.stopAt) {
+                const h = stopHistory.find((e) => e.stopAt === turn.stopAt);
+                if (h) h.echo = true;
+                const genuine = [...stopHistory].reverse().find((e) => !e.echo);
+                const restored = genuine ? genuine.stopAt : turn.prevStopAt;
+                // Only ever BACKWARD, and only while the clock is still this echo turn's own.
+                if (lastSpeechStopAt === turn.stopAt && restored < lastSpeechStopAt) { lastSpeechStopAt = restored; holdReleased = true; }
+              }
+              if (holdReleased || injectQueue.length) {
+                say("info", `echo turn ignored by stack law (hold released / stale reverted) — sim ${m.score.toFixed(2)}${bulkAppended ? " +timing" : ""}, hold ${holdReleased ? "released" : "was not ours"}, queue ${injectQueue.length}`,
+                  { echo_stack_ignored: true, hold_released: holdReleased, echo_sim: Number(m.score.toFixed(2)),
+                    echo_belt: `${echoish ? "text" : ""}${echoish && bulkAppended ? "+" : ""}${bulkAppended ? "timing" : ""}`, queue: injectQueue.length });
+              }
+              // Held lines flow on the NORMAL gate, now measured from his last real turn — never
+              // immediately: flushInjectQueue re-reads userSpeaking and the 2.5s window at fire time.
+              if (injectQueue.length) setTimeout(flushInjectQueue, 0);
+            }
             // TEETH — ONE definition, TWO doors (call 31599, 2026-08-20). A reply born from a turn
             // that is a moment later judged echo must die no matter WHICH belt judged it. 099e723
             // gave teeth to the live text belt only; the RECOVERY delete below leaned entirely on
@@ -4226,6 +4312,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // TOUCHED: the turn is already logged and emitted byte-identical — only our answer to
             // it dies.
             const echoTeeth = (door: string) => {
+              echoTurnTeeth = true;   // P9: a door has RULED on this turn's reply — including its
+                                      // deliberate "leave the mouth alone"; the belt below never
+                                      // second-guesses that decision.
               // E128's DISCRIMINATOR, ON THE RECOVERY DOOR TOO (call 31599, W36 verify). A recovery
               // transcript can land LATE — 2.0s after the response it belongs to, measured on 31599
               // — and by then a GENUINE live turn may already be under way. `turnStartedAt` is the
@@ -4513,7 +4602,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           // Stale-queue law: a completed user turn makes every held MIND line stale —
           // it must be re-woven against these new words, never auto-fired (echo once).
-          if (ev.transcript?.trim() && injectQueue.length && !queueStale) {
+          // P9 (the MIND's order, 97289): "it must not mark the queue STALE / count as a 'new user
+          // turn'." An echo turn carries no new words to re-weave against — they are OUR words —
+          // and a turn of one junk character carries none either. The verdict is reached earlier in
+          // THIS same event (the two delete doors above `break` before this line at all), so the
+          // marking is PREVENTED rather than undone: there is no window in which a stale flag set
+          // by an echo turn can be observed. A stale flag raised by an EARLIER, genuine turn is
+          // deliberately left standing — undoing that would auto-fire a line he never heard rewoven.
+          if (ev.transcript?.trim() && injectQueue.length && !queueStale && !echoTurnSuspect && !echoTurnShort) {
             queueStale = true;
             say("info", "mind queue STALE (new user turn) — awaiting re-weave");
           }
@@ -4538,6 +4634,40 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           } else if (!ev.transcript?.trim() && responseActive && !mindResponse
               && curResponseBornAt < speechStartedAt) {
             say("info", "empty segment ignored — active reply belongs to the previous real turn (E128 guard)");
+          }
+          // Noise gate, layer 3 — MIN TRANSCRIPT. Same cancel path as the empty gate directly
+          // above, same mindResponse exemption, same E128 born-from-THIS-segment guard. A turn of
+          // one non-space character is a recogniser artefact, not speech: on 97289 the single
+          // character "A" drew a full spoken reply, and it arrived with no speech_started at all
+          // (the previous one was three mute flips and 60s earlier), so lastSpeechMs read 60571ms
+          // and the blip gate could never have caught it. Measurement behind the bar of 1: see
+          // SHORT_MIN_CHARS.
+          if (echoTurnShort && responseActive && !mindResponse && !awaitingResponse && !closing
+              && curResponseBornAt >= speechStartedAt) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+            responseActive = false;
+            say("info", `short-transcript auto-reply cancelled (${echoTurnChars} chars)`, { short_transcript: true, chars: echoTurnChars });
+          }
+          // Noise gate, layer 4 — THE MOUTH MUST NOT ANSWER AN ECHO (the MIND's order, part c).
+          // echoTeeth() already kills the reply on every door that RULED on this turn (live text
+          // belt, recovery, leak-fragment) and its deliberate "a live turn is in flight, leave the
+          // mouth alone" verdict must stand — that is what `echoTurnTeeth` protects. This belt
+          // covers the one gap the forensics found: an echoish turn that reached the flag-only
+          // branch (a recovered turn whose residual survived, or one inside the recovery window)
+          // and so met no door at all.
+          // NARROWER THAN THE HOLD RULE, ON PURPOSE: text-belt agreement only, never
+          // timing-belt-only. A genuine turn CAN begin inside a resend window — the timing belt's
+          // own comment says so — and killing his real answer is the "הוא לא מגיב לי" defect this
+          // file has closed twice already. Releasing a hold early costs 2.5 seconds; cancelling a
+          // real reply costs him an answer. HIS WORDS ARE UNTOUCHED either way: say("you") has
+          // already logged and emitted the turn byte-identical; only our answer to it dies.
+          if (echoTurnEchoish && !echoTurnTeeth && responseActive && !mindResponse && !closing
+              && curResponseBornAt >= speechStartedAt) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+            responseActive = false;
+            say("info", "echo auto-reply cancelled — no door claimed this turn, the mouth was answering itself", { echo_reply_cancelled: true });
           }
           // EVA-ADDRESSED TURN (canon 027): silence the mouth for it, and keep it silent for a
           // beat — the server often creates the reply BEFORE the transcript that proves whose
