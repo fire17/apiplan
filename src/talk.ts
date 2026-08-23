@@ -589,6 +589,33 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       fs.renameSync(tmp, mindStatePath);
     } catch { /* state must never break the call */ }
   };
+  // ── ON-AIR PUBLISHER (hands L252, 2026-08-23) ────────────────────────────────────────
+  // ~/.livemind/playback.json {"v":1,"on_air":bool,"src":"mouth"|"mind"|"","call","ts"} — TRUE
+  // exactly while OUR OWN audio is in the room: the same predicate the vp barge arms on
+  // (`stillAudible() || mindPlayer`, onVpBarge). Written on every flip and as a 1 s heartbeat,
+  // atomically (tmp+rename). Readers (lm-ptt's mic meter first) treat a missing or stale
+  // (>1.5 s) file as NOT on air — fail OPEN, the meter then shows the raw mic as before.
+  // Born of call 14838 14:06 — the pill pegged full on speaker leak while the MOUTH talked;
+  // lm-ptt's raw device capture cannot know by itself when the speaker is ours.
+  const playbackPath = process.env.APIPLAN_PLAYBACK_STATE === "" ? "" :
+    (process.env.APIPLAN_PLAYBACK_STATE || `${process.env.HOME}/.livemind/playback.json`);
+  let pbLastKey = ""; let pbLastWrite = 0;
+  const publishPlayback = (off = false) => {
+    if (!playbackPath) return;
+    try {
+      const onAir = !off && (stillAudible() || !!mindPlayer);
+      const src = mindPlayer ? "mind" : onAir ? "mouth" : "";
+      const key = `${onAir}|${src}`; const now = Date.now();
+      if (key === pbLastKey && now - pbLastWrite < 1000) return;
+      pbLastKey = key; pbLastWrite = now;
+      ensureDir(dirname(playbackPath));
+      const tmp = `${playbackPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ v: 1, on_air: onAir, src, call: callId, ts: now }));
+      fs.renameSync(tmp, playbackPath);
+    } catch { /* state must never break the call */ }
+  };
+  const playbackTimer = playbackPath ? setInterval(publishPlayback, 100) : null;
+  (playbackTimer as any)?.unref?.();
   let recoveryHeldReply = false;              // a VAD auto-reply cancelled ONLY by the overlap-recovery window — released once the echo discriminator has ruled (call 3357)
   let pendingMouthReply = false;              // a VAD auto-reply cancelled only because MIND audio was playing — release it after
   let pendingMouthAt = 0;                     // when it was parked — canon 044: a hold that never releases is a mute
@@ -1258,6 +1285,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     if (closed) return; closed = true;
     if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (playbackTimer) { clearInterval(playbackTimer); pbLastKey = ""; publishPlayback(true); }   // final write: on_air=false
     try { ws.close(); } catch {}
     // ROTATION: a parked successor and a draining predecessor are real sockets. A call that ends
     // mid-rotation must leak neither past process exit (the warm daemon's own orphaned-socket
