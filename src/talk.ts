@@ -3173,6 +3173,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                   say("info", "external conversation in the room — voices HOLD (canon 045)", { external_conversation: true });
                 }
                 xconvUntil = xu;
+              } else if (xconvSince) {
+                // CANON 097 (his order, ask-pill 2026-08-23 02:04:11): "אם אחד המשפטים או
+                // סייפאורדים נאמרת אז חוזרים למצב רגיל" — a spoken release phrase takes the hold
+                // down at the producer (ears/xconv.py release_by_phrase). This branch honours a
+                // producer that released ITS OWN hold — a phrase, caps-on, or the hard cap — on
+                // THIS tick, instead of waiting out a lease we were handed before it changed its
+                // mind (up to 1.5s of his voice still being held for nothing). Release-only: it
+                // can never extend a hold, and an unreadable file still throws to the catch below
+                // where the lease expires on its own (canon 045: every reader fails OPEN).
+                xconvUntil = 0;
               }
             }
           } catch {}
