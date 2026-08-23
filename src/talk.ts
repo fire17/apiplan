@@ -1489,6 +1489,85 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // its binary is unversioned — see hands/research/settings-drift-2026-08-22.md.
     const BARGE_PEAK = envBar("APIPLAN_MIND_BARGE_PEAK", 1800);
     const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 250;
+    // ── MIND BARGE NEEDS SPEECH EVIDENCE (MIND spec 2026-08-23 05:18; hands engine lane) ──
+    // A LOUD SOUND IS NOT A HUMAN INTERRUPTING. The two legs above (level bar + leaky sustain)
+    // measure ENERGY, and on a rig whose canceller is down the loudest energy in the room is
+    // OUR OWN NARRATOR. Measured, not argued (hands, 2026-08-23, call 25908 turn-633 archive,
+    // 50ms blocks): his real close-mic speech in that same file peaks 1867-3634 with a
+    // continuous 900-2000 floor between syllables; the burst train that fired the 05:11:00.746
+    // cut peaks 8343 / 10589 / 9458 / 12833 / 16898 / 26056 in 50-150ms stabs with a ~130 floor
+    // between them. The call's own log says why: `vp capture down` at 03:21:13 — 19s after
+    // bring-up — so every frame after that ran on the RAW ffmpeg mic. The sibling P9 lane
+    // measured the same uncancelled leak at 6110-8397 (clipping 32768) on call 97289 and
+    // concluded no level bar can separate it from him. That is the whole class:
+    //   25908 05:11:00.746  peak 13492, no VAD turn open, no transcript after the cut
+    //   97289 03:00:47.628  peak  4569, same shape
+    // and he then had to ask what the mind had said. HIS LAW IS UNCHANGED — "הקול שלך מעל הכל",
+    // his voice outranks the MIND's audio — so the cut is not weakened, it is EVIDENCED: a peak
+    // may only ARM a short confirmation window (the accumulator keeps running), and the cut
+    // fires the moment SPEECH EVIDENCE lands inside it:
+    //   vp        the VPIO-cleaned child's speech verdict (scored on the cancelled signal, so by
+    //             construction it cannot be our own speakers) — the launcher exports
+    //             LM_BARGE_VP=1 by default since 0d063fc, so this is the normal source;
+    //   vad-open  the server already has a turn open (userSpeaking) when the peak lands;
+    //   vad-late  a server input_audio_buffer.speech_started that arrives INSIDE the window.
+    // No evidence by expiry → NO CUT, and the candidate is logged with its peak and loud-ms so
+    // the calibration corpus grows instead of the mystery (P9 asked for exactly this).
+    // COST, STATED, NEVER ABSORBED SILENTLY: a barge whose evidence is already present when the
+    // sustain completes costs 0ms (vp events lead the peak in practice); a barge confirmed later
+    // costs the arrival delay, bounded by APIPLAN_MIND_BARGE_CONFIRM_MS (400ms default — the
+    // engine's own AUTOUNMUTE_MS budget, "he must lose a word, not a sentence", and 2-8x longer
+    // than the 50-150ms stabs measured above while sitting inside his 300-700ms real-speech
+    // sustain). APIPLAN_MIND_BARGE_REQUIRE_SPEECH=0 restores today's peak-only behaviour exactly.
+    // KNOWN COST OF THE DEFAULT (say it out loud): on a rig where the canceller is DOWN there is
+    // no evidence source at all, so mind-barge stops cutting and every candidate is logged
+    // `no evidence source`. That is the deliberate trade the P9 lane recommended — "a barge that
+    // can only cut our own voice is worse than no barge" — and it is one env var to undo.
+    const envInt = (name: string, dflt: number) => {           // RECOVER_TAIL_MS idiom: a typo'd env falls back, never becomes NaN
+      const n = envBar(name, dflt);
+      return Number.isFinite(n) ? n : dflt;
+    };
+    // ── THE MIND'S OWN EVIDENCE, VERBATIM (spec 2026-08-23 05:18:11, engine-lane-barge-needs-
+    // speech-evidence.md; his forensics + Eva's). Quoted, never paraphrased — the confirmation
+    // window below exists ONLY because of it:
+    //
+    //   "the MIND-barge detector cuts narrator audio on RAW MIC PEAK ALONE. Evidence: 05:11:00 on
+    //    25908 'mind interrupted by user — spoke 48/589 chars (peak 13492 vs bar 1800)' with NO VAD
+    //    speech_started open and 'overlap recovery skipped — nothing above the leak bar (100ms
+    //    loud)' — a 100ms loud transient, almost certainly computer playback; he then had to ask
+    //    'what did the mind say'. Same shape 97289 03:00:47 (60/239 chars, peak 4569, no VAD) — the
+    //    barge he apologised for may not have been him."
+    //   "A loud sound is not a human interrupting."
+    //
+    // HANDS' ONE CORRECTION TO THAT EVIDENCE (mine, labelled as mine — the verdict is unchanged,
+    // only one fact is): the "(100ms loud)" recovery line does NOT measure the pre-cut window. The
+    // cut branch ends with `ovStart = -1; ovEnd = 0;`, so the recovery pass that printed it was
+    // measuring a window RE-OPENED after the SIGKILL. It proves the loud thing STOPPED at the cut,
+    // not that it only lasted 100ms. The archive envelope measured directly (turn-633 wav, 50ms
+    // blocks) says the same thing louder: 50-150ms stabs of 8343-26056 over a ~130 floor, against
+    // his real speech in that same file — 1867-3634, continuous 900-2000 floor, 2.3s sustained.
+    const BARGE_REQUIRE_SPEECH = envInt("APIPLAN_MIND_BARGE_REQUIRE_SPEECH", 1);
+    const BARGE_CONFIRM_MS = Math.max(0, envInt("APIPLAN_MIND_BARGE_CONFIRM_MS", 400));
+    // PURE by design (no Date.now, no closure state) so hands/tests/mind-barge-evidence.test.mjs
+    // can extract THIS body by anchor and run the engine's own decision instead of a copy.
+    const mindBargeVerdict = (o: {
+      mode: number; now: number; candAt: number; confirmMs: number;
+      sustained: boolean; vpLive: boolean; vpFresh: boolean;
+      userSpeaking: boolean; speechStartedAt: number;
+    }): { verdict: "cut" | "arm" | "reject" | "hold"; evidence: string } => {
+      const evidence = o.vpFresh ? "vp"
+        : o.userSpeaking ? "vad-open"
+        : (o.candAt > 0 && o.speechStartedAt >= o.candAt ? "vad-late" : "");
+      if (o.mode <= 0) return { verdict: o.sustained ? "cut" : "hold", evidence: "peak-only" };
+      if (o.candAt > 0) {                                       // window open: evidence wins, expiry rejects
+        if (evidence) return { verdict: "cut", evidence };
+        if (o.now - o.candAt >= o.confirmMs) return { verdict: "reject", evidence: o.vpLive ? "" : "no evidence source" };
+        return { verdict: "hold", evidence: "" };
+      }
+      if (!o.sustained) return { verdict: "hold", evidence: "" };
+      if (evidence) return { verdict: "cut", evidence };        // already proven when the peak completes → 0ms cost
+      return { verdict: "arm", evidence: "" };
+    };
     // ── MOUTH-BARGE bars (canon 027: the mic must hear him DURING the mouth's reply) ──
     // Same signal and the same leaky accumulator as the MIND pair above, with its own knobs:
     // the mouth's window is longer and its leak louder, and the MIND pair must not be
@@ -1689,6 +1768,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let latchHadVoice = false;  // any voice heard inside THIS latch? (picks which stretch applies)
     let latchTimedOut = false;  // the latch was cleared by timeout, not by the server
     let bargeMs = 0; let lastBargeAt = 0;
+    let bargeCandAt = 0; let bargeCandPeak = 0; let bargeCandMs = 0;   // the open speech-evidence confirmation window
     let mouthBargeMs = 0; let lastMouthBargeAt = 0; let mouthBargeTailUntil = 0;
     // Last moment the LOCAL mic evidence cleared bar+sustain — the duplex self-cut guard.
     let bargeEvidenceAt = 0;
@@ -2051,7 +2131,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // cut the NARRATOR ITSELF (which ends the leak), never the mouth mid-reply, and it
               // never sends gated audio. Re-fit for VPIO levels with APIPLAN_MIND_BARGE_PEAK.
               const vpNarrOk = !vp || (vpFresh() && pkM >= scaleBar(BARGE_PEAK));
-              if (bargeMs >= BARGE_SUSTAIN && vpNarrOk && Date.now() - lastBargeAt > 1000) {
+              // EVIDENCE GATE (see the mindBargeVerdict block above). `sustained` is HEAD's exact
+              // trigger; what changes is only what happens when it is true and nothing proves he spoke.
+              const sustained = bargeMs >= BARGE_SUSTAIN && vpNarrOk && Date.now() - lastBargeAt > 1000;
+              if (bargeCandAt) { bargeCandMs += fMs; bargeCandPeak = Math.max(bargeCandPeak, pkM); }
+              const bv = mindBargeVerdict({
+                mode: BARGE_REQUIRE_SPEECH, now: Date.now(), candAt: bargeCandAt, confirmMs: BARGE_CONFIRM_MS,
+                sustained, vpLive: !!vp, vpFresh: vpFresh(), userSpeaking, speechStartedAt,
+              });
+              if (bv.verdict === "arm") {
+                // ARM ONLY. THE ABSOLUTE INVARIANT IS UNTOUCHED: this branch writes three counters
+                // and falls through to the `continue` below exactly like a quiet frame — it never
+                // touches micMuted, never clears the gate, never sends a frame. The window listens
+                // to audio we are ALREADY dropping.
+                bargeCandAt = Date.now(); bargeCandPeak = pkM; bargeCandMs = fMs;
+              } else if (bv.verdict === "reject") {
+                say("info", `mind barge candidate rejected — no speech evidence (peak ${Math.round(bargeCandPeak)}, ${Math.round(bargeCandMs)}ms loud, ${Math.round(Date.now() - bargeCandAt)}ms window${bv.evidence ? `, ${bv.evidence}` : ", vp live"})`,
+                  { mind_barge_rejected: true, cand_peak: Math.round(bargeCandPeak), cand_loud_ms: Math.round(bargeCandMs),
+                    cand_window_ms: Math.round(Date.now() - bargeCandAt), cand_bar: scaleBar(BARGE_PEAK), vp_live: !!vp });
+                bargeCandAt = 0; bargeCandPeak = 0; bargeCandMs = 0;
+                bargeMs = 0; lastBargeAt = Date.now();          // the 1s cooldown now bounds the echo rate too
+              } else if (bv.verdict === "cut") {
+                const confirmMs = bargeCandAt ? Math.max(0, Date.now() - bargeCandAt) : 0;
+                bargeCandAt = 0; bargeCandPeak = 0; bargeCandMs = 0;
                 bargeMs = 0; vpBargeAt = 0; lastBargeAt = Date.now();
                 const L = mindLine;
                 // startAt is biased by ffplay spin-up (~250ms measured) and the cut rounds
@@ -2069,8 +2171,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // Now the trigger carries its own peak, the bar it cleared, and how far into the
                 // narrator it fired — so any future "he was cut without barging" is one grep.
                 const cutAtMs = Math.max(0, Date.now() - L.startAt);
-                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars (peak ${Math.round(pkM)} vs bar ${scaleBar(BARGE_PEAK)}, ${cutAtMs}ms into the line${vp ? ", vp live" : ""})`,
-                  { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: scaleBar(BARGE_PEAK), cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp });
+                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars (peak ${Math.round(pkM)} vs bar ${scaleBar(BARGE_PEAK)}, ${cutAtMs}ms into the line${vp ? ", vp live" : ""}, evidence ${bv.evidence}${confirmMs ? ` +${confirmMs}ms` : ""})`,
+                  { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: scaleBar(BARGE_PEAK), cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp,
+                    cut_evidence: bv.evidence, cut_confirm_ms: confirmMs });
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push({ text: rest, who: L.who }); queueStale = true; }   // remainder is STALE — re-weave against his words
                 saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
