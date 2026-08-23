@@ -365,6 +365,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let echoTurnTeeth = false;     // echoTeeth() already ruled on this turn's reply; never second-guess it
   let echoTurnShort = false;     // under the min-transcript bar (the MIND's +1, measured below)
   let echoTurnChars = 0;         // that turn's non-space character count, for the echo line
+  // ── E605/E606: this turn's EXTERNAL-SUSPECT verdict, carried out of the transcript block ──
+  // MARK, NEVER SUPPRESS. The verdict is computed at commit time inside the annotation branch;
+  // the auto-reply belt that consumes it lives outside that block, exactly like the P9 verdicts
+  // above. It gates ONE thing — the mouth's own auto-reply — and nothing else: the you-record,
+  // the archive and the canon are already written byte-identical before this is ever read.
+  let externalMarked = false;    // non-Hebrew AND xconv-adjacent (the E606 rule)
 
   let greeted = false;
   // ── PRESENCE-GATED OPENING (LM_GREET) ─ call 31599, 2026-08-20 ──────────────────
@@ -582,6 +588,53 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const XCONV_FILE = `${process.env.HOME}/.livemind/external-conversation.json`;
   let xconvUntil = 0, xconvSince = 0;
   const xconvHeld = () => Date.now() < xconvUntil;
+  // ── EXTERNAL-SUSPECT MARK (E605 + E606) ──────────────────────────────────────────
+  // WHAT WAS RETRACTED FIRST, so nobody rebuilds it: quarantining a you-turn by TIME alone
+  // (inside/±Nms of a window) is unbuildable. Eva measured it — a leak always commits AFTER
+  // the window closes, because the recogniser needs the audio to end, so the strict form
+  // catches zero leaks; and his own closest real turn sits +14.7s from a close against the
+  // furthest leak at +12.1s, so any pad wide enough to catch leaks swallows HIS words.
+  // Eva's law, verbatim: "THE THRESHOLD BELONGS TO THE CONSEQUENCE, NOT TO THE SIGNAL — 60s
+  // proximity right for marking is catastrophic for suppressing."
+  // WHAT THIS IS INSTEAD: language is the population SELECTOR (non-Hebrew), xconv proximity is
+  // the DECIDER, and the consequence is a MARK plus the loss of the mouth's auto-reply — never
+  // the commit, never the archive, never canon. Measured corridor on call 25908: the three
+  // leaks commit at +0.7s / +2.8s / +12.1s past a close, the next non-Hebrew turn of any kind
+  // at +316.0s (Eva's wider corpus: +193.2s). The threshold lives anywhere in that gap; 60s is
+  // hers. Against HIS Hebrew turns the margin is half a second, which is precisely why nothing
+  // here may suppress.
+  // COST, stated honestly: a real English turn of his inside the window loses ONE auto-reply —
+  // the MIND reads the mark in the LOG and answers. A swallowed turn is not recoverable, so
+  // the two errors are not symmetric and the design takes the recoverable one.
+  const EXTERNAL_MARK_ON = process.env.APIPLAN_EXTERNAL_MARK !== "0";           // fail-OPEN: 0 = today's behaviour, mechanism inert
+  const EXTERNAL_MARK_MS = Math.max(0, Number(process.env.APIPLAN_EXTERNAL_MARK_MS ?? 60000));
+  // The file publishes {active,since,until} and NOTHING else (canon 045/047) — when a window
+  // closes it goes back to {active:false,since:0,until:0}, so the CLOSE TIME exists nowhere on
+  // disk. It is observable only by watching the transition, so the engine keeps its own ring of
+  // the closes IT saw. Bounded and in RAM: no history of a private conversation is ever written.
+  const xconvCloses: number[] = [];
+  const XCONV_RING = 32;
+  /** ms since the most recent OBSERVED close at or before `at`; -1 when none is known.
+   *  FAIL-OPEN BY CONSTRUCTION: an empty ring — EARS never ran, the file is missing, stale or
+   *  unparseable (the poll tick's own try/catch swallows all three) — returns -1, i.e. NOT
+   *  adjacent, i.e. nothing is ever marked. A dead sensor can never cost him a reply. */
+  const xconvSinceClose = (at: number) => {
+    for (let i = xconvCloses.length - 1; i >= 0; i--) { const d = at - xconvCloses[i]; if (d >= 0) return d; }
+    return -1;
+  };
+  /** Adjacent = a window is open right now, or one closed within EXTERNAL_MARK_MS. The open
+   *  case is HANDS' derivation, not in the MIND's wording: a transcript committing while the
+   *  room is still busy is the same population, and it can only ever add a mark. */
+  const xconvAdjacent = (at: number) => {
+    if (xconvHeld()) return true;
+    const d = xconvSinceClose(at);
+    return d >= 0 && d <= EXTERNAL_MARK_MS;
+  };
+  /** THE DECIDER, one expression, no side effects — extracted and run for real by
+   *  ~/Creations/LiveMind/hands/tests/external-mark.test.mjs. `hasHebrew` is the engine's own
+   *  script test (the same one the language profile uses), so "non-Hebrew" can never drift
+   *  apart from what the rest of this file means by it. */
+  const externalSuspect = (t: string, at: number) => EXTERNAL_MARK_ON && !!t.trim() && !hasHebrew(t) && xconvAdjacent(at);
   const HOLD_MAX_MS = Number(process.env.APIPLAN_HOLD_MAX_MS) || 12000;     // a hold is not a mute
   let organFloorUntil = 0, organFloorWho = "", floorBogusAt = 0;
   let mutedSinceAt = 0, lastMutedNoteAt = 0;   // canon 044: a closed mouth announces itself
@@ -3223,6 +3276,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // never dropped, the same contract the organ floor keeps.
             say("info", `external conversation ended after ${Math.round((Date.now() - xconvSince) / 1000)}s — voices released (canon 045)`, { external_conversation: false });
             xconvSince = 0;
+            // THE ONLY PLACE A CLOSE IS OBSERVABLE (E606). This branch is reached by every
+            // release path there is — lease expiry, the producer's own release (phrase, caps-on,
+            // hard cap) and a vanished file — so the ring sees every window this call witnessed.
+            xconvCloses.push(Date.now()); if (xconvCloses.length > XCONV_RING) xconvCloses.shift();
             if (injectQueue.length) setTimeout(flushInjectQueue, 0);
             // `!prevRespId` — PRE-RELAUNCH AUDIT 2026-08-22 (P1). The canonical release path
             // (mouth reply released — was held behind mind audio) holds on a rotation drain
@@ -4196,7 +4253,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // P9: this turn's verdicts start clean. They are read further down the same event —
             // outside this block, where the stale-queue law and the auto-reply gates live — and a
             // verdict left over from the previous transcript would silence a real turn.
-            echoTurnSuspect = false; echoTurnEchoish = false; echoTurnTeeth = false;
+            echoTurnSuspect = false; echoTurnEchoish = false; echoTurnTeeth = false; externalMarked = false;
             echoTurnChars = tScript.replace(/\s+/g, "").length;
             echoTurnShort = echoTurnChars > 0 && echoTurnChars < SHORT_MIN_CHARS && !SHORT_OK.has(tScript);
             // This turn's own speech clock — never the globals, which any later turn overwrites.
@@ -4415,16 +4472,43 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (tScript) {
               turnsTranscribed++; sessTurnsTranscribed++;
               const suspect = echoish || bulkAppended;
+              // ── EXTERNAL-SUSPECT MARK, at commit time (E605/E606) ─────────────────────
+              // COMMIT TIME, not speech time, is the clock Eva measured: a leak's speech STARTS
+              // inside the window (it IS the window's audio), so a start-time test reads negative
+              // and marks nothing. The corridor she found — leaks at +0.7/+2.8/+12.1s, the next
+              // non-Hebrew turn at +316.0s — is a corridor of COMMITS.
+              // NOTHING BELOW THIS LINE IS GATED BY IT: say("you") runs byte-identical either way,
+              // the archive was written per frame far above, the item stays in the model's context
+              // and the canon still receives the turn. The single consequence is the belt at the
+              // bottom of this handler, which cancels the mouth's own auto-reply.
+              // DELIBERATELY NOT TOUCHED: the language profile below. A marked turn still teaches
+              // it exactly what it taught before — narrowing that would change a second thing,
+              // and the mark is allowed to change one.
+              // THE SPEC, in the MIND's and Eva's words (bus E606, 2026-08-23 05:01:18) — the one
+              // sentence this whole mechanism obeys:
+              //     "THE THRESHOLD BELONGS TO THE CONSEQUENCE, NOT TO THE SIGNAL"  — Eva
+              // 60s is right for a MARK and catastrophic for a SUPPRESSION, so the consequence is
+              // a mark. MARK, NEVER SUPPRESS: this line decides one thing and one thing only.
+              externalMarked = externalSuspect(tScript, Date.now());
               // LANGUAGE PROFILE: only turns NO belt suspects teach it which language he speaks,
               // so leak garbage can never talk the belt out of firing on more leak garbage.
               if (!suspect) { cleanTurns++; if (hasHebrew(tScript)) cleanHebrew++; }
               if (suspect) say("info", `possible speaker echo — turn FLAGGED, not removed (${echoish ? "text" : "—"}/${bulkAppended ? "timing" : "—"}${echoish && residual ? ", residual kept" : ""})`);
-              say("you", tScript, suspect ? {
+              // The mark travels ON the you-record (an additive field, the text untouched) so the
+              // MIND and Eva both see it without reading a second line.
+              const ann: Record<string, unknown> = suspect ? {
                 echo_suspect: true, echo_sim: Number(m.score.toFixed(2)),
                 echo_belt: `${echoish ? "text" : ""}${echoish && bulkAppended ? "+" : ""}${bulkAppended ? "timing" : ""}`,
                 echo_recovered: wasRecovered, echo_residual: residual.slice(0, 200),
                 resent_ms: Math.round(lastResendMs), speech_ms: turnMs,
-              } : undefined);
+              } : {};
+              if (externalMarked) {
+                ann.external_suspect = true; ann.external_belt = "lang+xconv";
+                ann.xconv_since_ms = xconvHeld() ? 0 : xconvSinceClose(Date.now());
+              }
+              say("you", tScript, (suspect || externalMarked) ? ann : undefined);
+              if (externalMarked) say("info", "turn marked external-suspect (lang+xconv) — the mouth will not auto-reply; his words are logged, archived and kept in full",
+                { external_suspect: true, external_belt: "lang+xconv", xconv_since_ms: xconvHeld() ? 0 : xconvSinceClose(Date.now()) });
               // RELEASE THE PARKED REPLY (call 3357). Reaching this line means the turn was
               // KEPT — the discriminator either found no echo or declined to call it one, and
               // it is now in the model's context. The answer it was owed is created here.
@@ -4668,6 +4752,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
             responseActive = false;
             say("info", "echo auto-reply cancelled — no door claimed this turn, the mouth was answering itself", { echo_reply_cancelled: true });
+          }
+          // Noise gate, layer 5 — EXTERNAL-SUSPECT MARK (E605/E606). Same cancel path as the four
+          // gates above, same mindResponse exemption, same E128 born-from-THIS-segment guard.
+          // THE WHOLE CONSEQUENCE OF THE MARK IS THESE SIX LINES. It cancels the mouth's own
+          // auto-reply and does nothing else: no conversation.item.delete, no echoHoldUntil
+          // reaching forward into the next create (a forward hold is a time-bound suppression,
+          // which is exactly the retracted design), no touch to the you-record above, which has
+          // already been logged and emitted byte-identical.
+          if (externalMarked && responseActive && !mindResponse && !awaitingResponse && !closing
+              && curResponseBornAt >= speechStartedAt) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+            responseActive = false;
+            say("info", "external-suspect auto-reply cancelled (lang+xconv)", { external_reply_cancelled: true });
           }
           // EVA-ADDRESSED TURN (canon 027): silence the mouth for it, and keep it silent for a
           // beat — the server often creates the reply BEFORE the transcript that proves whose
