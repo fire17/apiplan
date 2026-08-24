@@ -2840,6 +2840,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               { caps_resend_refused: "capsoff-window", path, cap_start_ms: capStart, cap_end_ms: capEnd, caps_off_at: capsOffAt });
             return;
           }
+          // (2d) canon 119 (his ruling 2026-08-24): a HISTORICAL turn-wav whose call has NO source LOG is
+          // permanently UNCLASSIFIABLE — no mute timeline can ever be derived for it — so canon 047's
+          // privacy-safe reading is to REFUSE it (the never-lose archive still holds it; a promote is his
+          // CLI, costing one step). DISTINCT from a LIVE/current call, which HAS a LOG and stays fail-open
+          // (never swallow his words on a live sensor gap). turn-* engine wavs only; capson-* are caps-ON.
+          if (/^turn-.*\.wav$/.test(base)) {
+            const callId = basename(dirname(path));
+            let hasLog = true;   // fail OPEN on any error — a stat glitch must never block a legit resend
+            try {
+              hasLog = fs.existsSync(`/tmp/${callId}.jsonl`)
+                || (fs.existsSync(`${LM_HOME}/calls/${callId}`) && fs.readdirSync(`${LM_HOME}/calls/${callId}`).some(f => f.endsWith(".jsonl")));
+            } catch { hasLog = true; }
+            if (!hasLog) {
+              say("info", `audio resend refused — ${base} is from a LOG-less call (${callId}); permanently unclassifiable, canon 047 refuses unknown historical audio (recorded not published; promote is his call)`,
+                { caps_resend_refused: "no-log-unclassifiable", path, call: callId });
+              return;
+            }
+          }
         }
       } catch { /* classification glitch (stat/size) must never block a legit resend — fail toward his words */ }
       // ROTATION: a resend streams over seconds. Swapping in the middle would send its head to one
