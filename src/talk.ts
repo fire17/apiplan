@@ -517,6 +517,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // איפה הוא נקטע"): the line now playing, so an interrupt can estimate how much was
   // actually heard (cut) and re-queue the unspoken remainder for re-weave.
   let mindLine: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
+  /** ON-AIR — the ONE predicate for "our own audio is in the room right now": the mouth's
+   *  playback clock or the MIND narrator's live child. This is the engine's OWN state, the
+   *  same expression the on-air publisher (2d13f7c) writes into ~/.livemind/playback.json —
+   *  named once here so every in-process reader (the publisher, the MIND-barge gate below)
+   *  asks the engine and never round-trips through the file, which can be stale or absent. */
+  const ownAudioOnAir = () => stillAudible() || !!mindPlayer;
+  /** MIND AUDIO ON AIR — the same question asked where the MIND-barge detector stands, and the
+   *  ONLY form of it that can still be FALSE there. D1 (judge, 2026-08-24): that detector lives
+   *  inside `if (mindPlayer && mindLine) {`, so `ownAudioOnAir()` is invariantly true at that
+   *  call site — a gate on it has a dead else-arm and an `on_air` log field that never varies.
+   *  What actually varies, and what the leak physics ask for, is whether our narrator's samples
+   *  have REACHED THE ROOM: ffplay is audible ~250ms after spawn, which is exactly why
+   *  mindLine.startAt is stamped APIPLAN_MIND_START_MS in the FUTURE. Before startAt there is no
+   *  leak to reject, so the raised on-air bars must not apply — raising them there would only
+   *  cost him sensitivity for nothing ("הקול שלך מעל הכל"). `playingUntil` is NOT usable here:
+   *  it is extended to cover the whole MIND line the moment the wav is written, so stillAudible()
+   *  is true through the spin-up too. */
+  const mindAudioOnAir = () => !!mindLine && Date.now() >= mindLine.startAt;
   // LANE 15: the SAME object as mindLine, but never nulled when playback ends — the state
   // file must still know the last line and how much of it was heard after it finished.
   let mindLast: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
@@ -610,7 +628,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const publishPlayback = (off = false) => {
     if (!playbackPath) return;
     try {
-      const onAir = !off && (stillAudible() || !!mindPlayer);
+      const onAir = !off && ownAudioOnAir();      // the shared predicate — identical expression, named once
       const src = mindPlayer ? "mind" : onAir ? "mouth" : "";
       const key = `${onAir}|${src}`; const now = Date.now();
       if (key === pbLastKey && now - pbLastWrite < 1000) return;
@@ -1637,6 +1655,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // his real speech in that same file — 1867-3634, continuous 900-2000 floor, 2.3s sustained.
     const BARGE_REQUIRE_SPEECH = envInt("APIPLAN_MIND_BARGE_REQUIRE_SPEECH", 1);
     const BARGE_CONFIRM_MS = Math.max(0, envInt("APIPLAN_MIND_BARGE_CONFIRM_MS", 400));
+    // ── THE ON-AIR GATE (canon 113 — his voice, call 96072, 16:44: "המשפטים של המוח לפעמים
+    // נקטעים... פספסתי לפחות הודעה אחת... לוודא שזה לא קורה שוב") ─────────────────────────
+    // The cut he complained about: 16:44:37 'mind interrupted by user — spoke 4/570 chars',
+    // peak 2166 at 399ms into the line — 4 characters of a 570-char message, and he never
+    // heard it. The measured leak ceiling on this rig is 1789 and the shipped bar is 1800:
+    // a margin of 1.006. Nothing separates our own narrator from him at that distance, so
+    // WHILE OUR OWN AUDIO IS ON AIR the bar is raised — level AND sustain, by env-tunable
+    // factors (default ×2 each ⇒ 3600 / 500ms). The band that closes is 1800-3600 peaks
+    // shorter than 500ms; the same call's REAL barges measured 14983 (15:54) and 6910
+    // (16:44:02) and clear the raised bar with 1.9-4.2x to spare, so his law is intact —
+    // "הקול שלך מעל הכל", his voice still cuts the MIND instantly.
+    // STATED COST, never absorbed silently: a QUIET real barge (his p90 runs 1642-2194)
+    // during MIND audio now needs 500ms of sustain and 3600 of level, and below 3600 it will
+    // not cut at all. That is the deliberate trade — a missed quiet barge costs him one more
+    // sentence, a self-cut costs him the whole message — and it is two env vars to undo
+    // (APIPLAN_MIND_BARGE_ONAIR_FACTOR=1 APIPLAN_MIND_BARGE_ONAIR_MS_FACTOR=1 restores the
+    // pre-canon-113 behaviour exactly). Factors are clamped at >=1: this gate may only ever
+    // make the cut HARDER while we are talking, never easier.
+    const onAirFactor = (name: string) => {
+      const n = envBar(name, 2);
+      return Number.isFinite(n) && n >= 1 ? n : 1;             // a typo'd or lowering value falls back to 1 = HEAD behaviour
+    };
+    const BARGE_ONAIR_FACTOR = onAirFactor("APIPLAN_MIND_BARGE_ONAIR_FACTOR");
+    const BARGE_ONAIR_MS_FACTOR = onAirFactor("APIPLAN_MIND_BARGE_ONAIR_MS_FACTOR");
     // PURE by design (no Date.now, no closure state) so hands/tests/mind-barge-evidence.test.mjs
     // can extract THIS body by anchor and run the engine's own decision instead of a copy.
     const mindBargeVerdict = (o: {
@@ -1980,7 +2022,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -2205,7 +2247,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // Leaky accumulator — real speech dips below any bar mid-word; a strict
               // consecutive rule never accumulates 250ms (measured).
               const pkM = framePeak(value);
-              bargeMs = pkM >= scaleBar(BARGE_PEAK) ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
+              // CANON 113 — the on-air multiplier. `bargeOnAir` is the ENGINE's own on-air
+              // state, asked in-process, never read back from playback.json. When it is false
+              // the two lines below are HEAD's, character for character: the factors are
+              // applied ONLY on the on-air branch.
+              // D1 (judge, 2026-08-24): this used to ask ownAudioOnAir(), which the guard above
+              // (`if (mindPlayer && mindLine)`) makes invariantly TRUE here — dead else-arm,
+              // always-true `on_air:` field. mindAudioOnAir() is the same question with the one
+              // degree of freedom that survives the guard: our narrator's samples are in the
+              // room only from mindLine.startAt (the APIPLAN_MIND_START_MS spin-up bias). The
+              // first ~250ms of every MIND line is therefore genuinely OFF-air — no leak exists
+              // yet — and keeps HEAD's bars, so he can still cut a line the instant it opens.
+              const bargeOnAir = mindAudioOnAir();
+              const bargeBar = bargeOnAir ? Math.round(scaleBar(BARGE_PEAK) * BARGE_ONAIR_FACTOR) : scaleBar(BARGE_PEAK);
+              const bargeSustain = bargeOnAir ? Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR) : BARGE_SUSTAIN;
+              bargeMs = pkM >= bargeBar ? bargeMs + fMs : Math.max(0, bargeMs - fMs);
               // DEFECT 5.1 — THE NARRATOR JOIN IS AN **AND**, NEVER AN OR. v2 let a VP event
               // fire this cut with the engine's own level bar bypassed; the sibling lane measured
               // three events during a live narrator line at peaks 19079 / 4469 / 8372, prob
@@ -2219,10 +2275,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // Worst case therefore stays the engine's stated one: a leaked narrator can at most
               // cut the NARRATOR ITSELF (which ends the leak), never the mouth mid-reply, and it
               // never sends gated audio. Re-fit for VPIO levels with APIPLAN_MIND_BARGE_PEAK.
-              const vpNarrOk = !vp || (vpFresh() && pkM >= scaleBar(BARGE_PEAK));
+              const vpNarrOk = !vp || (vpFresh() && pkM >= bargeBar);
               // EVIDENCE GATE (see the mindBargeVerdict block above). `sustained` is HEAD's exact
               // trigger; what changes is only what happens when it is true and nothing proves he spoke.
-              const sustained = bargeMs >= BARGE_SUSTAIN && vpNarrOk && Date.now() - lastBargeAt > 1000;
+              const sustained = bargeMs >= bargeSustain && vpNarrOk && Date.now() - lastBargeAt > 1000;
               if (bargeCandAt) { bargeCandMs += fMs; bargeCandPeak = Math.max(bargeCandPeak, pkM); }
               const bv = mindBargeVerdict({
                 mode: BARGE_REQUIRE_SPEECH, now: Date.now(), candAt: bargeCandAt, confirmMs: BARGE_CONFIRM_MS,
@@ -2235,9 +2291,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // to audio we are ALREADY dropping.
                 bargeCandAt = Date.now(); bargeCandPeak = pkM; bargeCandMs = fMs;
               } else if (bv.verdict === "reject") {
-                say("info", `mind barge candidate rejected — no speech evidence (peak ${Math.round(bargeCandPeak)}, ${Math.round(bargeCandMs)}ms loud, ${Math.round(Date.now() - bargeCandAt)}ms window${bv.evidence ? `, ${bv.evidence}` : ", vp live"})`,
+                say("info", `mind barge candidate rejected — no speech evidence (peak ${Math.round(bargeCandPeak)}, ${Math.round(bargeCandMs)}ms loud, ${Math.round(Date.now() - bargeCandAt)}ms window, bar ${bargeBar}/${bargeSustain}ms${bargeOnAir ? " on-air" : ""}${bv.evidence ? `, ${bv.evidence}` : ", vp live"})`,
                   { mind_barge_rejected: true, cand_peak: Math.round(bargeCandPeak), cand_loud_ms: Math.round(bargeCandMs),
-                    cand_window_ms: Math.round(Date.now() - bargeCandAt), cand_bar: scaleBar(BARGE_PEAK), vp_live: !!vp });
+                    cand_window_ms: Math.round(Date.now() - bargeCandAt), cand_bar: bargeBar, cand_sustain_ms: bargeSustain, on_air: bargeOnAir, vp_live: !!vp });
                 bargeCandAt = 0; bargeCandPeak = 0; bargeCandMs = 0;
                 bargeMs = 0; lastBargeAt = Date.now();          // the 1s cooldown now bounds the echo rate too
               } else if (bv.verdict === "cut") {
@@ -2260,8 +2316,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 // Now the trigger carries its own peak, the bar it cleared, and how far into the
                 // narrator it fired — so any future "he was cut without barging" is one grep.
                 const cutAtMs = Math.max(0, Date.now() - L.startAt);
-                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars (peak ${Math.round(pkM)} vs bar ${scaleBar(BARGE_PEAK)}, ${cutAtMs}ms into the line${vp ? ", vp live" : ""}, evidence ${bv.evidence}${confirmMs ? ` +${confirmMs}ms` : ""})`,
-                  { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: scaleBar(BARGE_PEAK), cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp,
+                say("info", `mind interrupted by user — spoke ${L.cut}/${L.text.length} chars (peak ${Math.round(pkM)} vs bar ${bargeBar}/${bargeSustain}ms${bargeOnAir ? ` on-air ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR}` : ""}, ${cutAtMs}ms into the line${vp ? ", vp live" : ""}, evidence ${bv.evidence}${confirmMs ? ` +${confirmMs}ms` : ""})`,
+                  { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: bargeBar, cut_sustain_ms: bargeSustain, on_air: bargeOnAir, cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp,
                     cut_evidence: bv.evidence, cut_confirm_ms: confirmMs });
                 const rest = L.text.slice(L.cut).trim();
                 if (rest) { injectQueue.push({ text: rest, who: L.who }); queueStale = true; }   // remainder is STALE — re-weave against his words
@@ -2861,6 +2917,33 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
         speakerCheck(); warnIfUnheard("mind");                        // LANE 18: async, cached 5s
+        // ── MOUTH-KNOWS-FIRST (LEDGER -46, fire17 voice, call 96072, 2026-08-24 17:12) ──────
+        // Until tonight the mouth learned a MIND line ONLY from `mindPlayer.exited` — and only
+        // the SPOKEN PREFIX (`text.slice(0, cut)`), by design. So every cut line lost its tail
+        // for the mouth too: he asked "what did the mind say", and the mouth could only recite
+        // the same 4 characters he already heard. Five cuts that call, five unanswerable asks.
+        // His order: the engine must hand the mouth the FULL line BY CODE, at/before playback
+        // start, so a cut becomes HARMLESS — the words are in the mouth's context before the
+        // first sample is audible, and he can always ask for them back.
+        //
+        // TWO FRAMES, NOT ONE (Eva E648 — the trap this avoids). The `role:"assistant"` item at
+        // exit means "THIS WAS SAID" and is deliberately the prefix only: filing unheard words
+        // as spoken makes them permanently unspeakable under the one-answer law. So the full
+        // text rides in a SEPARATE `role:"system"` note — the exact silent shape the {"context"}
+        // preload uses (conversation.item.create with input_text; the API generates NOTHING on
+        // an item.create, only on response.create) — marked as "about to be said, he may not
+        // hear all of it". Knowledge without a delivery claim. The assistant prefix that follows
+        // still tells it what actually landed, and the barge bookkeeping is untouched.
+        // APIPLAN_MIND_PREVIEW=0 restores the pre-(-46) behaviour exactly.
+        if (process.env.APIPLAN_MIND_PREVIEW !== "0" && text.trim() && ws.readyState === WebSocket.OPEN) {
+          const speaker = who === "eva" ? "EVA (a body organ)" : "the MIND";
+          try {
+            ws.send(JSON.stringify({ type: "conversation.item.create", item: {
+              type: "message", role: "system",
+              content: [{ type: "input_text", text: `[Line ${speaker} is about to speak aloud to him right now, in its own voice — absorb silently, do NOT respond to this, do NOT say it yourself, do NOT mention receiving it. You are the MOUTH; this is ${speaker}'s work and ${speaker}'s words, never your own. His voice may cut it mid-sentence, so he may hear only the beginning of it. FULL TEXT: ${String(text)} — if he asks what ${speaker} said, or says he missed it or wants it repeated, read it back from here in full. Any message that follows in the assistant voice is only the part he actually heard.]` }] } }));
+            say("info", `mind line preloaded to the mouth (${text.length} chars, before playback)`, { mind_preview: true, chars: text.length, who });
+          } catch {}
+        }
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
           "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
           ...mindPan, f],
@@ -2899,6 +2982,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           try { unlinkSync(f); } catch {}
           // Record the line in the mouth's conversation so it KNOWS it was said (one
           // answer, no repeats) — safe now, because the mouth never renders this item.
+          // STILL THE PREFIX ONLY, deliberately (Eva E648): this frame is the delivery claim
+          // ("this was heard"). The FULL text already went in as a system note before playback
+          // (MOUTH-KNOWS-FIRST above), so a cut no longer costs the mouth the tail — what it
+          // must never do is believe the unheard tail was delivered.
           if (spoken.trim()) {
             try { ws.send(JSON.stringify({ type: "conversation.item.create", item: {
               type: "message", role: "assistant", content: [{ type: "output_text", text: spoken }] } })); } catch {}
