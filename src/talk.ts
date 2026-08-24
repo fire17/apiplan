@@ -2751,6 +2751,36 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // mute BYPASSED (an explicit resend IS intent to be heard), 700ms silence tail so the
     // server VAD closes the turn and the mouth answers as if it was just spoken.
     async function resendAudio(path: string) {
+      // canon 119 CHOKEPOINT (LAB architectural catch, MIND-confirmed): resendAudio is the ONE
+      // function every archived-audio path reaches the model through — overlap recovery (the caller
+      // above) and the {audio} inject verb (grep-verified the complete set). Gate caps-off HERE so
+      // every caller, present and future, fails closed in one place instead of a fourth patched call
+      // site. Two fail-closed rules:
+      //   1) ~/SideTangent/ is canon 047's caps-off store — the sweeper already CLASSIFIED everything
+      //      there as caps-off, so the body never resends it (a promote is HIS CLI, never an agent
+      //      inject). This closes the {audio} verb (path 3) for caps-off audio, and any future path.
+      //   2) a recordings/ WAV whose OWN capture window overlaps a genuine caps-off (capsOffAt within
+      //      [mtime-duration, mtime]) — the same capsOffAt test as the overlap caller, derived from the
+      //      file's size+mtime (engine WAVs are s16 mono @ RATE). An old caps-ON file (capsOffAt after
+      //      its window) resends normally; an all-heard call (capsOffAt 0) is never gated.
+      // Errors fall through on purpose: a stat/size glitch must never block a legit resend of his words.
+      try {
+        if (path.includes("/SideTangent/")) {
+          say("info", `audio resend refused — ${basename(path)} is caps-off (canon 047/119: the body never publishes caps-off audio; a promote is his call)`,
+            { caps_resend_refused: "sidetangent", path });
+          return;
+        }
+        if (path.includes("/recordings/")) {
+          const st = fs.statSync(path);
+          const durMs = Math.max(0, (st.size - 44) / 2 / RATE * 1000);
+          const capEnd = st.mtimeMs; const capStart = capEnd - durMs;
+          if (capsOffAt >= capStart && capsOffAt <= capEnd) {
+            say("info", `audio resend refused — caps was off during ${basename(path)}'s capture window (canon 119: no caps-off audio reaches the model, recorded not published)`,
+              { caps_resend_refused: "capsoff-window", path, cap_start_ms: capStart, cap_end_ms: capEnd, caps_off_at: capsOffAt });
+            return;
+          }
+        }
+      } catch { /* classification glitch (stat/size) must never block a legit resend — fail toward his words */ }
       // ROTATION: a resend streams over seconds. Swapping in the middle would send its head to one
       // session and its tail to another — half a recording heard, half lost. The quiet gate reads
       // this flag, so a rotation simply waits for the resend to finish.
