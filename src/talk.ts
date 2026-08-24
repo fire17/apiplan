@@ -953,6 +953,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // invariant above is untouched (an absent sensor leaves capsOffAt old and can never withhold his
   // words), while a genuine off anywhere inside the turn now fails CLOSED at the `you` gate.
   let capsOffAt = 0;
+  // canon 119 (b) (LAB live measurement): capsOffAt is a single per-call value, and a STILL-OPEN call
+  // is never classified by the post-hoc SideTangent sweeper — so 14.6 min of a live call's caps-off
+  // audio was resendable. The durable answer is a persisted TIMELINE of genuine caps transitions that
+  // the resend gate reads back. Append-only, cross-call, under LM_HOME. capsPrev holds the last GENUINE
+  // state so we log only real transitions (never on the absent/stale/wrong-call assume-heard paths).
+  let capsPrev: boolean | null = null;
+  const CAPS_TL = `${LM_HOME}/caps-timeline.jsonl`;
   const capsWitness = () => {
     const j = capsNow();
     if (!j) { capsOnAt = Date.now(); return; }                                   // no publisher → assume heard
@@ -960,6 +967,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     if (j.inject && injectPath && String(j.inject) !== injectPath) { capsOnAt = Date.now(); return; }  // gates another call
     if (j.caps === true) capsOnAt = Date.now();
     else capsOffAt = Date.now();                                                  // canon 119: genuine caps-OFF for THIS call
+    const off = j.caps !== true;
+    if (off !== capsPrev) {   // a genuine transition — persist it for the cross-call resend gate
+      capsPrev = off;
+      try { fs.appendFileSync(CAPS_TL, JSON.stringify({ t: Date.now(), off }) + "\n"); } catch {}
+    }
   };
   const capsNow = () => {
     const now = Date.now();
@@ -2795,11 +2807,34 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               return;
             }
           }
-          // (2b) belt for a FRESH caps-off turn the sweeper has not filed yet: this call's live capsOffAt
-          // inside the file's own capture window.
           const st = fs.statSync(path);
           const durMs = Math.max(0, (st.size - 44) / 2 / RATE * 1000);
           const capEnd = st.mtimeMs; const capStart = capEnd - durMs;
+          // (2c) canon 119 (b): the persisted caps-off TIMELINE — the ONLY rule that covers a
+          // STILL-OPEN call (the post-hoc sweeper can never classify a live call, so (2a) protects
+          // nothing live — LAB measured 17+ min of a live call's caps-off audio still resendable).
+          // Reconstruct caps-off PERIODS from the append-only transitions (sorted, so live + backfilled
+          // entries interleave safely) and refuse if any overlaps this file's capture window.
+          try {
+            const trans: Array<{ t: number; off: boolean }> = [];
+            for (const ln of fs.readFileSync(CAPS_TL, "utf8").split("\n")) {
+              if (!ln) continue; let r: any; try { r = JSON.parse(ln); } catch { continue; }
+              if (typeof r.t === "number" && typeof r.off === "boolean") trans.push(r);
+            }
+            trans.sort((a, b) => a.t - b.t);
+            let offStart: number | null = null; let tainted = false;
+            for (const r of trans) {
+              if (r.off) { if (offStart === null) offStart = r.t; }
+              else if (offStart !== null) { if (offStart <= capEnd && r.t >= capStart) { tainted = true; break; } offStart = null; }
+            }
+            if (!tainted && offStart !== null && offStart <= capEnd) tainted = true;   // a still-open off period
+            if (tainted) {
+              say("info", `audio resend refused — ${base} overlaps a caps-off period in the timeline (canon 119 (b): no caps-off audio reaches the model, recorded not published)`,
+                { caps_resend_refused: "capsoff-timeline", path, cap_start_ms: capStart, cap_end_ms: capEnd });
+              return;
+            }
+          } catch { /* no timeline / unreadable -> the (2a) SideTangent and (2b) capsOffAt belts still apply */ }
+          // (2b) belt for a FRESH caps-off turn no rule above caught: this call's live capsOffAt in the window.
           if (capsOffAt >= capStart && capsOffAt <= capEnd) {
             say("info", `audio resend refused — caps was off during ${base}'s capture window (canon 119: no caps-off audio reaches the model, recorded not published)`,
               { caps_resend_refused: "capsoff-window", path, cap_start_ms: capStart, cap_end_ms: capEnd, caps_off_at: capsOffAt });
