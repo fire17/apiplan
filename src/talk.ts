@@ -2112,6 +2112,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (!archOn || !archAllowed()) { say("info", "overlap recovery skipped — archive off (private mode leaves no WAV to resend from)"); return; }
         const from = Math.max(0, (firstLoud - 6) * BLK);
         const to = Math.min(got, (lastLoud + 7) * BLK);
+        // canon 119 SECOND PATH (LAB, live-observed 3x on call 96072): overlap recovery slices the
+        // archive and resends it — which under archive_mode "always" can launder CAPS-OFF audio into
+        // the mouth's context, because archAllowed() ignores caps and the resent turn is keyed to
+        // RESEND-time caps (normally ON), so the straddle gate at the `you` event never sees it. Fail
+        // closed the same way as that gate: if caps was witnessed genuinely OFF anywhere inside THIS
+        // slice's capture window, skip recovery entirely — the words stay in the archive (canon
+        // 041/047: record everything, publish nothing) and never reach a responder. capsOffAt is 0
+        // until a real caps-off is seen, so an all-heard call recovers exactly as before.
+        const sliceStartMs = Date.now() - Math.round(((got - from) / 2 / RATE) * 1000);
+        if (capsOffAt >= sliceStartMs) {
+          say("info", `overlap recovery skipped — caps was off during the captured audio (canon 119: recovery must not launder caps-off speech to the mouth; recorded not published)`,
+            { caps_withheld_recovery: true, slice_start_ms: sliceStartMs, caps_off_at: capsOffAt });
+          return;
+        }
         const slice = buf.subarray(from, to);
         const tmp = `${archDir}/overlap-${Date.now()}.wav`;
         fs.writeFileSync(tmp, Buffer.concat([archHeader(slice.length), slice]));
