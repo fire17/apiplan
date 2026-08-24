@@ -944,12 +944,22 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // DIFFERENT call all leave `capsOnAt` fresh, so an absent sensor can never silently swallow his
   // words. Privacy he can verify is worth more than privacy that might be a dead file.
   let capsOnAt = Date.now();
+  // canon 119 (his URGENT, 2026-08-24: "voices when capslock is off are leaking to the mouth's
+  // context ... fix immediately and for good in one good shot"). capsOnAt alone withholds only a turn
+  // that was caps-OFF for its WHOLE length, so a turn STRADDLING the caps release — mic frames caught
+  // in the AUTOUNMUTE_MS release gap join the same VAD turn — published its caps-off tail. capsOffAt is
+  // the mirror: the LAST MOMENT CAPS WAS GENUINELY SEEN OFF for THIS call. It is refreshed ONLY in the
+  // real-off branch below, NEVER in the absent/stale/wrong-call branches, so the fail-toward-publishing
+  // invariant above is untouched (an absent sensor leaves capsOffAt old and can never withhold his
+  // words), while a genuine off anywhere inside the turn now fails CLOSED at the `you` gate.
+  let capsOffAt = 0;
   const capsWitness = () => {
     const j = capsNow();
     if (!j) { capsOnAt = Date.now(); return; }                                   // no publisher → assume heard
     if (Date.now() - (Number(j.ts) || 0) > 4000) { capsOnAt = Date.now(); return; }   // stale → assume heard
     if (j.inject && injectPath && String(j.inject) !== injectPath) { capsOnAt = Date.now(); return; }  // gates another call
     if (j.caps === true) capsOnAt = Date.now();
+    else capsOffAt = Date.now();                                                  // canon 119: genuine caps-OFF for THIS call
   };
   const capsNow = () => {
     const now = Date.now();
@@ -4573,7 +4583,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // still receives its engine turn-WAVs, and the words remain recoverable from disk.
             // The item is deleted from the MODEL's context too — a turn the mouth must not react
             // to must not sit in its history either.
-            if (tScript && turnStartedAt > 0 && capsOnAt < turnStartedAt) {
+            // canon 119: withhold if caps was off the WHOLE turn (capsOnAt < turnStartedAt) OR was seen
+            // genuinely OFF at ANY point at/after turnStartedAt (capsOffAt >= turnStartedAt) — i.e. require
+            // caps ON for the whole turn, failing CLOSED on a straddle so the caps-off tail never reaches
+            // the mouth/organs/canon. capsOffAt stays old when the sensor is absent, so a dead sensor still
+            // publishes (fail-toward-publishing preserved); the words remain in the archive either way.
+            if (tScript && turnStartedAt > 0 && (capsOnAt < turnStartedAt || capsOffAt >= turnStartedAt)) {
               turnsTranscribed++; sessTurnsTranscribed++;
               // Logged as a COUNT and a duration, never as text: the whole point is that these
               // words do not enter a surface the body reads, and the LOG is such a surface.
