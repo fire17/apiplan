@@ -14,6 +14,13 @@ import { VpCapture, type VpEvent } from "./aec.ts";
 
 const RATE = 24000;
 
+// LM_HOME — the livemind home every small live file below hangs off (his -36, 2026-08-24:
+// a SECOND, private LiveMind — Codex's — running the SAME code out of a different home,
+// "המכניזם וכל הסיסטם צריך להיות משותף"). Unset it resolves to $HOME/.livemind, the exact
+// string each of these paths was written as before, so an engine launched without LM_HOME
+// behaves byte-identically. The launcher exports it; nothing else in this file changed.
+const LM_HOME = process.env.LM_HOME || `${process.env.HOME}/.livemind`;
+
 /** How a call ended — callers (the daemon, /lx) stream a richer end-event from this. */
 export type TalkResult = {
   reason: "hangup" | "timeout" | "mic-lost" | "error" | "closed";
@@ -204,7 +211,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // unspoken remainder. The engine never writes an inject and never re-speaks on its own —
   // resuming stays the MIND's judgement, and mouth immediacy is untouched.
   const mindStatePath = process.env.APIPLAN_MIND_STATE === "" ? "" :
-    (process.env.APIPLAN_MIND_STATE || `${process.env.HOME}/.livemind/mind-last-spoken.json`);
+    (process.env.APIPLAN_MIND_STATE || `${LM_HOME}/mind-last-spoken.json`);
   const callId = logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`;
   let carry: any = null;   // LANE 15 review fix 0: previous call's mind fields survive mouth-only writes
   try {
@@ -598,7 +605,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Born of call 14838 14:06 — the pill pegged full on speaker leak while the MOUTH talked;
   // lm-ptt's raw device capture cannot know by itself when the speaker is ours.
   const playbackPath = process.env.APIPLAN_PLAYBACK_STATE === "" ? "" :
-    (process.env.APIPLAN_PLAYBACK_STATE || `${process.env.HOME}/.livemind/playback.json`);
+    (process.env.APIPLAN_PLAYBACK_STATE || `${LM_HOME}/playback.json`);
   let pbLastKey = ""; let pbLastWrite = 0;
   const publishPlayback = (off = false) => {
     if (!playbackPath) return;
@@ -629,7 +636,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Organs publish a claim to ~/.livemind/floor.json: {"who":"eva","until":<epoch ms>}.
   // Only holders in INTERRUPT_OK may cut a voice already speaking; everyone else waits for quiet
   // in their own process. Adding an organ is a line in that set, not a new arbitration layer.
-  const FLOOR_FILE = `${process.env.HOME}/.livemind/floor.json`;
+  const FLOOR_FILE = `${LM_HOME}/floor.json`;
   const INTERRUPT_OK = new Set(["mind"]);     // currency, not rank — extend only for fresher-info organs
   const FLOOR_MAX_MS = Number(process.env.APIPLAN_FLOOR_MAX_MS) || 30000;   // canon 044 cap
   // THE EXTERNAL CONVERSATION (fire17, canon 045): "אני מדבר פה עם חבר שלי עכשיו בחדר ואנחנו
@@ -643,7 +650,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // It is a HARD HOLD, not a drop: MIND lines queue exactly as they do for his own turn, and
   // they flow the moment the room is his again. `until` is a LEASE the producer refreshes ~2x/s,
   // so a dead EARS frees the mouth within 1.5s — the flag can never latch the call into silence.
-  const XCONV_FILE = `${process.env.HOME}/.livemind/external-conversation.json`;
+  const XCONV_FILE = `${LM_HOME}/external-conversation.json`;
   let xconvUntil = 0, xconvSince = 0;
   const xconvHeld = () => Date.now() < xconvUntil;
   // ── EXTERNAL-SUSPECT MARK (E605 + E606) ──────────────────────────────────────────
@@ -873,7 +880,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const now = Date.now();
     if (now - archModeAt > 2000) {
       archModeAt = now;
-      try { archMode = JSON.parse(fs.readFileSync(`${process.env.HOME}/.livemind/settings.json`, "utf8")).archive_mode || "always"; }
+      try { archMode = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).archive_mode || "always"; }
       catch { archMode = "always"; }
     }
     if (archMode === "off") return false;   // PRIVATE (canon 019): the app switch stops every archive write, live
@@ -900,7 +907,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // is excluded too — measured, it flips to output-running WITH our own playback and never
   // independently, so counting it would disable this law permanently.
   const AUTOUNMUTE_MS = Number(process.env.APIPLAN_AUTOUNMUTE_MS ?? 400);   // 0 disables the law
-  const CAPS_PATH = `${process.env.HOME}/.livemind/caps.json`;
+  const CAPS_PATH = `${LM_HOME}/caps.json`;
   const AUDIO_OUT_IGNORE = new Set(["com.apple.CoreSpeech"]);
   let capsJson: any = null; let capsReadAt = 0; let autoUnmutedAt = 0;
   // CANON 041 (his voice, 2026-08-22): "אני רוצה להיות מסוגל לדבר בפרטיות כשהקפסולה סגורה."
@@ -968,7 +975,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     say("info", `auto-unmuted — caps ON and you were talking into a muted mic (${evidence}${media.who === "unknown (no audio_out in caps.json)" ? ", media state unknown" : ""})`,
       { auto_unmute: true, evidence, media: media.who });
   };
-  const archDir = `${process.env.HOME}/.livemind/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
+  const archDir = `${LM_HOME}/recordings/${logPath ? basename(logPath).replace(/\.jsonl$/, "") : `talk-${process.pid}`}`;
   let archFd = -1; let archBytes = 0; let archPeak = 0; let archN = 0; let archPath = "";
   let archLastResp = "";
   const archHeader = (len: number) => {
@@ -1272,7 +1279,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let rotTimer: ReturnType<typeof setInterval> | null = null;
   // R3b self-demotion: if opening a successor ever kills the live session, overlap is disabled
   // for this call AND for every future call on this machine.
-  const rotConcPath = `${process.env.HOME}/.livemind/rotation-concurrency.json`;
+  const rotConcPath = `${LM_HOME}/rotation-concurrency.json`;
   let rotConcurrent = true;
   // Off-mode purity: with rotation unarmed nothing in this block runs — the demotion verdict
   // is only ever read by rotTick, which never ticks when off (W39 verify LOW).
@@ -2794,7 +2801,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // restart, no work, and nobody has to remember it. APIPLAN_EVA_VOICE overrides the file.
     const evaVoice = () => {
       if (process.env.APIPLAN_EVA_VOICE) return process.env.APIPLAN_EVA_VOICE;
-      try { return fs.readFileSync(`${process.env.HOME}/.livemind/eva-voice.txt`, "utf8").trim() || "shimmer"; }
+      try { return fs.readFileSync(`${LM_HOME}/eva-voice.txt`, "utf8").trim() || "shimmer"; }
       catch { return "shimmer"; }
     };
     const sendInjected = (text: string, who?: string) => {
