@@ -2771,11 +2771,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           return;
         }
         if (path.includes("/recordings/")) {
+          const base = basename(path);
+          // (2a) LAB's authoritative rule: canon 047's caps-off sweeper copies a caps-off turn-wav to
+          // ~/SideTangent with the SAME basename (capsoff-sweeper.py). A counterpart there = classified
+          // caps-off, and that judgement SURVIVES ACROSS CALLS — covering every earlier-call and
+          // earlier-off-period file the single live capsOffAt (reset per call, holds only the latest
+          // off) cannot. Bounded walk of <day>/capsoff/<run>/, first match wins, only on a rare
+          // deliberate resend. No SideTangent yet -> fall through to the (2b) live belt.
+          if (/^turn-.*\.wav$/.test(base)) {
+            let classifiedOff = false;
+            try {
+              const ST = `${process.env.HOME}/SideTangent`;
+              for (const day of fs.readdirSync(ST)) {
+                const co = `${ST}/${day}/capsoff`;
+                let runs; try { runs = fs.readdirSync(co); } catch { continue; }
+                for (const run of runs) { if (fs.existsSync(`${co}/${run}/${base}`)) { classifiedOff = true; break; } }
+                if (classifiedOff) break;
+              }
+            } catch { /* no SideTangent tree -> not classified there; the live belt below still applies */ }
+            if (classifiedOff) {
+              say("info", `audio resend refused — ${base} is classified caps-off in SideTangent (canon 047/119: the sweeper already judged it caps-off; a promote is his call)`,
+                { caps_resend_refused: "sidetangent-counterpart", path });
+              return;
+            }
+          }
+          // (2b) belt for a FRESH caps-off turn the sweeper has not filed yet: this call's live capsOffAt
+          // inside the file's own capture window.
           const st = fs.statSync(path);
           const durMs = Math.max(0, (st.size - 44) / 2 / RATE * 1000);
           const capEnd = st.mtimeMs; const capStart = capEnd - durMs;
           if (capsOffAt >= capStart && capsOffAt <= capEnd) {
-            say("info", `audio resend refused — caps was off during ${basename(path)}'s capture window (canon 119: no caps-off audio reaches the model, recorded not published)`,
+            say("info", `audio resend refused — caps was off during ${base}'s capture window (canon 119: no caps-off audio reaches the model, recorded not published)`,
               { caps_resend_refused: "capsoff-window", path, cap_start_ms: capStart, cap_end_ms: capEnd, caps_off_at: capsOffAt });
             return;
           }
