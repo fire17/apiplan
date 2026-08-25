@@ -852,6 +852,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const SHORT_MIN_CHARS = Math.max(0, Number(process.env.APIPLAN_MIN_TRANSCRIPT_CHARS ?? 2));
   const SHORT_OK = new Set((process.env.APIPLAN_SHORT_OK ?? "כן לא אה או מה זה לך בו נו OK ok yes no").split(/\s+/).filter(Boolean));
   let echoHoldUntil = 0;        // until this wall clock a VAD auto-reply is an answer to our own voice
+  let echoHoldSetAt = 0;        // when that verdict was reached — a speech segment that BEGAN after it is HIM
   // ── LEAK-FRAGMENT QUARANTINE (call 96642 @ 02:15:53 — three fake "you" turns) ─────────
   // Overlap recovery resent 8.4s of speaker leak (`audio resent (8.4s): overlap-...wav`) and
   // the recogniser turned it into "Hallo." / "Ismét elő." / "我不会。" — garbage in three
@@ -4531,7 +4532,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // window in which the mouth may not answer at all. The transcript that proves the
             // echo lands ~300ms AFTER the server has already created the reply, so the belt has
             // to be able to reach forward one turn — that is this flag's whole job.
-            const selfEcho = Date.now() < echoHoldUntil;
+            // INTERACTIONS.md #1 (call 26657 12:16:01): the hold reached forward and cancelled HIS
+            // real turn — a 2 s question whose reply was created 200 ms before the hold expired —
+            // and he had to repeat himself. The echo turn's reply belongs to audio that existed
+            // BEFORE the verdict; a segment whose speech_started came AFTER the verdict cannot be
+            // our echo (the echo audio was already transcribed and judged). So the hold cancels
+            // only a reply whose segment began at or before the verdict. A segment that began
+            // before the verdict and closed after it is still held — the narrower rule, not none.
+            const inEchoHold = Date.now() < echoHoldUntil;
+            const selfEcho = inEchoHold && speechStartedAt <= echoHoldSetAt;
+            if (inEchoHold && !selfEcho && !awaitingResponse)
+              say("info", `self-echo hold passed over a reply — its segment began ${speechStartedAt - echoHoldSetAt}ms AFTER the echo verdict: his turn, answered`,
+                { echo_hold_passed: true, segment_vs_verdict_ms: speechStartedAt - echoHoldSetAt });
             // EMPTY ROOM (presence doctrine, 31599). Before ANY human speech has been heard on
             // this call, an auto-response the engine did not ask for is the mouth talking to
             // nobody — the server's own idle self-prompt (idle_timeout_ms, which the daemon's
@@ -4558,7 +4570,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               responsesCancelled++; sessResponsesCancelled++;
               responseActive = false;
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
-              if (selfEcho && !suppressAuto && !noiseBlip) say("info", "auto-reply cancelled at birth — self-echo hold", { echo_suppressed: true, echo_hold: true });
+              if (selfEcho && !suppressAuto && !noiseBlip) say("info", `auto-reply cancelled at birth — self-echo hold (segment began ${speechStartedAt - echoHoldSetAt}ms vs the verdict)`, { echo_suppressed: true, echo_hold: true, segment_vs_verdict_ms: speechStartedAt - echoHoldSetAt });
               if (evaTurn && !suppressAuto && !noiseBlip && !selfEcho) say("info", "auto-reply cancelled at birth — he addressed Eva", { addressee: "eva" });
               // THROTTLED like the suppressAuto notice below it, and for the same reason (W36
               // verify): the daemon parks with turn_detection.idle_timeout_ms=15000, so an empty
@@ -4787,7 +4799,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 say("info", `caps withhold cut the mouth's reply (${wasActive ? "cancelled in flight" : "audible tail killed"}) — a withheld turn is answered by nobody`,
                   { caps_withhold_cut: true, in_flight: wasActive });
               }
-              echoHoldUntil = Date.now() + ECHO_HOLD_MS;
+              echoHoldUntil = Date.now() + ECHO_HOLD_MS; echoHoldSetAt = Date.now();
               pendingMouthReply = false;   // and nothing parked may be released into a caps-closed turn
               flushReply();
               break;
@@ -4898,7 +4910,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               const stale = door !== "live" && speechStartedAt > turnStartedAt
                 && !(lastResendAt && speechStartedAt >= lastResendAt && speechStartedAt - lastResendAt <= lastResendMs);
               if (!stale) {
-                echoHoldUntil = Date.now() + ECHO_HOLD_MS;   // reaches the NEXT create, not yet born
+                echoHoldUntil = Date.now() + ECHO_HOLD_MS; echoHoldSetAt = Date.now();   // reaches the NEXT create, not yet born
                 pendingMouthReply = false;                   // and the one parked behind MIND audio
               }
               if (!stale && responseActive && !mindResponse && !closing && turnStartedAt > 0 && curResponseBornAt >= turnStartedAt) {
