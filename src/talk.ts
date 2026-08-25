@@ -3218,6 +3218,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     };
     let evaAddressedAt = 0;   // his last Eva-addressed turn — the mouth stays out of it
     const injectQueue: { text: string; who?: string; bytes?: Uint8Array; speed?: number; adaptive?: boolean }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay); speed = per-line narrator tempo; adaptive=false = EXPRESSIVE line
+    // D7 (S147 gate ruling — the stack law had no owner field; MERGE fired on raw length and a fresh
+    // line auto-replaced EVERY stale line regardless of whose words they were): HELD/STALE/MERGE and
+    // auto-replace act PER VOICE. whoKey(undefined) = "mind".
+    const whoKey = (w?: string): string => w || "mind";
+    const whoCount = (w?: string): number => injectQueue.filter((q) => whoKey(q.who) === whoKey(w)).length;
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
     // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
@@ -3714,9 +3719,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // merged line and pileup is impossible; no drop_queue ritual needed ({"drop_queue"}
       // stays for manual control). Live evidence for the law: on call 22157 lines went
       // HELD→STALE repeatedly and nothing ever spoke.
-      if (queueStale && injectQueue.length) {
-        say("info", `stale queue auto-replaced (${injectQueue.length}) by fresh line`);
-        injectQueue.length = 0;
+      if (queueStale && whoCount(who)) {
+        say("info", `stale queue auto-replaced (${whoCount(who)}) by fresh ${whoKey(who)} line`);   // D7: only THIS voice's stale words die
+        for (let qi = injectQueue.length - 1; qi >= 0; qi--) if (whoKey(injectQueue[qi]!.who) === whoKey(who)) injectQueue.splice(qi, 1);
         // PRE-RELAUNCH AUDIT 2026-08-22 (P1). The waited-notice describes the LINE that waited.
         // The line just died; the flag must die with it, or the next unrelated MIND line opens
         // with an apology for a wait that never happened — spoken, verbatim, in his ear.
@@ -3732,7 +3737,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (speakerMutedNow) {
         injectQueue.push({ text, who, bytes, speed, adaptive });
         say("info", `mind line HELD (speaker muted) — queue ${injectQueue.length}`, { speaker_muted: true, spk: spkState });
-        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+        if (whoCount(who) > 1) say("info", `mind queue MERGE (${whoCount(who)} held, ${whoKey(who)}) — weave into one`);
         if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
@@ -3743,7 +3748,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // opener would be a lie about a turn that was never addressed to us.
         injectQueue.push({ text, who, bytes, speed, adaptive });
         say("info", `mind line HELD (external conversation — canon 045) — queue ${injectQueue.length}`);
-        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+        if (whoCount(who) > 1) say("info", `mind queue MERGE (${whoCount(who)} held, ${whoKey(who)}) — weave into one`);
         return;
       }
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
@@ -3754,7 +3759,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // במקום להתעדכן... זה צריך להיות הודעה אחת"): the queue must never grow past one —
         // this echo (once per growth) tells the watching MIND to {"drop_queue"} + weave
         // everything held into ONE fresh line.
-        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+        if (whoCount(who) > 1) say("info", `mind queue MERGE (${whoCount(who)} held, ${whoKey(who)}) — weave into one`);
         return;
       }
       if (mode === "interrupt" && (responseActive || awaitingResponse)) bargeNow();
@@ -3769,7 +3774,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (!freshWait && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed, adaptive); return; }
       injectQueue.push({ text, who, bytes, speed, adaptive });
       if (freshWait) { queueWait(freshWait); if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000); }
-      if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
+      if (whoCount(who) > 1) say("info", `mind queue MERGE (${whoCount(who)} held, ${whoKey(who)}) — weave into one`);   // queue-merge law, per voice (D7): one woven line per speaker, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
     // and the next item waits for that response's response.done — the queue stays serialized and
@@ -3852,6 +3857,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (waitWhy && injectQueue.length && holdCeilingDue(queueWaitSince, Date.now())) {
         say("info", `mind line released by hold ceiling — held ${Math.round((Date.now() - queueWaitSince) / 1000)}s waiting for "${waitWhy}" (quiet never came; B4: bound the consequence, never his turn)`,
           { hold_ceiling: true, held_ms: Date.now() - queueWaitSince, was_waiting_for: waitWhy, queue: injectQueue.length });
+        queueWaitSince = 0;   // barge's defect fix: the ceiling's echo IS the release — without this the
+                              // quiet-release echo below also fires and poisons the hold telemetry the 120s tune rests on
       } else if (waitWhy) {
         if (injectQueue.length) queueWait(waitWhy);
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -4052,15 +4059,28 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS
             && (Date.now() < organFloorUntil || xconvHeld() || mindBusy || !!mindPlayer)) {   // lane T: behind mind audio the hold ends at the line's last word — never a DROP
           pendingMouthAt = Date.now();
+        } else if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS
+            && (responseActive || awaitingResponse)) {
+          // D5 (S147 S-B: "a hold that can expire is a drop"): a TRANSIENT busy is not "the room
+          // moved on" — restart the clock exactly like the active-gate branch above, so the reply
+          // still speaks when the response finishes instead of dying to a race.
+          pendingMouthAt = Date.now();
         } else if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS) {
           const heldFor = Math.round((Date.now() - pendingMouthAt) / 1000);
           pendingMouthAt = 0;
-          if (!mindBusy && !mindPlayer && !suppressAuto && !closing && !responseActive && !awaitingResponse
+          if (!mindBusy && !mindPlayer && !suppressAuto && !closing
               && !emptyRoomNow() && ws.readyState === WebSocket.OPEN) {
             say("info", `mouth reply force-released after ${heldFor}s held — a hold that long is a mute (canon 044)`, { forced_release: true, held_s: heldFor });
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
           } else {
-            say("info", `mouth reply DROPPED after ${heldFor}s held — the room moved on (canon 044)`, { forced_drop: true, held_s: heldFor });
+            // D5: the drop is LEDGERED with its cause — never a silent "moved on".
+            const cause = suppressAuto ? "mouth closed" : closing ? "call closing" : emptyRoomNow() ? "empty room" :
+                          ws.readyState !== WebSocket.OPEN ? "socket gone" : mindPlayer ? "mind audio playing" : "mind busy";
+            say("info", `mouth reply DROPPED after ${heldFor}s held — ${cause} (canon 044; ledgered — D5)`, { forced_drop: true, held_s: heldFor, cause });
+            try {
+              ensureDir(`${LM_HOME}/dropped`);
+              fs.appendFileSync(`${LM_HOME}/dropped/${callId}.jsonl`, JSON.stringify({ t: Date.now(), kind: "mouth_reply_drop", held_s: heldFor, cause }) + "\n");
+            } catch {}
             pendingMouthReply = false;
           }
         }
