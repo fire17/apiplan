@@ -729,6 +729,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // reordering the injected reports. (Root cause of the inject-ordering backlog.)
   let awaitingResponse = false;
   let micMuted = false;                        // when true, mic frames are dropped (not sent to the model)
+  // CANON 124 (fire17 typed 2026-08-25 11:16: "do whatever is most reliable - and straigtforward that
+  // will return us to flawless ux") — CAPS RELEASE CLOSES THE TURN. He talks PTT-style: press, burst,
+  // release, press again. A mute used to DROP frames outright, so the server VAD never received the
+  // silence it needs and never closed the segment; the next press continued the SAME segment, the turn
+  // straddled caps-OFF, and canon 119 withheld all of it — six turns in a row on call 26657 (10:56–10:59),
+  // 22 s of caps-ON speech among them. Fix: for VAD_SILENCE_MS + a slack after each release the engine
+  // sends ZEROED frames (the model hears silence, never his muted words — the canon 048 invariant holds),
+  // so the server closes the segment exactly as it does after a natural pause, the reply flows through
+  // the ordinary path, and every press is its own turn. Chosen over a manual input_audio_buffer.commit
+  // because this engine has never relied on manual commits under server_vad and their interplay
+  // (speech_stopped? auto reply? segment reset?) could not be proven offline — reliability over cleverness.
+  const VAD_SILENCE_MS = Number(process.env.APIPLAN_VAD_SILENCE_MS) || 1100;
+  const RELEASE_FLUSH_MS = VAD_SILENCE_MS + 400;
+  let releaseFlushUntil = 0;                   // > now: muted frames go out as zeros so the server can close the turn
+  let releaseFlushAt = 0;                      // when the flush began = the audible end of the released turn
+  /** The frame to send while muted: zeros during the release flush, else null (drop). Pure, so a test can
+   *  drive it: same length as the live frame so the server's clock advances at the real rate. */
+  const releaseFlushFrame = (value: Buffer | Uint8Array, now: number): Buffer | null =>
+    now < releaseFlushUntil ? Buffer.alloc(value.length) : null;
   // suppressAuto: when true, the mouth may NOT answer on its own — any VAD auto-response is
   // cancelled the instant it starts, so the mouth speaks ONLY injected (MIND) lines. The MIND
   // flips this LIVE via an inject {"autospeak":true|false} — instant open/close of the mouth.
@@ -2259,7 +2278,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 say("info", "speaking while muted — the mouth cannot hear you");
               }
             }
-            if (micMuted && !vpCut) continue;                  // muted: drop mic frames so the model never hears them (canon 048: an auto-unmute one branch up lets THIS frame through — the mute is gone, so the gate is gone with it)
+            if (micMuted && !vpCut) {
+              // CANON 124: during the release flush the server gets SILENCE (zeros) of the same length, so
+              // its VAD closes the released turn on schedule; outside the flush the frame is dropped as before.
+              // muted: drop mic frames so the model never hears them (canon 048: an auto-unmute one branch up
+              // lets THIS frame through — the mute is gone, so the gate is gone with it)
+              const z = releaseFlushFrame(value, Date.now());
+              if (!z) continue;
+              value = z;
+            }
           }
           // MIND narrator playing: frames NEVER flow in ANY mode (o.barge only trades off
           // the MOUTH's playback — the narrator's audio must not reach the model even with
@@ -3529,6 +3556,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         // mid-speech → the server never sends speech_stopped → userSpeaking
                         // stayed true and held the MIND queue for 40s+). A mute IS the end
                         // of the audible turn — synthesize the stop.
+                        // CANON 124: a release while the server's segment is open → flush silence so it closes
+                        // (VAD_SILENCE_MS + 400) and mark the audible end of the turn for the noise gates.
+                        if (micMuted && (userSpeaking || speechStartedAt > lastSpeechStopAt)) {
+                          releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS;
+                          say("info", `turn closed on caps release — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
+                            { release_close: true, flush_ms: RELEASE_FLUSH_MS, speech_ms: speechStartedAt ? releaseFlushAt - speechStartedAt : 0 });
+                        }
+                        if (!micMuted) releaseFlushUntil = 0;   // pressed again inside the flush: real frames resume, the segment continues
                         if (micMuted && userSpeaking) {
                           userSpeaking = false;
                           latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;
@@ -4649,6 +4684,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "input_audio_buffer.speech_stopped":
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
+          // CANON 124: if this close was forced by a caps release, the audible speech ended at the release —
+          // the flushed silence must not inflate the length past the noise-blip bar (a 300 ms blip + 1.5 s of
+          // zeros is still a blip).
+          if (releaseFlushAt > speechStartedAt && speechStartedAt) { lastSpeechMs = releaseFlushAt - speechStartedAt; releaseFlushAt = 0; }
           userSpeaking = false;
           // P9: remember the quiet clock this turn is about to overwrite. If the turn turns out to
           // be our own speaker echo, the stack law must measure its 2.5s of silence from the last
@@ -4711,7 +4750,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // caps ON for the whole turn, failing CLOSED on a straddle so the caps-off tail never reaches
             // the mouth/organs/canon. capsOffAt stays old when the sensor is absent, so a dead sensor still
             // publishes (fail-toward-publishing preserved); the words remain in the archive either way.
-            if (tScript && turnStartedAt > 0 && (capsOnAt < turnStartedAt || capsOffAt >= turnStartedAt)) {
+            // CANON 124 (2026-08-25): the straddle half of 119 is retired — a caps-OFF window INSIDE a turn is
+            // zeroed frames now (release flush), so the transcript can carry no caps-off speech beyond the
+            // inject-latency tail (~150–400 ms after the physical release, the same tail every release always
+            // had). What 119 still fails closed on is a turn that BEGAN caps-off (capsOnAt < turnStartedAt).
+            // On call 26657 the straddle rule withheld six of his PTT bursts in three minutes, 22 s of caps-ON
+            // speech among them; his ruling (canon 124) is reliability and a flawless UX.
+            if (tScript && turnStartedAt > 0 && capsOnAt < turnStartedAt) {
               turnsTranscribed++; sessTurnsTranscribed++;
               // Logged as a COUNT and a duration, never as text: the whole point is that these
               // words do not enter a surface the body reads, and the LOG is such a surface.
