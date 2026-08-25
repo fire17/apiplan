@@ -1125,6 +1125,36 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     } catch { /* archive must never break the call */ }
   };
 
+  // ADAPTIVE VOLUME (fire17, voice, call 48629, 2026-08-25 14:10:46 — hands canon 132 / S149 link 2: "שיהיה בעצם כזה
+  // סוג של Adaptive Volume Threshold… שדיבור מהיר גם גורם לו קצת לצעוק… צריך לעבוד מושלם בלי שגיאות"; MIND lane V).
+  // Realtime loudness normalization INSIDE both players so speech sits at one level whatever the model does with
+  // its voice or pace. Two dynaudnorm stages (a wide-gain lifter, then a gentle settler), peak target p=0.5 = a HARD
+  // OUTPUT CEILING at -6 dBFS (lane V addendum, mouths' catch: the barge/recovery bars are absolute PCM peaks — leak
+  // ≤1789 at today's playback, bar 1800 — so a whisper normalized UP must never exceed today's playback peak; -6 dBFS
+  // sits under any normally-mastered TTS peak, so leak can only fall). MEASURED 2026-08-25 on a real archive turn at
+  // 0 / -15 / -30 dB, TWO different turns: spread 0.4 dB and 0.0 dB (three stages: a 40 dB lifter, then 20 dB, then
+  // 10 dB settlers — a two-stage chain spread 4.2 dB on the second turn), peaks -6.11 dBFS on every input, and ZERO
+  // added latency (a click at t=0 comes out at t=0 — dynaudnorm smooths GAIN, it does not delay samples). The
+  // single-stage m=8 the spec named tops out at +18 dB and left a -30 dB whisper 17 dB low; speechnorm two-stage
+  // p=0.5 caps identically (-6.02) but spread 1.7 / 3.6 dB — dynaudnorm kept for the flatter result. Governed by settings.json `adaptive_volume` (default ON, read live, 2 s cache) and the inject verb
+  // {"adaptive_volume":true|false}; a bypass is his EXPRESSIVE mode (a whisper must come through as a whisper):
+  // {"text":…,"adaptive_volume":false} bypasses one narrator line. ffplay fixes its filter graph at spawn, so a
+  // toggle takes effect at the next line boundary (both players are per-utterance) — never mid-line.
+  const ADAPTIVE_AF = "dynaudnorm=f=100:g=5:p=0.5:m=100:s=0,dynaudnorm=f=100:g=5:p=0.5:m=10:s=0,dynaudnorm=f=100:g=5:p=0.5:m=5:s=0";   // p=0.5 = the HARD OUTPUT CEILING (-6 dBFS): loud goes down freely, quiet comes up only to here
+  let adaptiveCached = true; let adaptiveAt = 0;
+  const adaptiveOn = (): boolean => {
+    if (Date.now() - adaptiveAt < 2000) return adaptiveCached;
+    adaptiveAt = Date.now();
+    try { const v = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).adaptive_volume; adaptiveCached = v === undefined ? true : v !== false && v !== 0 && v !== "off"; }
+    catch { adaptiveCached = true; }
+    return adaptiveCached;
+  };
+  const setAdaptive = (on: boolean) => {
+    adaptiveCached = on; adaptiveAt = Date.now();
+    try { const p = `${LM_HOME}/settings.json`; let j: any = {}; try { j = JSON.parse(fs.readFileSync(p, "utf8")); } catch {} j.adaptive_volume = on; ensureDir(LM_HOME); fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n"); } catch {}
+  };
+  /** The mouth player's argv with the normalizer folded in before `-i -` (ffplay options precede the input). */
+  const spkArgv = (): string[] => adaptiveOn() ? [...spk.slice(0, -2), "-af", ADAPTIVE_AF, ...spk.slice(-2)] : spk;
   let player: ReturnType<typeof Bun.spawn> | null = null;
   let speaking = false;          // the model currently has audio in flight
   let playerChecked = false;
@@ -1132,7 +1162,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const startPlayer = () => {
     panReset("mouth");   // fresh player, fresh byte alignment: a half-sample carried from the dead one would shift everything after it
     stereoRecheck((m) => rec({ ev: "info", text: m }));   // AirPods can arrive mid-call: re-decide mono-sum, ≤1 probe/30s
-    const p = Bun.spawn(spk, { stdin: "pipe", stdout: "ignore", stderr: "inherit" });
+    const p = Bun.spawn(spkArgv(), { stdin: "pipe", stdout: "ignore", stderr: "inherit" });   // ADAPTIVE VOLUME: decided per player, i.e. per reply
     player = p;
     // Per-player death watch (not once-ever): a player that dies MID-CALL — device change,
     // audio-unit reset, SIGPIPE — used to leave the turn a silent black hole while the
@@ -3059,7 +3089,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       return false;
     };
     let evaAddressedAt = 0;   // his last Eva-addressed turn — the mouth stays out of it
-    const injectQueue: { text: string; who?: string; bytes?: Uint8Array; speed?: number }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay); speed = per-line narrator tempo
+    const injectQueue: { text: string; who?: string; bytes?: Uint8Array; speed?: number; adaptive?: boolean }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay); speed = per-line narrator tempo; adaptive=false = EXPRESSIVE line
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
     // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
@@ -3087,7 +3117,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       } catch {}
       return EVA_GAIN_DEFAULT;
     };
-    const sendInjected = (text: string, who?: string, bytes?: Uint8Array, lineSpeed?: number) => {
+    const sendInjected = (text: string, who?: string, bytes?: Uint8Array, lineSpeed?: number, lineAdaptive?: boolean) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
       // conversational model with "say this word for word" instructions proved FLAKY: it
@@ -3120,7 +3150,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // then, with the waited-notice). The user-barge cut stays as the last line of defence.
         const heStartedMeanwhile = userSpeaking && Date.now() - speechStartedAt < 120000;
         if (heStartedMeanwhile) {
-          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed });   // keep the render — no second 8 s wait when it is released
+          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed, adaptive: lineAdaptive });   // keep the render — no second 8 s wait when it is released
           queueHeldForHim = true;
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
@@ -3170,11 +3200,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
         // ONE filter graph (ffplay fixes it at spawn): pan/volume first, then the tempo — never a second -af.
-        const mindAf = tempo !== 1
+        const mindAf0 = tempo !== 1
           ? (mindPan.length ? ["-af", `${mindPan[1]},atempo=${tempo.toFixed(3)}`] : ["-af", `atempo=${tempo.toFixed(3)}`])
           : mindPan;
+        // ADAPTIVE VOLUME on the narrator: same normalizer, same ONE filter graph, unless this line is EXPRESSIVE (bypass).
+        const adaptiveThisLine = lineAdaptive !== undefined ? lineAdaptive : adaptiveOn();
+        const mindAf = adaptiveThisLine ? ["-af", mindAf0.length ? `${mindAf0[1]},${ADAPTIVE_AF}` : ADAPTIVE_AF] : mindAf0;
+        if (lineAdaptive === false) rec({ ev: "info", text: "narrator line EXPRESSIVE — adaptive volume bypassed for this line", adaptive_bypass: true });
         if (spkState === "muted" || spkState === "vol0") {          // MUTED-SPEAKER HOLD at playback-ready
-          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed });   // keep the render — no second 8 s wait when it is released
+          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed, adaptive: lineAdaptive });   // keep the render — no second 8 s wait when it is released
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (speaker muted) — audio parked, queue ${injectQueue.length}`, { parked_at_ready: true, speaker_muted: true, spk: spkState, chars: text.length });
           if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3522,7 +3556,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       lastMouthBargeAt = now;
       mouthBargeTailUntil = now + MOUTH_BARGE_TAIL;
     };
-    const injectContext = (text: string, mode: string, who?: string, bytes?: Uint8Array, speed?: number) => {
+    const injectContext = (text: string, mode: string, who?: string, bytes?: Uint8Array, speed?: number, adaptive?: boolean) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
       // by construction (the chunk-splitting workaround existed only because the mouth's
       // model summarized long instruction-driven lines).
@@ -3559,7 +3593,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       speakerCheck();
       const speakerMutedNow = spkState === "muted" || spkState === "vol0";
       if (speakerMutedNow) {
-        injectQueue.push({ text, who, bytes, speed });
+        injectQueue.push({ text, who, bytes, speed, adaptive });
         say("info", `mind line HELD (speaker muted) — queue ${injectQueue.length}`, { speaker_muted: true, spk: spkState });
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3570,13 +3604,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // has to say, exactly as his own turn does. Queued, never dropped; `queueHeldForHim` is
         // deliberately NOT set — the "I wanted to say this earlier but you were speaking"
         // opener would be a lie about a turn that was never addressed to us.
-        injectQueue.push({ text, who, bytes, speed });
+        injectQueue.push({ text, who, bytes, speed, adaptive });
         say("info", `mind line HELD (external conversation — canon 045) — queue ${injectQueue.length}`);
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         return;
       }
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
-        injectQueue.push({ text, who, bytes, speed });
+        injectQueue.push({ text, who, bytes, speed, adaptive });
         queueHeldForHim = true;   // mind-never-interrupts: this line waited out his speech — it will open with the waited-notice
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
         // QUEUE MERGE LAW (fire17, voice, 2026-08-20: "כמה הודעות במקביל נכנסות למחסנית
@@ -3590,8 +3624,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
       // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
       // speaking over the tail of the old voice.
-      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed); return; }
-      injectQueue.push({ text, who, bytes, speed });
+      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed, adaptive); return; }
+      injectQueue.push({ text, who, bytes, speed, adaptive });
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
@@ -3653,7 +3687,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const q = injectQueue.shift()!;
         let t = q.text;
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
-        sendInjected(t, q.who, t === q.text ? q.bytes : undefined, q.speed);   // a prefixed line is new words — render them
+        sendInjected(t, q.who, t === q.text ? q.bytes : undefined, q.speed, q.adaptive);   // a prefixed line is new words — render them
       }
     };
     /** {"replay":"last"|"<mind-NNN-*.wav>"} — play a stored narrator render AGAIN (his 13:21 ask), through the very same
@@ -3776,8 +3810,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       replayNarration(j.replay);
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
+                    } else if (typeof j.adaptive_volume === "boolean" && j.text === undefined) {   // ADAPTIVE VOLUME toggle — both players, from the next line
+                      setAdaptive(j.adaptive_volume);
+                      say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined, undefined,
-                      j.speed !== undefined ? clampSpeed(j.speed, speedMind) : undefined);   // per-line narrator tempo (MIND picks: technical 1.0, chatty 1.3)
+                      j.speed !== undefined ? clampSpeed(j.speed, speedMind) : undefined,   // per-line narrator tempo (MIND picks: technical 1.0, chatty 1.3)
+                      typeof j.adaptive_volume === "boolean" ? j.adaptive_volume : undefined);   // per-line EXPRESSIVE bypass (adaptive_volume:false)
                   } catch {}
                 }
               }
@@ -4633,6 +4671,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           sessT0 = Date.now();
           sessExpiresAt = expiresMs(ev.session?.expires_at);
           if (speedMouth !== 1 || speedMind !== 1.2) say("info", `speed at connect: mouth ${speedMouth}, narrator ${speedMind} (settings.json)`, { speed: speedMouth, mind_speed: speedMind });
+          say("info", `adaptive volume ${adaptiveOn() ? "ON" : "OFF"} at connect (settings.json adaptive_volume; both players)`, { adaptive_volume: adaptiveOn() });
           {
             // OFF-MODE PURITY. With rotation unarmed this handler must add nothing to the turn
             // stream the MIND and the monitor read — the whole worth of an opt-in knob is that it
