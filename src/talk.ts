@@ -350,6 +350,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // above stay for the gates that legitimately mean "the latest turn" (E128, hangup); the echo
   // timing belt reads THIS turn's pair or it does not fire at all.
   const speechTurns: Array<{ startedAt: number; ms: number; stopAt: number; prevStopAt: number }> = [];
+  // NEVER ACT ON A CUT MESSAGE (fire17, voice, call 48629, 2026-08-25 13:25:49 — hands canon 129: "תוודא שאתה
+  // לא מבצע דברים אם אתה מזהה שההודעה שנקטעה, ולא משנה אם זה היה קפסלוק או לא קפסלוק … כדי לשחזר כדי שהכל
+  // יהיה בלי טעויות. אף פעם."). Every finalized turn is judged for truncation BEFORE anyone acts on it;
+  // a cut turn is echoed `turn INCOMPLETE (<why>) — recover before acting` with the evidence, and the
+  // LiveMind side (ears/incomplete-recover.py) recovers the words from the archive WAVs into a correction
+  // entry. Evidence: 13:22:27 'להיות שקורות מזה…' — the tail of a 55 s utterance the 60-min rotation cut.
+  let lastRotCommitAt = 0;                     // when the mic last moved to a successor session
+  let lastReleaseFlushAt = 0;                  // when a caps release last forced a segment closed
+  const TRUNC_ROT_MS = 30000;                  // a turn that began within this after a swap is suspect
+  const MID_START = /^(?:[a-z]|[ושלבמכ][\u05d0-\u05ea]{2,}|להיות|אז |וגם|ובעצם|ואז|אבל |כי )/u;   // continuation shapes, weak
+  const truncationFlags = (text: string, t: { startedAt: number; stopAt: number } | undefined, now: number): string[] => {
+    const why: string[] = [];
+    if (t && lastRotCommitAt && t.startedAt >= lastRotCommitAt - 1000 && t.startedAt - lastRotCommitAt < TRUNC_ROT_MS) why.push(`started ${Math.round((t.startedAt - lastRotCommitAt) / 1000)}s after the session rotation`);
+    if (t && lastReleaseFlushAt && Math.abs(t.stopAt - lastReleaseFlushAt) < 1500) why.push("closed by a caps release, not by a pause");
+    if (MID_START.test(text.trim())) why.push("starts mid-sentence (weak heuristic)");
+    return why;
+  };
   let userSpeaking = false;   // VAD says the human is mid-turn — MIND lines HOLD (stack law)
   let lastSpeechStopAt = 0;   // sustained-silence gate: MIND may speak only after ~2.5s of real quiet
   let prevSpeechStopAt = 0;   // the quiet clock BEFORE the current turn overwrote it — an echo turn puts it back
@@ -3641,7 +3658,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         // CANON 124: a release while the server's segment is open → flush silence so it closes
                         // (VAD_SILENCE_MS + 400) and mark the audible end of the turn for the noise gates.
                         if (micMuted && (userSpeaking || speechStartedAt > lastSpeechStopAt)) {
-                          releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS;
+                          releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
                           say("info", `turn closed on caps release — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
                             { release_close: true, flush_ms: RELEASE_FLUSH_MS, speech_ms: speechStartedAt ? releaseFlushAt - speechStartedAt : 0 });
                         }
@@ -4298,6 +4315,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       sessResponsesCreated = 0; sessResponsesCancelled = 0; sessTurnsTranscribed = 0; sessResponsesEmpty = 0;
       sessT0 = succT0 || Date.now(); sessExpiresAt = succExpiresAt;
       rotN++; rotState = "off"; rotGap = false; succTries = 0; succRetryAt = 0;
+      lastRotCommitAt = Date.now();   // truncation detector: the next turn may be the tail of a cut utterance
       // W2(b/c) — NEVER LEAVE A SUCCESSOR HALF-CONFIGURED. If the un-park was not acknowledged
       // before we had to swap, the session may still be carrying create_response:false: it would
       // hear him perfectly and never answer, and a mouth that is silently shut is exactly the
@@ -5111,7 +5129,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 ann.external_suspect = true; ann.external_belt = "lang+xconv";
                 ann.xconv_since_ms = xconvHeld() ? 0 : xconvSinceClose(Date.now());
               }
-              say("you", tScript, (suspect || externalMarked) ? ann : undefined);
+              const cutWhy = truncationFlags(tScript, turn, Date.now());
+              const strongCut = cutWhy.some((w) => !w.includes("weak"));
+              if (cutWhy.length) { ann.incomplete = strongCut ? "strong" : "weak"; ann.incomplete_why = cutWhy; }
+              say("you", tScript, (suspect || externalMarked || cutWhy.length) ? ann : undefined);
+              if (strongCut)
+                say("info", `turn INCOMPLETE (${cutWhy.join("; ")}) — recover before acting`,
+                  { incomplete: true, why: cutWhy, turn_started_at: turnStartedAt, turn_stop_at: turn?.stopAt ?? 0, chars: tScript.length });
+              else if (cutWhy.length)
+                say("info", `turn possibly incomplete (${cutWhy.join("; ")}) — weak signal, logged only`, { incomplete_weak: true, why: cutWhy, turn_started_at: turnStartedAt });
               if (externalMarked) say("info", "turn marked external-suspect (lang+xconv) — the mouth will not auto-reply; his words are logged, archived and kept in full",
                 { external_suspect: true, external_belt: "lang+xconv", xconv_since_ms: xconvHeld() ? 0 : xconvSinceClose(Date.now()) });
               // RELEASE THE PARKED REPLY (call 3357). Reaching this line means the turn was
