@@ -473,9 +473,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // silence, and announce on unmute how many lines he may have missed (replay = MIND's
   // call from the LOG). ponytail: osascript on demand; CoreAudio listener only if this
   // ever needs to be event-driven.
-  let spkState = "unknown"; let spkAt = 0; let mutedSpoken = 0;
-  const speakerCheck = () => {
-    if (Date.now() - spkAt < 5000) return;
+  let spkState = "unknown"; let spkAt = 0; let mutedSpoken = 0; let spkMutedSince = 0;
+  const speakerCheck = (force = false) => {
+    if (!force && Date.now() - spkAt < 5000) return;   // force: the muted-speaker hold polls 1 s while lines wait, and only then
     spkAt = Date.now();
     try {
       const p = Bun.spawn(["osascript", "-e", "get volume settings"], { stdout: "pipe", stderr: "ignore" });
@@ -484,8 +484,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const muted = /output muted:true/.test(out);
         const prev = spkState;
         spkState = muted ? "muted" : vol === 0 ? "vol0" : Number.isNaN(vol) ? "unknown" : vol <= 15 ? "low" : "ok";
-        if (prev !== spkState && (spkState === "muted" || spkState === "vol0"))
+        if (prev !== spkState && (spkState === "muted" || spkState === "vol0")) {
+          spkMutedSince = Date.now();
           say("info", `mac output ${spkState} — speech from here is likely UNHEARD`);
+        }
+        // MUTED-SPEAKER HOLD (MIND spec, call 48629 2026-08-25: the S146 star-ack played at
+        // 13:01:46 into a speaker he had muted at ~12:54 — lost; this read fired 135 ms AFTER
+        // playback began). On the muted->audible edge the lines held below flow under the stack
+        // law, and the mouth is told BY CODE to open its next reply with the fact.
+        if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && injectQueue.length) {
+          const since = new Date(spkMutedSince || spkAt).toTimeString().slice(0, 5);
+          say("info", `speaker unmuted — ${injectQueue.length} held mind line(s) flow (muted since ${since})`, { speaker_unmuted: true, held: injectQueue.length, muted_since: spkMutedSince });
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text",
+                text: `[His speaker was muted since ${since}; ${injectQueue.length} line(s) from the mind were held and will play now. Open your next reply by telling him exactly that, in one short sentence, then answer him.]` }] } }));
+            } catch {}
+          }
+          if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 200);
+        }
         if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && mutedSpoken) {
           say("info", `mac output audible again — ${mutedSpoken} line(s) were spoken while ${prev}; he may have missed them (replay from LOG if he asks)`);
           mutedSpoken = 0;
@@ -3099,6 +3116,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const mindPan = mindGain
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
+        if (spkState === "muted" || spkState === "vol0") {          // MUTED-SPEAKER HOLD at playback-ready
+          injectQueue.unshift({ text, who });
+          mindBusy = false;
+          say("info", `mind line HELD at playback-ready (speaker muted) — audio parked, queue ${injectQueue.length}`, { parked_at_ready: true, speaker_muted: true, spk: spkState, chars: text.length });
+          if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+          return;
+        }
         speakerCheck(); warnIfUnheard("mind");                        // LANE 18: async, cached 5s
         // ── MOUTH-KNOWS-FIRST (LEDGER -46, fire17 voice, call 96072, 2026-08-24 17:12) ──────
         // Until tonight the mouth learned a MIND line ONLY from `mindPlayer.exited` — and only
@@ -3455,6 +3479,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         queueHeldForHim = false;
       }
       queueStale = false;   // a new inject IS the re-weave — it releases the stale hold
+      // MUTED-SPEAKER HOLD: refresh the LANE 18 read NOW (async, cached 5 s) so that by
+      // playback-ready — seconds of render later — the gate holds a fresh answer; and if the
+      // last-known state is already muted, hold before rendering at all. Never latches off:
+      // "unknown" plays (a failed read must not silence the MIND — canon 045's fail-open rule).
+      speakerCheck();
+      const speakerMutedNow = spkState === "muted" || spkState === "vol0";
+      if (speakerMutedNow) {
+        injectQueue.push({ text, who });
+        say("info", `mind line HELD (speaker muted) — queue ${injectQueue.length}`, { speaker_muted: true, spk: spkState });
+        if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+        if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+        return;
+      }
       if (xconvHeld()) {
         // CANON 045: a conversation he is having with someone else outranks anything the MIND
         // has to say, exactly as his own turn does. Queued, never dropped; `queueHeldForHim` is
@@ -3514,6 +3551,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         return;
       }
       if (userSpeaking || Date.now() - lastSpeechStopAt < 2500) {
+        if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+        return;
+      }
+      if (spkState === "muted" || spkState === "vol0") {   // MUTED-SPEAKER HOLD — polls 1 s ONLY while lines wait (E107 kept; MIND: 5 s unmute latency is felt)
+        speakerCheck(true);
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
