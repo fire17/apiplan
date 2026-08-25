@@ -1371,6 +1371,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let sessExpiresAt = 0;         // the server's own deadline in ms, when it states one
   let rotN = 0;
   let rotResending = false;      // a resend is streaming — a swap would split it in half
+  let rotEarlyAt = 0;            // ROTATE AT A TURN BOUNDARY: when this session's deliberate early reconnect was requested (0 = not yet)
   let rotTimer: ReturnType<typeof setInterval> | null = null;
   // R3b self-demotion: if opening a successor ever kills the live session, overlap is disabled
   // for this call AND for every future call on this machine.
@@ -3957,6 +3958,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       && injectQueue.length === 0 && Date.now() - lastSpeechStopAt >= ROT_QUIET_MS;
 
     const rotBackoff = () => { succTries++; succRetryAt = Date.now() + Math.min(15000, 2000 * 2 ** Math.min(3, succTries - 1)); };
+    /** ROTATE AT A TURN BOUNDARY (MIND spec C, 2026-08-25; the root of canon 129's 13:22:27 cut: on this
+     *  endpoint overlap is self-demoted — ~/.livemind/rotation-concurrency.json — so the armed state used
+     *  to WAIT for the 60:00 cap, and whatever he was saying AT the cap was split, 13:21:17 → 13:22:12,
+     *  only the tail transcribed). Once the floor-lead window opens, the FIRST quiet moment (the same
+     *  2.5 s bar the MIND's stack gate uses — nobody speaking, nothing generating, nothing held) closes
+     *  the socket ON PURPOSE, so the existing R2 reconnect-in-place path runs at a turn boundary instead
+     *  of mid-word. Once per session; the cap remains the backstop if no quiet moment ever comes. */
+    const rotBoundaryDue = (now: number, floorAt: number) =>
+      !rotGap && !rotConcurrent && !rotEarlyAt && now >= floorAt - ROT_LEAD_MS && rotQuiet();
     /** R1 — the successor failed. The LIVE call is never touched by this path. */
     const rotDrop = (why: string) => {
       const s = succ; succ = null;
@@ -4314,7 +4324,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       const outTurns = sessTurnsTranscribed, outEmpty = sessResponsesEmpty;
       sessResponsesCreated = 0; sessResponsesCancelled = 0; sessTurnsTranscribed = 0; sessResponsesEmpty = 0;
       sessT0 = succT0 || Date.now(); sessExpiresAt = succExpiresAt;
-      rotN++; rotState = "off"; rotGap = false; succTries = 0; succRetryAt = 0;
+      rotN++; rotState = "off"; rotGap = false; succTries = 0; succRetryAt = 0; rotEarlyAt = 0;
       lastRotCommitAt = Date.now();   // truncation detector: the next turn may be the tail of a cut utterance
       // W2(b/c) — NEVER LEAVE A SUCCESSOR HALF-CONFIGURED. If the un-park was not acknowledged
       // before we had to swap, the session may still be carrying create_response:false: it would
@@ -4419,7 +4429,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             { rotation: true, rot_n: rotN, floor_in_s: Math.round((floorAt - now) / 1000), expires_at: sessExpiresAt || undefined });
           return;
         case "armed":
-          if (!rotGap && !rotConcurrent) return;    // self-demoted: no overlap — wait for the cap, then reconnect
+          if (!rotGap && !rotConcurrent) {          // self-demoted: no overlap — reconnect in place at a turn boundary, else at the cap
+            if (rotBoundaryDue(now, floorAt)) {
+              rotEarlyAt = now;
+              say("info", `rotation: quiet moment at ${Math.round((now - sessT0) / 1000)}s — reconnecting in place BEFORE the cap (floor in ${Math.round((floorAt - now) / 1000)}s) so no utterance is split`,
+                { rotation: true, rot_early: true, floor_in_s: Math.round((floorAt - now) / 1000) });
+              try { ws.close(); } catch {}         // onclose → rotReconnect: archive rolls, successor opens, gap re-fed — the R2 path unchanged
+            }
+            return;
+          }
           if (now < succRetryAt) return;
           if (rotGap && succTries >= 6) {
             rotState = "done";
