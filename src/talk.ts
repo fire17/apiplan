@@ -3038,8 +3038,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // ORGAN VOICES: an organ line ({"text":…,"who":"eva"}) is rendered by the SAME narrator,
       // through the SAME queue and the SAME never-interrupt gates — only the voice differs.
       const mindVoice = who === "eva" ? evaVoice() : (process.env.APIPLAN_MIND_VOICE || "ash");
+      const renderStartedAt = Date.now();
       speakRealtime(c, { text, voice: mindVoice }, 60000).then(async (r) => {
         if (closed) { mindBusy = false; return; }
+        // NO-BARGE-EVER (fire17, voice, call 48629, 2026-08-25 12:53:29 — hands canon 126: "גם אם זה
+        // השליחה הראשונה שלו לא יכול להתפרץ אליי. זה קרה ממש הרגע ואנחנו חייבים שזה יהיה סגור
+        // לצמיתות"). The stack-law HELD gate above ran when the line was READ; rendering took
+        // seconds (12:52:43.344 read -> 12:52:49.040 ready) and he started talking in between
+        // (speech_started 12:52:47.657). The old flow then silenced the mouth and played over him
+        // for 23 s, mic ducked, his words archived-only. So the gate is re-evaluated HERE, at the
+        // instant the audio exists: if he is mid-turn now, the rendered line goes back to the
+        // FRONT of the held queue and follows the stack law like any held line — flushInjectQueue
+        // releases it only after the mouth has answered him and 2.5 s of real quiet (re-rendered
+        // then, with the waited-notice). The user-barge cut stays as the last line of defence.
+        const heStartedMeanwhile = userSpeaking && Date.now() - speechStartedAt < 120000;
+        if (heStartedMeanwhile) {
+          injectQueue.unshift({ text, who });
+          queueHeldForHim = true;
+          mindBusy = false;
+          say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
+            { parked_at_ready: true, render_ms: Date.now() - renderStartedAt, chars: text.length });
+          if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+          if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
+          return;
+        }
         // MIND priority (code-enforced handoff): silence the mouth right as the MIND's audio is
         // ready — no dead air, no overlap. Unconditional: the mouth's audio outlives its response,
         // so checking responseActive alone let the MIND play over the mouth's tail.
