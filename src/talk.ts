@@ -526,6 +526,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let curResponseBornAt = 0;                  // E128: when the active response was born — the empty-transcript
                                               // gate may only cancel a reply born from ITS OWN segment
   let mindResponse = false;                   // current response was MIND/tool-initiated (never noise-cancel it)
+  let lastSpkMutedEchoAt = 0;                 // MUTED-SPEAKER SUPPRESS echo throttle (10 s, like the suppressAuto line)
   let pendingMindHistory = "";                // MIND line to record in conversation AFTER it is spoken
   let mindBusy = false;                       // a MIND narrator line is generating or playing (serializes the queue)
   let mindPlayer: any = null;                 // the MIND voice's own ffplay child (killed on barge/exit)
@@ -4644,7 +4645,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // The recovery half of suppressAuto, told apart from the MIND's explicit {"autospeak":false}
             // (which leaves suppressRestoreAt at 0). Only the recovery half is deferrable.
             const recoveryWindow = suppressAuto && suppressRestoreAt > 0;
-            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom || evaTurn || organFloor || xconv)) {
+            // MUTED-SPEAKER SUPPRESS (MIND order 2026-08-25 13:4x, extends the 7ffb8b7 hold; observed 13:39-13:41
+            // on call 48629: he was in a side conversation with someone else, Mac output muted, and the mouth
+            // answered every line into silence — each reply ducking his mic 5-20 s, half-duplex for nobody).
+            // A reply nobody can hear is cancelled at birth. LANE 18's read is refreshed here (async, cached
+            // 5 s) so the next verdict is fresh; "unknown" never suppresses (canon 045 fail-open). MIND-initiated
+            // responses carry awaitingResponse and are untouched — {text} lines have their own hold. autospeak is
+            // NOT flipped (that reads as PARKED to lm-calls); the archive is untouched; the unmute edge still
+            // tells the mouth what was held.
+            speakerCheck();
+            const spkMuted = spkState === "muted" || spkState === "vol0";
+            if (!awaitingResponse && (suppressAuto || noiseBlip || mindBusy || selfEcho || emptyRoom || evaTurn || organFloor || xconv || spkMuted)) {
               try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responsesCancelled++; sessResponsesCancelled++;
@@ -4652,6 +4663,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
               if (selfEcho && !suppressAuto && !noiseBlip) say("info", `auto-reply cancelled at birth — self-echo hold (segment began ${speechStartedAt - echoHoldSetAt}ms vs the verdict)`, { echo_suppressed: true, echo_hold: true, segment_vs_verdict_ms: speechStartedAt - echoHoldSetAt });
               if (evaTurn && !suppressAuto && !noiseBlip && !selfEcho) say("info", "auto-reply cancelled at birth — he addressed Eva", { addressee: "eva" });
+              if (spkMuted && !suppressAuto && !noiseBlip && !selfEcho && !evaTurn && !mindBusy && !emptyRoom && !organFloor && !xconv) {
+                if (Date.now() - lastSpkMutedEchoAt > 10000) {
+                  lastSpkMutedEchoAt = Date.now();
+                  say("info", `auto-reply suppressed (speaker muted) — output ${spkState}, nobody would hear it`, { speaker_muted: true, spk: spkState });
+                } else rec({ ev: "info", text: "auto-reply suppressed (speaker muted) (throttled)", speaker_muted: true, throttled: true });
+              }
               // THROTTLED like the suppressAuto notice below it, and for the same reason (W36
               // verify): the daemon parks with turn_detection.idle_timeout_ms=15000, so an empty
               // room self-prompts every ~15s — ~120 cancels across a 30-minute absence. The
