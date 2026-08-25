@@ -2127,21 +2127,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let latchWatchAt = 0;       // last watch echo
     let latchPeakMax = 0;       // max mic frame peak since the last watch echo (B4: loud-but-untranscribed
                                 // is a different world from quiet-but-stuck — only the peak separates them)
-    let lastDeltaAt = 0;        // last transcription delta — the quiet-INDEPENDENT escape clock (B4):
-                                // every release was quiet-gated, so sustained room noise held a segment
-                                // 814.3s; his real speech always produces deltas, so a segment open with a
-                                // silent transcription stream is closable no matter how loud the room is.
-    const STALL_ESC_MS = (() => { const v = envBar("APIPLAN_LATCH_STALL_MS", 20000); return Number.isFinite(v) && v >= 0 ? v : 20000; })();
-    const HARD_ESC_MS = (() => { const v = envBar("APIPLAN_LATCH_HARD_MS", 300000); return Number.isFinite(v) && v >= 0 ? v : 300000; })();
-    /** p16, pure (B4): the quiet-independent escape — the segment is open and either the transcription
-     *  stream has said nothing for STALL_ESC_MS (20s — MIND order, latch #4 16:09:45; deltas died mid-segment, speech_stopped never
-     *  came) or the segment passed the absolute ceiling (2x his longest genuine turn, 156s). */
-    const stallEscapeDue = (startedAt: number, stoppedAt: number, deltaAt: number, synthAt: number, now: number): string | null => {
-      if (!(startedAt > stoppedAt) || synthAt) return null;
-      if (HARD_ESC_MS > 0 && now - startedAt >= HARD_ESC_MS) return `open ${Math.round((now - startedAt) / 1000)}s >= hard ceiling ${Math.round(HARD_ESC_MS / 1000)}s`;
-      if (STALL_ESC_MS > 0 && now - Math.max(deltaAt, startedAt) >= STALL_ESC_MS) return `no transcription delta for ${Math.round((now - Math.max(deltaAt, startedAt)) / 1000)}s while the segment is open`;
-      return null;
-    };
+    let lastDeltaAt = 0;        // last transcription delta — DIAGNOSTIC ONLY (B4 addendum refuted it as an
+                                // escape clock: deltas land AT/AFTER speech_stopped — 35 of 59 real >60s
+                                // segments carry ZERO mid-segment deltas, incl. his genuine 546.7s turn).
     let bargeMs = 0; let lastBargeAt = 0;
     let bargeCandAt = 0; let bargeCandPeak = 0; let bargeCandMs = 0;   // the open speech-evidence confirmation window
     let mouthBargeMs = 0; let lastMouthBargeAt = 0; let mouthBargeTailUntil = 0;
@@ -3835,6 +3823,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       }
       return null;
     };
+    // HOLD CEILING (B4 addendum, measured: 6 holds on call 37249, median 301.5s, max 814.3s — the harm
+    // was the MIND starved, not the segment open; and NO ceiling on HIS segment is safe: real turns
+    // reach 546.7s, so the stall/duration escapes were removed as premise-false). After a line has
+    // waited this long for a silence that may never come, it speaks — over noise if need be; his voice
+    // still barges it within ~250ms and it re-queues (self-healing). 0 disables. Value = the MIND's.
+    const MIND_HOLD_MAX_MS = (() => { const v = envBar("APIPLAN_MIND_HOLD_MAX_MS", 180000); return Number.isFinite(v) && v >= 0 ? v : 180000; })();
+    /** Pure: has this wait outlived the ceiling? */
+    const holdCeilingDue = (waitingSince: number, now: number): boolean =>
+      MIND_HOLD_MAX_MS > 0 && waitingSince > 0 && now - waitingSince >= MIND_HOLD_MAX_MS;
     const queueWait = (why: string) => {
       if (!queueWaitSince) queueWaitSince = Date.now();
       if (Date.now() - queueWaitEchoAt > 5000) { queueWaitEchoAt = Date.now(); say("info", `mind queue waiting — ${why}`, { queue_waiting: why, queue: injectQueue.length }); }
@@ -3852,7 +3849,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         ? queueMustWait(Date.now(), userSpeaking, lastSpeechStopAt, quietBar, !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0",
             lastRealTurnAt, lastRealTurnStart, lastResponseCreatedAt, responseActive, pendingMouthReply, playingUntil, lastMindSpokeAt)
         : (userSpeaking || Date.now() - lastSpeechStopAt < quietBar ? "his turn active" : null);
-      if (waitWhy) {
+      if (waitWhy && injectQueue.length && holdCeilingDue(queueWaitSince, Date.now())) {
+        say("info", `mind line released by hold ceiling — held ${Math.round((Date.now() - queueWaitSince) / 1000)}s waiting for "${waitWhy}" (quiet never came; B4: bound the consequence, never his turn)`,
+          { hold_ceiling: true, held_ms: Date.now() - queueWaitSince, was_waiting_for: waitWhy, queue: injectQueue.length });
+      } else if (waitWhy) {
         if (injectQueue.length) queueWait(waitWhy);
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
@@ -3921,25 +3921,6 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           say("info", `latch watch: segment open ${Math.round((Date.now() - speechStartedAt) / 1000)}s, quiet ${Math.round((Date.now() - lastVoiceAt) / 1000)}s, peak ${latchPeakMax}, last delta ${lastDeltaAt ? Math.round((Date.now() - lastDeltaAt) / 1000) + "s ago" : "never"}, frames ${latchFrames} (${latchFrozen} frozen${latchFrozen ? ": " + latchFreezeWhy : ""}), userSpeaking=${userSpeaking} synth=${latchSynthAt ? "fired" : "no"}`,
             { latch_watch: true, open_ms: Date.now() - speechStartedAt, quiet_ms: Date.now() - lastVoiceAt, peak: latchPeakMax, delta_ms: lastDeltaAt ? Date.now() - lastDeltaAt : -1, frames: latchFrames, frozen: latchFrozen, why: latchFreezeWhy, user_speaking: userSpeaking });
           latchFrames = 0; latchFrozen = 0; latchPeakMax = 0;
-        }
-        // p16/B4 QUIET-INDEPENDENT ESCAPE: sustained room noise must never hold a segment forever
-        // (814.3s measured; every other release is quiet-gated). Same release flush as lane L.
-        {
-          const esc = stallEscapeDue(speechStartedAt, serverStoppedAt, lastDeltaAt, latchSynthAt, Date.now());
-          if (esc) {
-            latchSynthAt = Date.now();
-            releaseFlushAt = latchSynthAt; releaseFlushUntil = latchSynthAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
-            say("info", `segment closed by hard escape — ${esc} (quiet-independent, B4) — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
-              { latch_hard_escape: true, why: esc, open_ms: latchSynthAt - speechStartedAt });
-            // latch #4 (MIND order 16:1x): the transcription stream may be DEAD server-side, so the
-            // flush alone may never produce speech_stopped — release the LOCAL latch too, exactly as
-            // the local timeout does (speechTurns untouched; the 2.5s quiet gate still applies).
-            if (userSpeaking) {
-              userSpeaking = false; latchTimedOut = true; lastSpeechStopAt = latchSynthAt; latchVoiceMs = 0;
-              say("info", `user-speaking latch released by hard escape — ${injectQueue.length} held MIND line(s) may flow`, { latch_hard_local: true, held: injectQueue.length });
-              if (injectQueue.length) setTimeout(flushInjectQueue, 0);
-            }
-          }
         }
         try {
           const f = Bun.file(injectPath);
