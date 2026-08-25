@@ -1073,6 +1073,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
     return capsJson;
   };
+  // p17 (call 37249, 16:00:34 x5): pid 38276 — aecmic2, the barge pipeline's child, a GRANDCHILD of this
+  // process — read as foreign media and held the canon-048 auto-unmute. pid/ppid equality misses
+  // grandchildren, so ancestry is walked through one cached `ps` snapshot (5s): any audio_out pid whose
+  // parent chain reaches this process is OURS, never "other media". Fails open (unknown pid = foreign,
+  // the law wins over the unknown — same stance as the sensor itself).
+  let psMapAt = 0; let psMap: Map<number, number> = new Map();
+  const psSnapshot = (): Map<number, number> => {
+    if (Date.now() - psMapAt > 5000) {
+      psMapAt = Date.now(); psMap = new Map();
+      try {
+        const out = Bun.spawnSync(["ps", "-eo", "pid=,ppid="]).stdout.toString();
+        for (const ln of out.split("\n")) { const m = ln.trim().split(/\s+/); if (m.length === 2) psMap.set(Number(m[0]), Number(m[1])); }
+      } catch {}
+    }
+    return psMap;
+  };
+  /** Pure half — walks a pid→ppid map; the test drives it with a fixture tree. */
+  const chainReaches = (map: Map<number, number>, pid: number, root: number): boolean => {
+    let p = pid;
+    for (let i = 0; i < 12 && p > 1; i++) { if (p === root) return true; p = map.get(p) ?? 0; }
+    return false;
+  };
+  const isOwnDescendant = (pid: number): boolean => Number.isFinite(pid) && pid > 1 && chainReaches(psSnapshot(), pid, process.pid);
   // true only when we can SEE foreign audio output. An absent/old file is "unknown", and the
   // law wins over the unknown (his exception names media he can hear, not a missing sensor) —
   // it is logged either way so a wrong unmute is never a mystery.
@@ -1084,7 +1107,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // handles are the belt: a reparented child (ppid 1) was reproduced in test and would
       // otherwise read as foreign media.
       && a.pid !== player?.pid && a.pid !== mindPlayer?.pid
-      && !AUDIO_OUT_IGNORE.has(String(a.bundle || "")));
+      && !AUDIO_OUT_IGNORE.has(String(a.bundle || ""))
+      && !isOwnDescendant(Number(a.pid)));   // p17: our own pipeline's grandchildren are never "other media"
     return { on: foreign.length > 0, who: foreign.map((a: any) => `${a.bundle || "pid " + a.pid}`).join(", ") };
   };
   // Called from the muted-frame path the moment speech evidence crosses the bar.
@@ -2086,10 +2110,38 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const LATCH_SYNTH_QUIET_MS = (() => { const v = envBar("APIPLAN_LATCH_SYNTH_QUIET_MS", 3000); return Number.isFinite(v) && v > 0 ? v : 3000; })();
     let latchSynthAt = 0;       // when the synthesized stop was issued for the open segment (0 = not yet)
     let serverStoppedAt = 0;    // the server's own last speech_stopped — the segment is OPEN while speechStartedAt > this
+    /** p16, pure: the watch speaks only while the SERVER segment is open >20s, at most every 10s. */
+    const latchWatchDue = (startedAt: number, stoppedAt: number, lastAt: number, now: number): boolean =>
+      startedAt > stoppedAt && now - startedAt > 20000 && now - lastAt >= 10000;
     /** Pure, so the test can replay the three clocks of call 48629 against it. */
     const latchSynthDue = (openMs: number, quietMs: number, synthAt: number, segmentOpen: boolean): boolean =>
       segmentOpen && !synthAt && openMs >= LATCH_SYNTH_OPEN_MS && quietMs >= LATCH_SYNTH_QUIET_MS;
     let latchTimedOut = false;  // the latch was cleared by timeout, not by the server
+    // p16 LATCH WATCH (call 37249, 15:57:02→16:00:34): a segment sat open 3m31s with ZERO latch echoes —
+    // neither the 4/12s local timeout nor the lane-L synth ever spoke, and the LOG cannot say whether the
+    // frame path stalled or the freeze branch held. These counters + the 10s watch echo in the inject tick
+    // make the next occurrence self-explaining. Diagnostic only — no behavior change.
+    let latchFrames = 0;        // mic frames that reached the latch block since the last watch echo
+    let latchFrozen = 0;        // of those, frames the freeze branch swallowed
+    let latchFreezeWhy = "";    // the last freeze reason (audible | mindBusy | mindPlayer | ducked)
+    let latchWatchAt = 0;       // last watch echo
+    let latchPeakMax = 0;       // max mic frame peak since the last watch echo (B4: loud-but-untranscribed
+                                // is a different world from quiet-but-stuck — only the peak separates them)
+    let lastDeltaAt = 0;        // last transcription delta — the quiet-INDEPENDENT escape clock (B4):
+                                // every release was quiet-gated, so sustained room noise held a segment
+                                // 814.3s; his real speech always produces deltas, so a segment open with a
+                                // silent transcription stream is closable no matter how loud the room is.
+    const STALL_ESC_MS = (() => { const v = envBar("APIPLAN_LATCH_STALL_MS", 20000); return Number.isFinite(v) && v >= 0 ? v : 20000; })();
+    const HARD_ESC_MS = (() => { const v = envBar("APIPLAN_LATCH_HARD_MS", 300000); return Number.isFinite(v) && v >= 0 ? v : 300000; })();
+    /** p16, pure (B4): the quiet-independent escape — the segment is open and either the transcription
+     *  stream has said nothing for STALL_ESC_MS (20s — MIND order, latch #4 16:09:45; deltas died mid-segment, speech_stopped never
+     *  came) or the segment passed the absolute ceiling (2x his longest genuine turn, 156s). */
+    const stallEscapeDue = (startedAt: number, stoppedAt: number, deltaAt: number, synthAt: number, now: number): string | null => {
+      if (!(startedAt > stoppedAt) || synthAt) return null;
+      if (HARD_ESC_MS > 0 && now - startedAt >= HARD_ESC_MS) return `open ${Math.round((now - startedAt) / 1000)}s >= hard ceiling ${Math.round(HARD_ESC_MS / 1000)}s`;
+      if (STALL_ESC_MS > 0 && now - Math.max(deltaAt, startedAt) >= STALL_ESC_MS) return `no transcription delta for ${Math.round((now - Math.max(deltaAt, startedAt)) / 1000)}s while the segment is open`;
+      return null;
+    };
     let bargeMs = 0; let lastBargeAt = 0;
     let bargeCandAt = 0; let bargeCandPeak = 0; let bargeCandMs = 0;   // the open speech-evidence confirmation window
     let mouthBargeMs = 0; let lastMouthBargeAt = 0; let mouthBargeTailUntil = 0;
@@ -2361,7 +2413,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // a mute flip already synthesizes the stop (call 86130).
           if (LATCH_MS > 0 && value?.length && !micMuted && (userSpeaking || latchTimedOut)) {
             const nowL = Date.now();
+            latchFrames++;   // p16: proves the frame path itself is alive
+            { const pk16 = framePeak(value); if (pk16 > latchPeakMax) latchPeakMax = pk16; }
             if (stillAudible() || mindBusy || mindPlayer || ducked()) {
+              latchFrozen++; latchFreezeWhy = stillAudible() ? "audible" : mindBusy ? "mindBusy" : mindPlayer ? "mindPlayer" : "ducked";
               // UNOBSERVABLE WINDOW. While OUR audio plays, these frames carry speaker leak,
               // so a peak proves nothing about him — freeze the clock rather than time out
               // blind, and never let our own leak drive a re-latch.
@@ -3860,6 +3915,32 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (Date.now() >= selfMuteUntil) { suppressAuto = false; suppressBy = ""; selfMuteUntil = 0; say("info", `mouth OPEN (self-mute expired after ${Math.round(SELF_MUTE_MS / 1000)}s — he must ask again to keep it quiet)`, { mouth_self: "expired" }); }
           else if (Date.now() - selfMuteEchoAt >= 20000) { selfMuteEchoAt = Date.now(); say("info", `mouth self-muted — reopens in ${Math.round((selfMuteUntil - Date.now()) / 1000)}s`, { mouth_self: "countdown" }); }
         }
+        // p16 LATCH WATCH: while the server's VAD segment is open past 20s, echo the three clocks every 10s.
+        if (latchWatchDue(speechStartedAt, serverStoppedAt, latchWatchAt, Date.now())) {
+          latchWatchAt = Date.now();
+          say("info", `latch watch: segment open ${Math.round((Date.now() - speechStartedAt) / 1000)}s, quiet ${Math.round((Date.now() - lastVoiceAt) / 1000)}s, peak ${latchPeakMax}, last delta ${lastDeltaAt ? Math.round((Date.now() - lastDeltaAt) / 1000) + "s ago" : "never"}, frames ${latchFrames} (${latchFrozen} frozen${latchFrozen ? ": " + latchFreezeWhy : ""}), userSpeaking=${userSpeaking} synth=${latchSynthAt ? "fired" : "no"}`,
+            { latch_watch: true, open_ms: Date.now() - speechStartedAt, quiet_ms: Date.now() - lastVoiceAt, peak: latchPeakMax, delta_ms: lastDeltaAt ? Date.now() - lastDeltaAt : -1, frames: latchFrames, frozen: latchFrozen, why: latchFreezeWhy, user_speaking: userSpeaking });
+          latchFrames = 0; latchFrozen = 0; latchPeakMax = 0;
+        }
+        // p16/B4 QUIET-INDEPENDENT ESCAPE: sustained room noise must never hold a segment forever
+        // (814.3s measured; every other release is quiet-gated). Same release flush as lane L.
+        {
+          const esc = stallEscapeDue(speechStartedAt, serverStoppedAt, lastDeltaAt, latchSynthAt, Date.now());
+          if (esc) {
+            latchSynthAt = Date.now();
+            releaseFlushAt = latchSynthAt; releaseFlushUntil = latchSynthAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
+            say("info", `segment closed by hard escape — ${esc} (quiet-independent, B4) — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
+              { latch_hard_escape: true, why: esc, open_ms: latchSynthAt - speechStartedAt });
+            // latch #4 (MIND order 16:1x): the transcription stream may be DEAD server-side, so the
+            // flush alone may never produce speech_stopped — release the LOCAL latch too, exactly as
+            // the local timeout does (speechTurns untouched; the 2.5s quiet gate still applies).
+            if (userSpeaking) {
+              userSpeaking = false; latchTimedOut = true; lastSpeechStopAt = latchSynthAt; latchVoiceMs = 0;
+              say("info", `user-speaking latch released by hard escape — ${injectQueue.length} held MIND line(s) may flow`, { latch_hard_local: true, held: injectQueue.length });
+              if (injectQueue.length) setTimeout(flushInjectQueue, 0);
+            }
+          }
+        }
         try {
           const f = Bun.file(injectPath);
           if (await f.exists()) {
@@ -4823,7 +4904,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // A transcription delta IS voice: a quiet talker under the peak bar must never let
           // the stuck-latch timeout fire on him. (On this rig deltas arrive in a burst after the
           // commit, so this is a belt — the mic frames are the working signal.)
-          if (ev.delta) { lastVoiceAt = Date.now(); if (userSpeaking) latchHadVoice = true; rec({ ev: "you_delta", text: ev.delta }); }
+          if (ev.delta) { lastVoiceAt = Date.now(); lastDeltaAt = lastVoiceAt; if (userSpeaking) latchHadVoice = true; rec({ ev: "you_delta", text: ev.delta }); }
           break;
       }
       switch (ev.type) {
