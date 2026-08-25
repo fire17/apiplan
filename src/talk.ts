@@ -573,6 +573,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // LANE 15: the SAME object as mindLine, but never nulled when playback ends — the state
   // file must still know the last line and how much of it was heard after it finished.
   let mindLast: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
+  let mindSeq = 0;                            // NARRATOR ARCHIVE: mind-NNN-<t>.wav sequence within this call
   let mindQueue: { text: string; who?: string }[] = [];   // bound to the live inject queue below — the lines never spoken
   let mindStatus = "idle";
   let mindStateAt = 0;
@@ -3045,7 +3046,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       return false;
     };
     let evaAddressedAt = 0;   // his last Eva-addressed turn — the mouth stays out of it
-    const injectQueue: { text: string; who?: string }[] = [];
+    const injectQueue: { text: string; who?: string; bytes?: Uint8Array }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay)
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
     // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
@@ -3073,7 +3074,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       } catch {}
       return EVA_GAIN_DEFAULT;
     };
-    const sendInjected = (text: string, who?: string) => {
+    const sendInjected = (text: string, who?: string, bytes?: Uint8Array) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
       // conversational model with "say this word for word" instructions proved FLAKY: it
@@ -3091,7 +3092,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // through the SAME queue and the SAME never-interrupt gates — only the voice differs.
       const mindVoice = who === "eva" ? evaVoice() : (process.env.APIPLAN_MIND_VOICE || "ash");
       const renderStartedAt = Date.now();
-      speakRealtime(c, { text, voice: mindVoice }, 60000).then(async (r) => {
+      // A pre-rendered line (parked at playback-ready, or a {"replay"}) skips the narrator: same gates, same player, no re-render.
+      (bytes ? Promise.resolve({ bytes }) : speakRealtime(c, { text, voice: mindVoice }, 60000)).then(async (r: { bytes: Uint8Array }) => {
         if (closed) { mindBusy = false; return; }
         // NO-BARGE-EVER (fire17, voice, call 48629, 2026-08-25 12:53:29 — hands canon 126: "גם אם זה
         // השליחה הראשונה שלו לא יכול להתפרץ אליי. זה קרה ממש הרגע ואנחנו חייבים שזה יהיה סגור
@@ -3105,7 +3107,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // then, with the waited-notice). The user-barge cut stays as the last line of defence.
         const heStartedMeanwhile = userSpeaking && Date.now() - speechStartedAt < 120000;
         if (heStartedMeanwhile) {
-          injectQueue.unshift({ text, who });
+          injectQueue.unshift({ text, who, bytes: r.bytes });   // keep the render — no second 8 s wait when it is released
           queueHeldForHim = true;
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
@@ -3152,7 +3154,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
         if (spkState === "muted" || spkState === "vol0") {          // MUTED-SPEAKER HOLD at playback-ready
-          injectQueue.unshift({ text, who });
+          injectQueue.unshift({ text, who, bytes: r.bytes });   // keep the render — no second 8 s wait when it is released
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (speaker muted) — audio parked, queue ${injectQueue.length}`, { parked_at_ready: true, speaker_muted: true, spk: spkState, chars: text.length });
           if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3184,6 +3186,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               type: "message", role: "system",
               content: [{ type: "input_text", text: `[Line ${speaker} is about to speak aloud to him right now, in its own voice — absorb silently, do NOT respond to this, do NOT say it yourself, do NOT mention receiving it. You are the MOUTH; this is ${speaker}'s work and ${speaker}'s words, never your own. His voice may cut it mid-sentence, so he may hear only the beginning of it. FULL TEXT: ${String(text)} — if he asks what ${speaker} said, or says he missed it or wants it repeated, read it back from here in full. Any message that follows in the assistant voice is only the part he actually heard.]` }] } }));
             say("info", `mind line preloaded to the mouth (${text.length} chars, before playback)`, { mind_preview: true, chars: text.length, who });
+          } catch {}
+        }
+        // NARRATOR ARCHIVE (fire17, voice, call 48629, 2026-08-25 13:21: "הקלטה האחרונה שהמוח עשה לה
+        // פליי... אני רוצה לשמוע אותה בפליי עוד פעם"; MIND lane). Until now only HIS turns were archived —
+        // a MIND/organ line existed only as words in the LOG. Every render that reaches the speaker is
+        // now kept beside the mic turns (mind-NNN-<t>.wav + .json sidecar: text, who, t, ms), and
+        // {"replay":"last"|"<wav>"} plays it AGAIN through this exact path. Swallows every error:
+        // the archive must never break the call. APIPLAN_NARRATOR_ARCHIVE=0 turns it off.
+        if (process.env.APIPLAN_NARRATOR_ARCHIVE !== "0" && !bytes) {
+          try {
+            ensureDir(archDir); mindSeq++;
+            const kept = `${archDir}/mind-${String(mindSeq).padStart(3, "0")}-${Date.now()}.wav`;
+            fs.writeFileSync(kept, r.bytes);
+            fs.writeFileSync(kept + ".json", JSON.stringify({ text, who: who ?? "mind", t: Date.now(), ms: Math.round(ms), chars: text.length, call: callId }));
+            say("info", `narrator archived (${(ms / 1000).toFixed(1)}s): ${basename(kept)}`, { narrator_archive: true, who: who ?? "mind", ms: Math.round(ms) });
           } catch {}
         }
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
@@ -3484,7 +3501,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       lastMouthBargeAt = now;
       mouthBargeTailUntil = now + MOUTH_BARGE_TAIL;
     };
-    const injectContext = (text: string, mode: string, who?: string) => {
+    const injectContext = (text: string, mode: string, who?: string, bytes?: Uint8Array) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
       // by construction (the chunk-splitting workaround existed only because the mouth's
       // model summarized long instruction-driven lines).
@@ -3521,7 +3538,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       speakerCheck();
       const speakerMutedNow = spkState === "muted" || spkState === "vol0";
       if (speakerMutedNow) {
-        injectQueue.push({ text, who });
+        injectQueue.push({ text, who, bytes });
         say("info", `mind line HELD (speaker muted) — queue ${injectQueue.length}`, { speaker_muted: true, spk: spkState });
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3532,13 +3549,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // has to say, exactly as his own turn does. Queued, never dropped; `queueHeldForHim` is
         // deliberately NOT set — the "I wanted to say this earlier but you were speaking"
         // opener would be a lie about a turn that was never addressed to us.
-        injectQueue.push({ text, who });
+        injectQueue.push({ text, who, bytes });
         say("info", `mind line HELD (external conversation — canon 045) — queue ${injectQueue.length}`);
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         return;
       }
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
-        injectQueue.push({ text, who });
+        injectQueue.push({ text, who, bytes });
         queueHeldForHim = true;   // mind-never-interrupts: this line waited out his speech — it will open with the waited-notice
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
         // QUEUE MERGE LAW (fire17, voice, 2026-08-20: "כמה הודעות במקביל נכנסות למחסנית
@@ -3552,8 +3569,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
       // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
       // speaking over the tail of the old voice.
-      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who); return; }
-      injectQueue.push({ text, who });
+      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes); return; }
+      injectQueue.push({ text, who, bytes });
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
@@ -3615,8 +3632,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const q = injectQueue.shift()!;
         let t = q.text;
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
-        sendInjected(t, q.who);
+        sendInjected(t, q.who, t === q.text ? q.bytes : undefined);   // a prefixed line is new words — render them
       }
+    };
+    /** {"replay":"last"|"<mind-NNN-*.wav>"} — play a stored narrator render AGAIN (his 13:21 ask), through the very same
+     *  gates and player as a fresh line: stack law, muted-speaker hold, one voice, mouth-knows-first. The words come from
+     *  the sidecar, the audio is the archived bytes — no re-render, no second voice, nothing leaves the machine. */
+    const replayNarration = (which: string) => {
+      try {
+        let p = which;
+        if (which === "last") {
+          const all = fs.existsSync(archDir) ? fs.readdirSync(archDir).filter((f) => /^mind-\d+-\d+\.wav$/.test(f)).sort() : [];
+          if (!all.length) { say("info", "narrator replay failed: no archived narrator render this call"); return; }
+          p = `${archDir}/${all[all.length - 1]}`;
+        }
+        if (!p.startsWith("/")) p = `${archDir}/${p}`;
+        if (!fs.existsSync(p)) { say("info", `narrator replay failed: no such render ${basename(p)}`); return; }
+        let meta: any = {}; try { meta = JSON.parse(fs.readFileSync(p + ".json", "utf8")); } catch {}
+        const bytes = new Uint8Array(fs.readFileSync(p));
+        say("info", `narrator replay (${((bytes.length - 44) / 2 / RATE).toFixed(1)}s): ${basename(p)}`, { narrator_replay: true, who: meta.who });
+        injectContext(String(meta.text || "(archived narrator render)"), "graceful", meta.who && meta.who !== "mind" ? String(meta.who) : undefined, bytes);
+      } catch (e) { say("info", `narrator replay failed: ${String((e as any)?.message ?? e)}`); }
     };
     function startInjectLoop() {
       if (!injectPath) return;
@@ -3709,6 +3745,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       injectQueue.length = 0;
                       queueStale = false;
                       queueHeldForHim = false;   // audit P1: the notice belongs to the dropped line
+                    } else if (typeof j.replay === "string") {   // play a stored narrator render again (to the speaker, never to the model)
+                      replayNarration(j.replay);
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined);
