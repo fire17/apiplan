@@ -590,6 +590,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let mindQueue: { text: string; who?: string }[] = [];   // bound to the live inject queue below — the lines never spoken
   let mindStatus = "idle";
   let mindStateAt = 0;
+  // LANE M-A (call 415, 14:48:52): "תנסה רגע לרסת את הפה ולהתחבר אליו מחדש" made the mouth mute ITSELF for four minutes
+  // (heartbeats 'CLOSED for 120s/180s'). A self-mute needs an EXPLICIT quiet/mute ask in HIS last words — reset, reconnect
+  // and restart words are never one — and it is a courtesy, not a state: it reopens by itself after SELF_MUTE_MS.
+  let lastYouText = "";           // his last finalized turn — the allow-list judges HIS words, never the model's wish
+  let suppressBy = "";            // who closed the mouth: "self" | "MIND" | "lm-calls" | "" — the suppress echo names the real closer
+  let selfMuteUntil = 0, selfMuteEchoAt = 0;
+  const SELF_MUTE_MS = Number(process.env.APIPLAN_SELF_MUTE_MS) || 60000;
+  const EXPLICIT_MUTE = /שתוק|תשתוק|תשתקי|תשתיק את עצמך|תשתיקי את עצמך|תהיה בשקט|תהיי בשקט|אל תדבר|אל תדברי|תפסיק לדבר|תפסיקי לדבר|תשתיק את הפה|mute yourself|be quiet|shut up|stop talking|stay quiet|quiet please|go mute/i;
+  const explicitMuteAsk = (t: string): boolean => EXPLICIT_MUTE.test(t);
+  // LANE S (never-lose — EVA's turn-134 of call 48629: 152 s voiced, NO transcript; the relaunch killed the engine while the
+  // server still owed the transcript of the flushed buffer). A deliberate shutdown WAITS for it, bounded.
+  let transcriptPending = 0;      // ms when a segment closed whose transcript has not arrived yet
+  const SHUTDOWN_WAIT_MS = Number(process.env.APIPLAN_SHUTDOWN_WAIT_MS) || 6000;
   let mouthLast = "";             // the mouth's own last completed reply (it dies with the socket too)
   // Total transcript chars generated for the reply in flight. mouthBuf keeps only the LAST
   // 2000 chars (a memory bound), so on a long reply it is a tail window — the barge split below
@@ -920,6 +933,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Load-bearing short words are NEVER explained away (the same instinct as echoResidual's floor).
   const LEAK_FRAG_KEEP = new Set(["ok", "yes", "no", "stop", "wait", "mute", "כן", "לא"]);
   const hasHebrew = (t: string) => /[\u0590-\u05FF]/.test(t);
+  // GARBLE GATE (MIND lane 2026-08-25, call 415): recogniser noise like "Niwasatlo kan itano." / "Halo, te?" earned mouth
+  // replies. Short, no Hebrew letter, no common English word = garble. He speaks Hebrew and English; anything else this
+  // short is the recogniser, not him. The transcript is still RECORDED (never-lose) — only the reply is withheld.
+  const EN_COMMON = new Set("the a an and or but so if to of in on at for with from by is are was were be been am do does did have has had not no yes ok okay hi hello hey bye thanks thank please what when where who why how which this that these those it its i you he she we they me him her us them my your his our their can could will would should may might must just now then here there also very really good bad fine great sure right wrong stop go come wait listen tell say said talk speak mind mouth eva hands call restart reset reconnect mute unmute volume louder quieter again more less".split(" "));
+  const garbleTurn = (t: string): boolean => {
+    const s = t.trim();
+    if (!s || s.length >= 25 || hasHebrew(s)) return false;
+    const words = s.toLowerCase().replace(/[^a-z' ]/g, " ").split(/\s+/).filter(Boolean);
+    return !words.some((w) => EN_COMMON.has(w.replace(/'/g, "")));
+  };
   let cleanTurns = 0, cleanHebrew = 0;   // language profile, learned from his OWN unflagged turns
   /** True when a transcript is a short fragment with no character of the script the call is
    *  spoken in. Consulted ONLY for resend-carved turns, and only once the profile has real
@@ -1140,6 +1163,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // {"adaptive_volume":true|false}; a bypass is his EXPRESSIVE mode (a whisper must come through as a whisper):
   // {"text":…,"adaptive_volume":false} bypasses one narrator line. ffplay fixes its filter graph at spawn, so a
   // toggle takes effect at the next line boundary (both players are per-utterance) — never mid-line.
+  const EXPRESSIVE_LIMIT_AF = "alimiter=limit=0.891:attack=5:release=50:level=0";   // LANE X: the bypass path keeps a brick wall at -1 dBFS — louder than normal, never past the leak-safe bound
   const ADAPTIVE_AF = "dynaudnorm=f=100:g=5:p=0.5:m=100:s=0,dynaudnorm=f=100:g=5:p=0.5:m=10:s=0,dynaudnorm=f=100:g=5:p=0.5:m=5:s=0";   // p=0.5 = the HARD OUTPUT CEILING (-6 dBFS): loud goes down freely, quiet comes up only to here
   let adaptiveCached = true; let adaptiveAt = 0;
   const adaptiveOn = (): boolean => {
@@ -1154,7 +1178,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try { const p = `${LM_HOME}/settings.json`; let j: any = {}; try { j = JSON.parse(fs.readFileSync(p, "utf8")); } catch {} j.adaptive_volume = on; ensureDir(LM_HOME); fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n"); } catch {}
   };
   /** The mouth player's argv with the normalizer folded in before `-i -` (ffplay options precede the input). */
-  const spkArgv = (): string[] => adaptiveOn() ? [...spk.slice(0, -2), "-af", ADAPTIVE_AF, ...spk.slice(-2)] : spk;
+  // LANE M-B (hands, measured 2026-08-25 14:5x on a paced 20 ms/960-byte pipe, the mouth's real feed): the 3-stage
+  // ADAPTIVE_AF needs (g-1)/2 frames of lookahead PER STAGE — free on the narrator's file, but on the MOUTH's live
+  // stdin it is wall time: first output 1.89 s late (plain path 0.09 s) and the last ~1.9 s of every reply still
+  // inside the filter when playingUntil said the reply had ended (mic reopened onto the mouth's own tail —
+  // call 415 14:46:53 'recovering speech spoken during mouth reply (15.4s loud-trimmed of 15.4s)'). One short-frame
+  // stage keeps the -6 dBFS ceiling and the quiet-line lift (0 / -15 / +6 dB in → -6.03 / -6.23 / -6.02 out) at
+  // 0.29 s — inside stillAudible()'s slack. The narrator keeps the 3-stage chain (file input, no pipe).
+  const MOUTH_ADAPTIVE_AF = "dynaudnorm=f=50:g=3:p=0.5:m=10:s=0";
+  const spkArgv = (): string[] => adaptiveOn() ? [...spk.slice(0, -2), "-af", MOUTH_ADAPTIVE_AF, ...spk.slice(-2)] : spk;
   let player: ReturnType<typeof Bun.spawn> | null = null;
   let speaking = false;          // the model currently has audio in flight
   let playerChecked = false;
@@ -1459,7 +1491,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // A daemon that calls talk() repeatedly passes manageSignals:false — per-call process
   // handlers would accumulate, and the uncaughtException rethrow would kill the daemon.
   if (o.manageSignals !== false) {
-    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => { close(); process.exit(0); });
+    // LANE S: a deliberate shutdown waits (bounded) for the last segment's transcript. An open segment is closed with the
+    // caps-release flush so the server commits it; then the transcript is awaited up to SHUTDOWN_WAIT_MS; on timeout a
+    // 'transcript pending' marker names the archive WAV (the recovery daemon transcribes it locally). Every path exits.
+    let shuttingDown = false;
+    const gracefulExit = (sig: string) => {
+      if (shuttingDown) { close(); process.exit(0); }
+      shuttingDown = true;
+      const open = userSpeaking && speechStartedAt > 0;
+      if (!open && !transcriptPending) { close(); process.exit(0); }
+      if (open) { releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt; transcriptPending = Date.now(); }
+      say("info", `shutdown (${sig}): waiting up to ${SHUTDOWN_WAIT_MS}ms for the last segment's transcript${open ? " (segment still open — flushing silence so the server commits it)" : ""}`, { shutdown_wait: true, segment_open: open });
+      const t0 = Date.now();
+      const poll = setInterval(() => {
+        if (!transcriptPending) { clearInterval(poll); say("info", `shutdown: last transcript arrived after ${Date.now() - t0}ms — exiting`, { shutdown_done: true }); close(); process.exit(0); }
+        if (Date.now() - t0 >= SHUTDOWN_WAIT_MS) {
+          clearInterval(poll);
+          const marker = `${LM_HOME}/incomplete/${basename(logPath || "call.jsonl")}`;
+          try { ensureDir(dirname(marker)); fs.appendFileSync(marker, JSON.stringify({ t: Date.now(), kind: "transcript pending", why: `shutdown (${sig}) before the server transcribed the last segment`, speech_started_at: speechStartedAt, wav: archPath || null, call: callId }) + "\n"); } catch {}
+          say("info", `shutdown: transcript still pending after ${SHUTDOWN_WAIT_MS}ms — marker written naming ${archPath || "no archive WAV"} (${marker}); recover before acting`, { shutdown_timeout: true, wav: archPath || null });
+          close(); process.exit(0);
+        }
+      }, 100);
+    };
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => gracefulExit(sig));
     process.on("exit", () => { try { close(); } catch {} });
     // RECORD WHERE IT CAME FROM. Call 63395 died on "uncaught ENOSPC ... write" and the line
     // named no stack, so which of a dozen write paths threw had to be reasoned out afterwards
@@ -2019,6 +2074,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let lastVoiceAt = 0;        // last mic frame at/above LATCH_PEAK, or last you_delta
     let latchVoiceMs = 0;       // leaky accumulator behind the re-latch
     let latchHadVoice = false;  // any voice heard inside THIS latch? (picks which stretch applies)
+    // VAD LATCH RELEASE (MIND lane L, call 48629 2026-08-25: 14:16:02 speech_started and NO speech_stopped for 3 min
+    // while lm-ptt read silence (level_raw ~197) — his 3-minute message was recorded (turn-122) but never transcribed
+    // live; again 14:22:20, the successor's FIRST segment right after 'call rotated (#2)'; again 14:28:42, ~4 s after a
+    // long turn's commit — every time released only by the MIND's mute flip, i.e. by a human hand. The local latch
+    // above already frees the MIND's queue; this closes the SERVER's segment: once the segment has been open for
+    // LATCH_SYNTH_OPEN_MS and the mic has been quiet for LATCH_SYNTH_QUIET_MS, the engine synthesizes the stop
+    // itself — the same release flush the caps release uses (zeros for VAD_SILENCE_MS+400 so the server VAD ends the
+    // segment, transcribes, and replies) — and says so. Once per segment; a real speech_stopped resets it.
+    const LATCH_SYNTH_OPEN_MS = (() => { const v = envBar("APIPLAN_LATCH_SYNTH_OPEN_MS", 8000); return Number.isFinite(v) && v > 0 ? v : 8000; })();
+    const LATCH_SYNTH_QUIET_MS = (() => { const v = envBar("APIPLAN_LATCH_SYNTH_QUIET_MS", 3000); return Number.isFinite(v) && v > 0 ? v : 3000; })();
+    let latchSynthAt = 0;       // when the synthesized stop was issued for the open segment (0 = not yet)
+    let serverStoppedAt = 0;    // the server's own last speech_stopped — the segment is OPEN while speechStartedAt > this
+    /** Pure, so the test can replay the three clocks of call 48629 against it. */
+    const latchSynthDue = (openMs: number, quietMs: number, synthAt: number, segmentOpen: boolean): boolean =>
+      segmentOpen && !synthAt && openMs >= LATCH_SYNTH_OPEN_MS && quietMs >= LATCH_SYNTH_QUIET_MS;
     let latchTimedOut = false;  // the latch was cleared by timeout, not by the server
     let bargeMs = 0; let lastBargeAt = 0;
     let bargeCandAt = 0; let bargeCandPeak = 0; let bargeCandMs = 0;   // the open speech-evidence confirmation window
@@ -2302,6 +2372,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (pkL >= LATCH_PEAK) { lastVoiceAt = nowL; latchVoiceMs += fMsL; if (userSpeaking) latchHadVoice = true; }
               else latchVoiceMs = Math.max(0, latchVoiceMs - fMsL);
               const needL = latchHadVoice ? LATCH_HOLD_MS : LATCH_MS;
+              // SERVER-SIDE RELEASE (lane L): the segment stayed open on the server while the room was silent.
+              if (latchSynthDue(nowL - speechStartedAt, nowL - lastVoiceAt, latchSynthAt, speechStartedAt > serverStoppedAt)) {
+                latchSynthAt = nowL;
+                releaseFlushAt = nowL; releaseFlushUntil = nowL + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
+                say("info", `user-speaking latch released (silent ${Math.round((nowL - lastVoiceAt) / 1000)}s, segment open ${Math.round((nowL - speechStartedAt) / 1000)}s) — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
+                  { latch_release: true, quiet_ms: nowL - lastVoiceAt, open_ms: nowL - speechStartedAt, after_rotation: lastRotCommitAt > 0 && speechStartedAt - lastRotCommitAt < 30000, rot_n: rotN, bar: LATCH_PEAK });
+              }
               if (userSpeaking && lastVoiceAt && nowL - lastVoiceAt >= needL) {
                 // The SERVER's segment stays open — this clears only OUR latch, so held MIND
                 // lines may flow. speechTurns is NOT pushed and lastSpeechMs is NOT touched:
@@ -3005,10 +3082,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const runMouthTool = (item: any) => {
       let state = "read";
       try { state = String(JSON.parse(item.arguments || "{}").state || "read"); } catch {}
-      if (state === "mute") { suppressAuto = true; suppressRestoreAt = 0; say("info", "mouth CLOSED (self-muted on his word)", { mouth_self: "mute" }); }
-      else if (state === "unmute") { suppressAuto = false; suppressRestoreAt = 0; say("info", "mouth OPEN (self-unmuted on his word)", { mouth_self: "unmute" }); }
+      if (state === "mute" && !explicitMuteAsk(lastYouText)) {
+        state = "refused";
+        say("info", `mouth self-mute REFUSED — his last words were not a mute request: "${lastYouText.slice(0, 80)}"`, { mouth_self: "refused" });
+      } else if (state === "mute") {
+        suppressAuto = true; suppressRestoreAt = 0; suppressBy = "self"; selfMuteUntil = Date.now() + SELF_MUTE_MS; selfMuteEchoAt = Date.now();
+        say("info", `mouth CLOSED (self-muted on his word) — reopens by itself in ${Math.round(SELF_MUTE_MS / 1000)}s unless he asks again`, { mouth_self: "mute", reopen_in_ms: SELF_MUTE_MS });
+      }
+      else if (state === "unmute") { suppressAuto = false; suppressRestoreAt = 0; suppressBy = ""; selfMuteUntil = 0; say("info", "mouth OPEN (self-unmuted on his word)", { mouth_self: "unmute" }); }
       if (closed || ws.readyState !== WebSocket.OPEN) return;
-      const output = state === "read"
+      const output = state === "refused"
+        ? "That was NOT a request to mute you (he asked for a reset/reconnect or something else). You stay open — answer him."
+        : state === "read"
         ? (suppressAuto ? "You are currently MUTED." : "You are currently able to speak.")
         : (suppressAuto ? "You are now muted. Say nothing further until he tells you to speak."
                         : "You can speak again. Answer him briefly.");
@@ -3149,12 +3234,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // releases it only after the mouth has answered him and 2.5 s of real quiet (re-rendered
         // then, with the waited-notice). The user-barge cut stays as the last line of defence.
         const heStartedMeanwhile = userSpeaking && Date.now() - speechStartedAt < 120000;
-        if (heStartedMeanwhile) {
+        const mouthFirstNow = mouthFirstPark && pendingMouthReply;   // lane T: his mouth reply was born while this rendered — it goes first
+        mouthFirstPark = false;
+        if (heStartedMeanwhile || mouthFirstNow) {
           injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed, adaptive: lineAdaptive });   // keep the render — no second 8 s wait when it is released
-          queueHeldForHim = true;
+          if (heStartedMeanwhile) queueHeldForHim = true;
           mindBusy = false;
-          say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
+          if (heStartedMeanwhile) say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
             { parked_at_ready: true, render_ms: Date.now() - renderStartedAt, chars: text.length });
+          else say("info", `mind line HELD at playback-ready (mouth answers him first) — audio parked, queue ${injectQueue.length}`,
+            { parked_at_ready: true, mouth_first: "parked", render_ms: Date.now() - renderStartedAt, chars: text.length });
+          if (mouthFirstNow && pendingMouthReply && !emptyRoomNow() && !suppressAuto && !closing && !responseActive && !awaitingResponse && ws.readyState === WebSocket.OPEN) {
+            say("info", "mouth reply released (mind line parked — mouth answers him first)", { mouth_first: "released" });
+            try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
+          }
           if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
           if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
           return;
@@ -3205,7 +3298,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           : mindPan;
         // ADAPTIVE VOLUME on the narrator: same normalizer, same ONE filter graph, unless this line is EXPRESSIVE (bypass).
         const adaptiveThisLine = lineAdaptive !== undefined ? lineAdaptive : adaptiveOn();
-        const mindAf = adaptiveThisLine ? ["-af", mindAf0.length ? `${mindAf0[1]},${ADAPTIVE_AF}` : ADAPTIVE_AF] : mindAf0;
+        const mindAf = adaptiveThisLine ? ["-af", mindAf0.length ? `${mindAf0[1]},${ADAPTIVE_AF}` : ADAPTIVE_AF]
+                                        : ["-af", mindAf0.length ? `${mindAf0[1]},${EXPRESSIVE_LIMIT_AF}` : EXPRESSIVE_LIMIT_AF];   // lane X: EXPRESSIVE/off = leveler bypassed, limiter kept
         if (lineAdaptive === false) rec({ ev: "info", text: "narrator line EXPRESSIVE — adaptive volume bypassed for this line", adaptive_bypass: true });
         if (spkState === "muted" || spkState === "vol0") {          // MUTED-SPEAKER HOLD at playback-ready
           injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed, adaptive: lineAdaptive });   // keep the render — no second 8 s wait when it is released
@@ -3624,8 +3718,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
       // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
       // speaking over the tail of the old voice.
-      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed, adaptive); return; }
+      // LANE T: a FRESH line is gated exactly like a held one — the quiet bar and mouth-first apply at arrival too. Until
+      // now a line landing 0.8 s after his last word (userSpeaking already false) was spoken at once; only the QUEUE
+      // waited. That was his 14:54:30 interruption, and it was true for every who= voice (S147 link 4: one queue, one law).
+      const freshWait = queueMustWait(Date.now(), userSpeaking, lastSpeechStopAt, releaseQuietMs(), !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0",
+        lastRealTurnAt, lastRealTurnStart, lastResponseCreatedAt, responseActive, pendingMouthReply, playingUntil, lastMindSpokeAt);
+      if (!freshWait && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed, adaptive); return; }
       injectQueue.push({ text, who, bytes, speed, adaptive });
+      if (freshWait) { queueWait(freshWait); if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000); }
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
@@ -3649,6 +3749,41 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // with a waited-notice, per his exact spec ("אה רציתי להגיד לך קודם אבל היית תוך כדי
     // דיבור") — added here in code so no MIND session has to remember it.
     let lastRealTurnAt = 0, lastRealTurnStart = 0, queueHeldForHim = false;
+    // LANE T — QUEUE-RELEASE TIMING (fire17, voice, call 415, 14:38:44 + 14:54:30 — hands canons 133/135): "דברים מהקיו
+    // צריכים לחכות עוד שנייה או שתיים … אף פעם לא יכול להיות ששקט קצר מהשיחה שלי תהפוך להיות ניגון של משהו מהקיו … הפה
+    // צריך להגיב לפני הקיו". Engine-side, three mechanics: (1) held MIND lines flow only after mind_release_quiet_ms of
+    // real quiet (settings.json, read live; default 4500 — two-plus seconds longer than the mouth's own reply delay, so a
+    // breath can never play the queue); (2) the mouth answers his turn FIRST: the queue waits while that reply is owed, in
+    // flight or audible, and MOUTH_DRAIN_GRACE_MS past its last sample; (3) a mouth reply born while a MIND line is still
+    // rendering parks the line (bytes kept) and goes first; born while the line is audible, the line is cut at a word
+    // boundary and its remainder re-queued behind the mouth (APIPLAN_MOUTH_FIRST_CUT_MS bounds that: 0 = always).
+    let releaseQuietAt = 0, releaseQuietCached = 4500;
+    const releaseQuietMs = (): number => {
+      if (Date.now() - releaseQuietAt < 2000) return releaseQuietCached;
+      releaseQuietAt = Date.now();
+      try { const v = Number(JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).mind_release_quiet_ms); releaseQuietCached = Number.isFinite(v) && v >= 1000 && v <= 15000 ? v : 4500; }
+      catch { releaseQuietCached = 4500; }
+      return releaseQuietCached;
+    };
+    const MOUTH_DRAIN_GRACE_MS = Number(process.env.APIPLAN_MOUTH_DRAIN_GRACE_MS) || 1500;
+    const MOUTH_FIRST_CUT_MS = Number(process.env.APIPLAN_MOUTH_FIRST_CUT_MS ?? 0);
+    let mouthFirstPark = false;                 // a mouth reply is owed — park the MIND line at playback-ready instead of playing it
+    let queueWaitSince = 0, queueWaitEchoAt = 0;
+    /** The ONE predicate for "the queue must wait" (pure, replayable): he is mid-turn; the quiet is shorter than the bar;
+     *  or the mouth's reply to his last turn is still owed / in flight / audible (+ grace). null = the queue may flow. */
+    const queueMustWait = (now: number, speaking: boolean, stopAt: number, quietMs: number, canAnswer: boolean, turnAt: number, turnStart: number, createdAt: number, active: boolean, pending: boolean, playUntil: number, mindSpokeAt: number): string | null => {
+      if (speaking) return "his turn active";
+      if (now - stopAt < quietMs) return `quiet ${((now - stopAt) / 1000).toFixed(1)}s < ${(quietMs / 1000).toFixed(1)}s`;
+      if (canAnswer && turnAt > 0 && now - turnAt < 20000 && mindSpokeAt < turnAt) {
+        if (createdAt < turnStart) return "mouth has not answered his turn yet";
+        if (active || pending || now < playUntil + MOUTH_DRAIN_GRACE_MS) return "mouth answering — his turn goes first";
+      }
+      return null;
+    };
+    const queueWait = (why: string) => {
+      if (!queueWaitSince) queueWaitSince = Date.now();
+      if (Date.now() - queueWaitEchoAt > 5000) { queueWaitEchoAt = Date.now(); say("info", `mind queue waiting — ${why}`, { queue_waiting: why, queue: injectQueue.length }); }
+    };
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     const flushInjectQueue = () => {
       flushTimer = null;
@@ -3657,7 +3792,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
-      if (userSpeaking || Date.now() - lastSpeechStopAt < 2500) {
+      const quietBar = releaseQuietMs();
+      const waitWhy = injectQueue.length
+        ? queueMustWait(Date.now(), userSpeaking, lastSpeechStopAt, quietBar, !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0",
+            lastRealTurnAt, lastRealTurnStart, lastResponseCreatedAt, responseActive, pendingMouthReply, playingUntil, lastMindSpokeAt)
+        : (userSpeaking || Date.now() - lastSpeechStopAt < quietBar ? "his turn active" : null);
+      if (waitWhy) {
+        if (injectQueue.length) queueWait(waitWhy);
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
       }
@@ -3672,18 +3813,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // creates a reply at all), lastResponseCreatedAt can never advance for his turn — so EVERY
       // MIND line waits the full 20s failsafe after EVERY turn of his, in exactly the mode where
       // the MIND is the only voice he has. Skip the wait when nothing can satisfy it.
-      const mouthCanAnswer = !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0";
-      if (mouthCanAnswer && lastRealTurnAt > 0 && lastResponseCreatedAt < lastRealTurnStart && lastMindSpokeAt < lastRealTurnAt
-          && Date.now() - lastRealTurnAt < 20000) {   // his last turn not yet answered — mouth speaks first
-        if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
-        return;
-      }
+      // (lane T: the mouth-speaks-first wait above is now one clause of queueMustWait — one predicate, one echo.)
       // `prevRespId` — the ONE-ACTIVE INVARIANT ACROSS A ROTATION (W37 verify). A predecessor
       // finishing its sentence is still audible in the shared player, and the swap force-clears
       // responseActive/awaitingResponse, so without this term a held line would flush into the
       // successor while the old voice is still speaking: two voices, one player, interleaved PCM.
       // Held, not dropped — rotDrainRelease() calls this again the moment the drain ends.
       while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) {
+        if (queueWaitSince) {
+          say("info", `mind queue released after ${((Date.now() - lastSpeechStopAt) / 1000).toFixed(1)}s quiet (${lastResponseCreatedAt >= lastRealTurnStart ? "mouth answered" : "no mouth reply due"}) — waited ${((Date.now() - queueWaitSince) / 1000).toFixed(1)}s`,
+            { queue_released: true, waited_ms: Date.now() - queueWaitSince });
+          queueWaitSince = 0;
+        }
         const q = injectQueue.shift()!;
         let t = q.text;
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
@@ -3714,6 +3855,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
       const tick = async () => {
         if (closed) return;
+        // LANE M-A: a self-mute reopens by itself after SELF_MUTE_MS; the countdown is echoed every 20 s.
+        if (suppressAuto && suppressBy === "self" && selfMuteUntil) {
+          if (Date.now() >= selfMuteUntil) { suppressAuto = false; suppressBy = ""; selfMuteUntil = 0; say("info", `mouth OPEN (self-mute expired after ${Math.round(SELF_MUTE_MS / 1000)}s — he must ask again to keep it quiet)`, { mouth_self: "expired" }); }
+          else if (Date.now() - selfMuteEchoAt >= 20000) { selfMuteEchoAt = Date.now(); say("info", `mouth self-muted — reopens in ${Math.round((selfMuteUntil - Date.now()) / 1000)}s`, { mouth_self: "countdown" }); }
+        }
         try {
           const f = Bun.file(injectPath);
           if (await f.exists()) {
@@ -3766,7 +3912,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (typeof j.autospeak === "boolean") {   // MIND's mouth switch — may the model answer on its own?
                       suppressRestoreAt = 0;                          // MIND's explicit choice outranks a pending overlap-recovery restore
                       suppressAuto = !j.autospeak;
-                      say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : "mouth CLOSED (MIND-only)");
+                      suppressBy = j.autospeak ? "" : String(j.who || "MIND");   // lane M-A: the closer is named (lm-calls park passes "who":"lm-calls")
+                      selfMuteUntil = 0;
+                      say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : suppressBy === "MIND" ? "mouth CLOSED (MIND-only)" : `mouth CLOSED (MIND-only) — by ${suppressBy}`);
                     } else if (typeof j.pause === "boolean" || j.resume === true) {
                       // CANON 013/014 (fire17, typed): mechanistic pause of every audible agent
                       // voice — mouth stream, draining tails, MIND narrator — via SIGSTOP/SIGCONT.
@@ -3781,6 +3929,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         try { ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", audio: { output: { speed: speedMouth } } } })); } catch {}
                       }
                       say("info", `speed set ${speedMouth} (mouth+narrator)`, { speed: speedMouth, mind_speed: speedMind });
+                    } else if (j.reconnect === true) {   // LANE M-A (4): "reset the mouth" = rotate the MOUTH session in place — the successor path, never a relaunch
+                      if (ROT_ON && !closed && !closing && rotState !== "done" && !rotGap) { say("info", "reconnect: rotating the mouth session in place on the MIND's word (successor path — the mic never stops)", { reconnect: true }); rotReconnect("MIND reconnect"); }
+                      else say("info", `reconnect refused — rotation ${ROT_ON ? rotState + (rotGap ? " (gap in progress)" : "") : "off (LIVEMIND_ROTATE)"}`, { reconnect: false });
                     } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
                       say("info", "pong");
                     } else if (j.context) {
@@ -3837,7 +3988,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // consumed, so the watchdog still catches the unexplained holds it was written for the
         // moment the gate lets go.
         if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS
-            && (Date.now() < organFloorUntil || xconvHeld())) {
+            && (Date.now() < organFloorUntil || xconvHeld() || mindBusy || !!mindPlayer)) {   // lane T: behind mind audio the hold ends at the line's last word — never a DROP
           pendingMouthAt = Date.now();
         } else if (pendingMouthReply && pendingMouthAt && Date.now() - pendingMouthAt > HOLD_MAX_MS) {
           const heldFor = Math.round((Date.now() - pendingMouthAt) / 1000);
@@ -3981,6 +4132,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // "did a SECOND response appear" — which is nearly never, hence a ~62% false-positive rate.
     // A timestamp compared against the turn's OWN start asks the real question instead.
     let lastResponseCreatedAt = 0;
+    // LANE E — THE EMPTY REPLY (call 48629, 28 'said NOTHING' replies; MIND lane 2026-08-25). Every one of them was
+    // a reply the server CREATED and then a speech_started 60–400 ms later — the server's own turn detection cancels
+    // a newborn reply when he keeps talking or the mic reopens; none was a silent completed reply. Three facts
+    // the old record could not tell apart: (1) a reply that produced no AUDIO is not an answer — the answer watch
+    // now counts first audible output, not creation; (2) the server says WHY in response.status/status_details —
+    // read it; (3) a reply the server COMPLETED with nothing in it is the one case worth ONE retry. Never retry a
+    // cancelled one: he is talking, and his next turn brings its own reply.
+    let lastMouthOutputAt = 0;               // first audible output (audio/transcript delta) of the current MOUTH reply
+    let emptyRetryAt = 0;                    // when the one retry for his current turn was sent (0 = none)
+    let retryResponse = false;               // the response.create we sent IS a mouth reply, not a MIND line
+    const EMPTY_RETRY = process.env.APIPLAN_EMPTY_RETRY !== "0";
+    const emptyRetryDue = (status: string, mind: boolean, toolOnly: boolean, canAnswer: boolean, speaking: boolean, retriedAt: number, turnStart: number): boolean =>
+      EMPTY_RETRY && status === "completed" && !mind && !toolOnly && canAnswer && !speaking && retriedAt < turnStart;
     const ANSWER_WATCH_MS = Number(process.env.APIPLAN_ANSWER_WATCH_MS) || 2500;
     /** Exclusions are RECORDED, not silent — one line per reason per window. A bare `return` made
      *  the one cause-agnostic instrument indistinguishable from an instrument that never armed,
@@ -4003,7 +4167,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             responses_empty: responsesEmpty, turns_transcribed: turnsTranscribed,
             text: `answer watch armed and excluded (${reason}) — ${((now - turnAt) / 1000).toFixed(1)}s after his turn was transcribed` });
         };
-        if (lastResponseCreatedAt >= turnStart) return skip("answered");   // a response was created FOR THIS TURN
+        if (lastMouthOutputAt >= turnStart) return skip("answered");   // the mouth AUDIBLY answered this turn (lane E: a created reply that said nothing is not an answer)
         // DELIBERATE silences, not outages: the MIND holding the mouth shut ({"autospeak":false}),
         // or mouthpiece mode, where the MIND is the voice for the whole call by configuration.
         if (suppressAuto) return skip("suppress_auto");
@@ -4014,7 +4178,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // still owes him the answer. `speaking` is in here because audio outlives response.done.
         if (responseActive || awaitingResponse || mindBusy || mindPlayer || speaking || pendingMouthReply || injectQueue.length) return skip("in_flight");
         unansweredStreak++;
-        const line = `turn ANSWERED BY NOBODY — ${((Date.now() - turnAt) / 1000).toFixed(1)}s after his turn was transcribed, no response had been created for it (streak ${unansweredStreak}; created ${responsesCreated}, cancelled ${responsesCancelled}, empty ${responsesEmpty}, turns ${turnsTranscribed}, rotations ${rotN})`;
+        const line = `turn ANSWERED BY NOBODY — ${((Date.now() - turnAt) / 1000).toFixed(1)}s after his turn was transcribed, ${lastResponseCreatedAt >= turnStart ? "a reply was created for it but said NOTHING" : "no response had been created for it"} (streak ${unansweredStreak}; created ${responsesCreated}, cancelled ${responsesCancelled}, empty ${responsesEmpty}, turns ${turnsTranscribed}, rotations ${rotN})`;
         const extra = { unanswered_turn: true, streak: unansweredStreak, responses_created: responsesCreated,
           responses_cancelled: responsesCancelled, responses_empty: responsesEmpty,
           turns_transcribed: turnsTranscribed, rot_n: rotN };
@@ -4265,6 +4429,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.audio.delta": {
           if (!ev.delta || !prevRespId || (ev.response_id && ev.response_id !== prevRespId)) return;
           const buf = Buffer.from(ev.delta, "base64");
+          if (!mindResponse && lastMouthOutputAt < curResponseBornAt) lastMouthOutputAt = Date.now();   // lane E: the reply became audible
           queueAudio(buf.length);
           paceFeed(stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth"), (buf.length / 2 / RATE) * 1000);   // canon 013
           return;
@@ -4651,6 +4816,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             const dead = cancelledResponses.has(ev.response_id ?? curResponseId ?? "");
             rec({ ev: "model_delta", text: ev.delta, ...(dead ? { cancelled: true } : {}) });
             if (!dead) { mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
+            if (!dead && !mindResponse && lastMouthOutputAt < curResponseBornAt) lastMouthOutputAt = Date.now();   // lane E
           }
           break;
         case "conversation.item.input_audio_transcription.delta":
@@ -4830,7 +4996,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // session doesn't spam.
               if (suppressAuto && !noiseBlip && Date.now() - lastSuppressEchoAt > 10000) {
                 lastSuppressEchoAt = Date.now();
-                say("info", `auto-reply suppressed (mouth ${suppressRestoreAt ? "in recovery window" : "CLOSED by MIND"})`);
+                say("info", `auto-reply suppressed (mouth ${suppressRestoreAt ? "in recovery window" : suppressBy === "self" ? `self-muted on his word${selfMuteUntil ? `, reopens in ${Math.max(0, Math.round((selfMuteUntil - Date.now()) / 1000))}s` : ""}` : `CLOSED by ${suppressBy || "MIND"}`})`);
               }
               // Starvation fix (fire17, 2026-08-20): a REAL user turn whose auto-reply was
               // cancelled only because MIND audio was playing still deserves its answer —
@@ -4854,7 +5020,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 say("info", `mouth reply held behind ${organFloorWho} audio — will release`, { floor: organFloorWho });
               } else if (mindBusy && !suppressAuto && !noiseBlip && !selfEcho && !emptyRoom) {
                 pendingMouthReply = true; pendingMouthAt = Date.now();
-                say("info", "mouth reply held behind mind audio — will release");
+                // LANE T (his 14:45:52 — a 26 s line held his answer 12 s): the mouth answers him FIRST. Line still
+                // rendering → park it at playback-ready (bytes kept). Line audible → cut at a word boundary, remainder
+                // re-queued behind the mouth (not STALE — nothing of his is unanswered by it). The narrator's exit
+                // handler then releases the held reply exactly as it always did.
+                const L = mindLine;
+                const audibleMs = mindPlayer && L ? Date.now() - L.startAt : -1;
+                const forHim = speechStartedAt > 0 && curResponseBornAt >= speechStartedAt;
+                if (forHim && !mindPlayer) {
+                  mouthFirstPark = true;
+                  say("info", "mouth reply held behind mind audio — will release: the line is still rendering and will be PARKED, mouth first", { mouth_first: "park" });
+                } else if (forHim && L && mindPlayer && (MOUTH_FIRST_CUT_MS === 0 || audibleMs < MOUTH_FIRST_CUT_MS)) {
+                  const raw = Math.min(L.text.length, Math.max(0, Math.round((audibleMs / L.ms) * L.text.length)));
+                  const wb = L.text.lastIndexOf(" ", raw);
+                  L.cut = wb > 0 ? wb : Math.max(0, raw);
+                  const rest = L.text.slice(L.cut).trim();
+                  if (rest) injectQueue.unshift({ text: rest, who: L.who });
+                  try { mindPlayer.kill("SIGKILL"); } catch {}   // exited handler: records the spoken prefix, releases the held mouth reply
+                  playingUntil = Date.now() + 250;
+                  say("info", `mind line cut for the mouth's reply — spoke ${L.cut}/${L.text.length} chars at ${(Math.max(0, audibleMs) / 1000).toFixed(1)}s, remainder re-queued behind the mouth (mouth first)`,
+                    { mouth_first: "cut", cut_chars: L.cut, cut_at_ms: Math.max(0, audibleMs), remainder_chars: rest.length });
+                } else say("info", "mouth reply held behind mind audio — will release at its last word");
               } else if (recoveryWindow && !mindBusy && !noiseBlip && !selfEcho && !emptyRoom && !organFloor && !xconv) {
                 // HELD, NOT SWALLOWED — the 22% fix (call 3357: this cancel fired 10x in 7 minutes
                 // and the engine's OWN discriminator afterwards refused to call 7 of those turns an
@@ -4886,7 +5072,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
           }
           responseActive = true;
-          mindResponse = awaitingResponse;   // if we sent this response.create, it's the MIND speaking
+          mindResponse = awaitingResponse && !retryResponse;   // if we sent this response.create, it's the MIND speaking — unless it is lane E's retry of an empty MOUTH reply
+          retryResponse = false;
           if (!awaitingResponse) pendingMouthReply = false;   // a REAL covering auto-reply is now active — the supersede is genuine (see speech_started note)
           awaitingResponse = false;   // the send we were awaiting has now materialized
           break;
@@ -4903,6 +5090,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.speech_started":
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
+          latchSynthAt = 0;      // lane L: a fresh segment may be released once
           // Fresh latch — the stuck-latch timeout clock starts here, with no voice heard yet.
           lastVoiceAt = Date.now(); latchVoiceMs = 0; latchHadVoice = false; latchTimedOut = false;
           // Supersede fix (EVA's 17:01 question, proven real): the held-reply clear used to
@@ -4934,11 +5122,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "input_audio_buffer.speech_stopped":
+          serverStoppedAt = Date.now();   // lane L: the server closed the segment itself
+          if (latchSynthAt) rec({ ev: "info", text: `latch release worked — the server ended the segment ${Date.now() - latchSynthAt}ms after the synthesized stop`, latch_release_ok: true, ms: Date.now() - latchSynthAt });
           if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
           // CANON 124: if this close was forced by a caps release, the audible speech ended at the release —
           // the flushed silence must not inflate the length past the noise-blip bar (a 300 ms blip + 1.5 s of
           // zeros is still a blip).
           if (releaseFlushAt > speechStartedAt && speechStartedAt) { lastSpeechMs = releaseFlushAt - speechStartedAt; releaseFlushAt = 0; }
+          transcriptPending = Date.now();   // lane S: the server now owes this segment's transcript
           userSpeaking = false;
           // P9: remember the quiet clock this turn is about to overwrite. If the turn turns out to
           // be our own speaker echo, the stack law must measure its 2.5s of silence from the last
@@ -4957,6 +5148,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
           break;
         case "conversation.item.input_audio_transcription.completed":
+          transcriptPending = 0;   // lane S: the owed transcript arrived
           // Overlap recovery done: the recovered turn transcribed — reopen the mouth to
           // whatever it was before (MIND's explicit {"autospeak"} always wins, see below).
           // Keyed on recoverSentAt: a LIVE turn's lagging transcript arriving before the
@@ -5256,6 +5448,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               const cutWhy = truncationFlags(tScript, turn, Date.now());
               const strongCut = cutWhy.some((w) => !w.includes("weak"));
               if (cutWhy.length) { ann.incomplete = strongCut ? "strong" : "weak"; ann.incomplete_why = cutWhy; }
+              lastYouText = tScript;   // lane M-A: the self-mute allow-list judges HIS words
               say("you", tScript, (suspect || externalMarked || cutWhy.length) ? ann : undefined);
               if (strongCut)
                 say("info", `turn INCOMPLETE (${cutWhy.join("; ")}) — recover before acting`,
@@ -5469,6 +5662,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // response born from THIS empty segment. A blip landing while the PREVIOUS real
           // turn's reply is still generating must never kill that reply — frequent at
           // VAD 500 where a trailing blip becomes its own segment.
+          const garbleNow = !!ev.transcript?.trim() && garbleTurn(ev.transcript);
+          if (garbleNow && responseActive && !mindResponse && !awaitingResponse && !closing && curResponseBornAt >= speechStartedAt && lastSpeechMs < 4000) {
+            try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
+            responseActive = false;
+            say("info", `garble turn ignored ("${ev.transcript.trim().slice(0, 40)}") — not Hebrew, not English, ${ev.transcript.trim().length} chars; recorded, not answered`, { garble: true });
+          }
           if (!ev.transcript?.trim() && responseActive && !mindResponse && !awaitingResponse && !closing
               && curResponseBornAt >= speechStartedAt
               && lastSpeechMs < 2 * (Number(process.env.APIPLAN_MIN_SPEECH_MS) || 500)) {
@@ -5553,6 +5753,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "conversation.item.input_audio_transcription.failed":
           speechTurns.shift();   // no transcript will ever consume this turn's pair — keep the FIFO aligned
+          transcriptPending = 0;   // lane S: nothing more will come for it
           if (suppressRestoreAt && recoverSentAt) { suppressAuto = savedSuppress; suppressRestoreAt = 0; recoverSentAt = 0; }
           // Don't strand a held reply for 4s when the transcript simply failed.
           flushReply();
@@ -5648,12 +5849,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // created, 9 spoken, 6 tool calls — every one of them would have read as "empty").
             const toolOnly = Array.isArray(ev.response?.output)
               && ev.response.output.some((it: any) => it?.type === "function_call");
+            // lane E: the server names the reason — cancelled/turn_detected (he kept talking), completed (truly mute),
+            // incomplete (max tokens / content filter), failed (error). Read it instead of guessing.
+            const rStatus = String(ev.response?.status ?? "?");
+            const rDet = ev.response?.status_details;
+            const rWhy = String(rDet?.reason ?? rDet?.error?.message ?? rDet?.type ?? "");
             if (!cancelledResponses.has(doneId) && !mindResponse && !toolOnly && mouthChars === 0 && !mouthBuf.trim()) {
               responsesEmpty++; sessResponsesEmpty++;
-              rec({ ev: "info", empty_reply: true, response_id: doneId || null,
+              const serverCut = rStatus === "cancelled";
+              const canAnswer = !suppressAuto && process.env.APIPLAN_VAD_CREATE_RESPONSE !== "0";
+              const wasRetry = emptyRetryAt > 0 && emptyRetryAt >= lastRealTurnStart;
+              const retry = emptyRetryDue(rStatus, mindResponse, toolOnly, canAnswer, userSpeaking, emptyRetryAt, lastRealTurnStart);
+              rec({ ev: "info", empty_reply: true, response_id: doneId || null, status: rStatus, status_reason: rWhy || null,
+                server_cut: serverCut, retry, retry_failed: wasRetry && rStatus === "completed",
                 responses_created: responsesCreated, responses_empty: responsesEmpty,
                 responses_cancelled: responsesCancelled, turns_transcribed: turnsTranscribed, rot_n: rotN,
-                text: `response ${doneId || "?"} was created and said NOTHING — no transcript, no audio, not cancelled (created ${responsesCreated}, empty ${responsesEmpty}, turns ${turnsTranscribed})` });
+                text: `response ${doneId || "?"} was created and said NOTHING — status ${rStatus}${rWhy ? ` (${rWhy})` : ""}: ${serverCut ? "the server cancelled it at birth (he kept talking / the mic reopened) — his next turn answers itself, no retry" : rStatus === "completed" ? (retry ? "genuinely empty — retrying once" : wasRetry ? "the retry was empty too — giving up on this turn" : "genuinely empty — no retry (mouth closed, he is speaking, or APIPLAN_EMPTY_RETRY=0)") : "neither completed nor cancelled — no retry"} (created ${responsesCreated}, empty ${responsesEmpty}, turns ${turnsTranscribed})` });
+              if (retry) {
+                emptyRetryAt = Date.now(); retryResponse = true; awaitingResponse = true;   // awaitingResponse: the flush must not race a MIND line into the retry
+                say("info", "empty reply — retrying (1/1)", { empty_retry: true, response_id: doneId || null });
+                try { ws.send(JSON.stringify({ type: "response.create" })); } catch { awaitingResponse = false; retryResponse = false; }
+              } else if (wasRetry && rStatus === "completed") {
+                say("info", "empty reply — retry failed (the mouth said nothing twice for this turn)", { empty_retry_failed: true, response_id: doneId || null });
+              }
             } else if (!cancelledResponses.has(doneId) && mindResponse && !toolOnly && mouthChars === 0 && !mouthBuf.trim()) {
               // Engine-initiated (MIND/narrator/greeting) responses stay OUT of responsesEmpty —
               // but a MIND line that produced no speech is still worth a record of its own class.
