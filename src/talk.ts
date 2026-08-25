@@ -3038,6 +3038,22 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       try { return fs.readFileSync(`${LM_HOME}/eva-voice.txt`, "utf8").trim() || "shimmer"; }
       catch { return "shimmer"; }
     };
+    // EVA'S VOLUME IS A LEVEL, 50% BY DEFAULT — his voice, call 48629, 2026-08-25 13:25:10: "הווליום שלה צריך
+    // להיות על חמישים אחוז", and 13:25:49: "אני לא אמרתי שום טוגל, אני דיברתי על שהווליום שלה יהיה על חמישים
+    // אחוז" (hands canon 128/129). Until now her lines rode the MIND's trim (voiceGain("mind")) — there was no
+    // knob for her at all. Read like eva-voice.txt / settings.json: live, per utterance, no restart. Accepts
+    // settings.json "eva_volume" as 0..1 or 0..100 (50 == 0.5); anything else falls back to the default.
+    const EVA_GAIN_DEFAULT = 0.5;
+    const evaGain = (): number => {
+      const raw = process.env.LIVEMIND_EVA_GAIN;
+      const norm = (v: number) => (Number.isFinite(v) && v >= 0 ? (v > 1 ? v / 100 : v) : NaN);
+      if (raw !== undefined && raw !== "") { const v = norm(Number(raw)); if (Number.isFinite(v) && v <= 1) return v; }
+      try {
+        const v = norm(Number(JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).eva_volume));
+        if (Number.isFinite(v) && v <= 1) return v;
+      } catch {}
+      return EVA_GAIN_DEFAULT;
+    };
     const sendInjected = (text: string, who?: string) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
@@ -3112,7 +3128,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // confirms this form passes c0 at unity, so what is written here is what is heard.
         // toFixed(4) keeps float dust (0.30000000000000004) out of argv.
         const mindGain = r.bytes[22] === 1 && stereoEnabled() ? panGains("mind") : null;
-        const mindTrim = voiceGain("mind");
+        const mindTrim = who === "eva" ? evaGain() : voiceGain("mind");   // her level, not the MIND's (canon 128/129)
         const mindPan = mindGain
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
