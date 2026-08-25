@@ -2584,7 +2584,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                   { mind_cut: true, cut_peak: Math.round(pkM), cut_bar: bargeBar, cut_sustain_ms: bargeSustain, on_air: bargeOnAir, cut_at_ms: cutAtMs, cut_chars: L.cut, line_chars: L.text.length, vp_live: !!vp,
                     cut_evidence: bv.evidence, cut_confirm_ms: confirmMs });
                 const rest = L.text.slice(L.cut).trim();
-                if (rest) { injectQueue.push({ text: rest, who: L.who }); queueStale = true; }   // remainder is STALE — re-weave against his words
+                if (rest) { injectQueue.push({ text: rest, who: L.who }); staleWho.add(whoKey(L.who)); }   // remainder is STALE for ITS OWN voice — re-weave against his words
                 saveMindState("cut-by-user");                              // LANE 15: cut point + remainder outlive the call
                 ovStart = -1; ovEnd = 0; ovPath = ""; ovSrc = "";   // his live speech supersedes overlap recovery here
               }
@@ -3296,7 +3296,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             say("info", "mouth reply released (mind line parked — mouth answers him first)", { mouth_first: "released" });
             try { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; pendingMouthReply = false; } catch {}
           }
-          if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
+          if (whoCount(who) > 1) say("info", `mind queue MERGE (${whoCount(who)} held, ${whoKey(who)}) — weave into one`);   // D7: the 5th site, missed in 1e1c3db
           if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
           return;
         }
@@ -3719,7 +3719,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // merged line and pileup is impossible; no drop_queue ritual needed ({"drop_queue"}
       // stays for manual control). Live evidence for the law: on call 22157 lines went
       // HELD→STALE repeatedly and nothing ever spoke.
-      if (queueStale && whoCount(who)) {
+      if (staleWho.has(whoKey(who)) && whoCount(who)) {
         say("info", `stale queue auto-replaced (${whoCount(who)}) by fresh ${whoKey(who)} line`);   // D7: only THIS voice's stale words die
         for (let qi = injectQueue.length - 1; qi >= 0; qi--) if (whoKey(injectQueue[qi]!.who) === whoKey(who)) injectQueue.splice(qi, 1);
         // PRE-RELAUNCH AUDIT 2026-08-22 (P1). The waited-notice describes the LINE that waited.
@@ -3727,7 +3727,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // with an apology for a wait that never happened — spoken, verbatim, in his ear.
         queueHeldForHim = false;
       }
-      queueStale = false;   // a new inject IS the re-weave — it releases the stale hold
+      staleWho.delete(whoKey(who));   // a new inject IS the re-weave — it releases THIS voice's stale hold
       // MUTED-SPEAKER HOLD: refresh the LANE 18 read NOW (async, cached 5 s) so that by
       // playback-ready — seconds of render later — the gate holds a fresh answer; and if the
       // last-known state is already muted, hold before rendering at all. Never latches off:
@@ -3787,7 +3787,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // שהמוח מנתח את מה שאמרתי עכשיו"): once a NEW user turn completes while lines sit
     // in the queue, those lines are STALE — they never auto-flush. Only {"drop_queue"}
     // (MIND re-weaves and sends fresh) or a new inject releases the hold.
-    let queueStale = false;
+    // D7 completion (MOUTHS audit of 1e1c3db): stale is PER VOICE. The re-weave protocol is the
+    // MIND's; a global flag marked EVA's queued line stale on his fresh turn and — since she never
+    // re-weaves — silently withheld her words FOREVER. staleWho holds the voices whose lines await
+    // a re-weave; every other voice's lines keep flowing.
+    const staleWho = new Set<string>();
     // MIND-NEVER-INTERRUPTS (fire17, voice 2026-08-21, call 96642: "תוודא שמה שהמוח רוצה
     // להגיד לי בעצם נדחף לתור, לאחרי שגם הפה יענה לי על הדבר האחרון שסיימתי להגיד...
     // ובחיים המוח לא יוכל לקטע אותי"): after a real turn of his, held MIND lines wait
@@ -3844,7 +3848,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     const flushInjectQueue = () => {
       flushTimer = null;
-      if (queueStale) return;
+      if (injectQueue.length && injectQueue.every((q) => staleWho.has(whoKey(q.who)))) return;   // D7: only when EVERY queued voice awaits re-weave
       if (xconvHeld()) {   // canon 045 — retried, so the release needs no extra wiring
         if (injectQueue.length && !flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
         return;
@@ -3881,13 +3885,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // responseActive/awaitingResponse, so without this term a held line would flush into the
       // successor while the old voice is still speaking: two voices, one player, interleaved PCM.
       // Held, not dropped — rotDrainRelease() calls this again the moment the drain ends.
-      while (injectQueue.length && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) {
+      while (injectQueue.some((q) => !staleWho.has(whoKey(q.who))) && !responseActive && !awaitingResponse && !mindBusy && !prevRespId) {
         if (queueWaitSince) {
           say("info", `mind queue released after ${((Date.now() - lastSpeechStopAt) / 1000).toFixed(1)}s quiet (${lastResponseCreatedAt >= lastRealTurnStart ? "mouth answered" : "no mouth reply due"}) — waited ${((Date.now() - queueWaitSince) / 1000).toFixed(1)}s`,
             { queue_released: true, waited_ms: Date.now() - queueWaitSince });
           queueWaitSince = 0;
         }
-        const q = injectQueue.shift()!;
+        const qi = injectQueue.findIndex((q) => !staleWho.has(whoKey(q.who)));   // D7: skip stale voices, never starve the rest
+        const q = injectQueue.splice(qi, 1)[0]!;
         let t = q.text;
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
         sendInjected(t, q.who, t === q.text ? q.bytes : undefined, q.speed, q.adaptive);   // a prefixed line is new words — render them
@@ -4024,7 +4029,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (j.drop_queue) {   // MIND re-weave: discard held/unspoken lines before sending a fresh one
                       say("info", `queue dropped (${injectQueue.length} lines)`);
                       injectQueue.length = 0;
-                      queueStale = false;
+                      staleWho.clear();
                       queueHeldForHim = false;   // audit P1: the notice belongs to the dropped line
                     } else if (typeof j.replay === "string") {   // play a stored narrator render again (to the speaker, never to the model)
                       replayNarration(j.replay);
@@ -5729,8 +5734,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // marking is PREVENTED rather than undone: there is no window in which a stale flag set
           // by an echo turn can be observed. A stale flag raised by an EARLIER, genuine turn is
           // deliberately left standing — undoing that would auto-fire a line he never heard rewoven.
-          if (ev.transcript?.trim() && injectQueue.length && !queueStale && !echoTurnSuspect && !echoTurnShort) {
-            queueStale = true;
+          if (ev.transcript?.trim() && whoCount(undefined) && !staleWho.has("mind") && !echoTurnSuspect && !echoTurnShort) {
+            staleWho.add("mind");   // D7: re-weave is the MIND's protocol — an organ's held line SURVIVES his new turn
             say("info", "mind queue STALE (new user turn) — awaiting re-weave");
           }
           // Noise gate, layer 2 — MECHANISTIC. Long ambient noise (>= minSpeech, so it passed
