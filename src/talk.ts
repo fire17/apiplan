@@ -4765,18 +4765,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
               // WITHHOLDING THE TRANSCRIPT IS NOT ENOUGH — the server may already have created a
               // reply to it (the transcript routinely lands AFTER response.created), and a mouth
-              // answering a caps-closed turn is the exact thing he asked to be impossible. Two
-              // doors, because the reply can be on either side of this moment:
+              // answering a caps-closed turn is the exact thing he asked to be impossible. Three
+              // doors, because the reply can be on any side of this moment:
               //   in flight — cancel it, guarded by curResponseBornAt >= turnStartedAt so a reply
               //   belonging to an EARLIER turn is never collateral (the same guard the echo teeth
               //   learned the hard way on call 31599);
+              //   ALREADY AUDIBLE — call 26657 12:13:52: the reply's audio had streamed and queued
+              //   into the local player ~4 s before this withhold fired (audio arrives far faster
+              //   than it plays), so a bare response.cancel stopped the server and the speaker
+              //   read the whole 14.3 s reply anyway. A withhold must cut like a barge does:
+              //   silenceMouth() = cancel + conversation.item.truncate + kill the audible tail,
+              //   and it also handles the response.done-but-still-playing case that
+              //   responseActive alone cannot see. Guarded to THIS turn's reply by
+              //   lastResponseCreatedAt >= turnStartedAt, the same clock the answer watch uses;
               //   not yet born — ECHO_HOLD_MS reaches forward one create, which is precisely the
               //   job that flag already exists for.
-              if (responseActive && !mindResponse && !closing && curResponseBornAt >= turnStartedAt) {
-                try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-                if (curResponseId) cancelledResponses.add(curResponseId);
-                responsesCancelled++; sessResponsesCancelled++;
-                responseActive = false;
+              if (!mindResponse && !closing && lastResponseCreatedAt >= turnStartedAt
+                  && (responseActive ? curResponseBornAt >= turnStartedAt : (speaking || playingUntil > Date.now()))) {
+                const wasActive = responseActive;
+                silenceMouth();
+                say("info", `caps withhold cut the mouth's reply (${wasActive ? "cancelled in flight" : "audible tail killed"}) — a withheld turn is answered by nobody`,
+                  { caps_withhold_cut: true, in_flight: wasActive });
               }
               echoHoldUntil = Date.now() + ECHO_HOLD_MS;
               pendingMouthReply = false;   // and nothing parked may be released into a caps-closed turn
