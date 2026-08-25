@@ -300,7 +300,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     output_modalities: ["audio"],
     ...(instructions ? { instructions } : {}),
     tools: [MOUTH_TOOL, ...(o.tools ?? [])], tool_choice: "auto",
-    audio: { input, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE } } },
+    audio: { input, output: { voice: o.voice || "cedar", format: { type: "audio/pcm", rate: RATE }, ...(speedMouth !== 1 ? { speed: speedMouth } : {}) } },
   });
   /** PARKED input. It still TRANSCRIBES (so the successor is not born mute-of-record the moment
    *  it takes over) but it may never answer and may never self-prompt. It is also never appended
@@ -574,6 +574,19 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // file must still know the last line and how much of it was heard after it finished.
   let mindLast: { text: string; ms: number; startAt: number; cut: number; who?: string } | null = null;
   let mindSeq = 0;                            // NARRATOR ARCHIVE: mind-NNN-<t>.wav sequence within this call
+  // REALTIME SPEED (fire17, voice, call 48629, 2026-08-25 14:01:21 — hands canon 131 / seeds S149: "לשלוט בזמן אמת
+  // בלי להתחיל את כל המערכת של livemind מחדש... לדבר קצת יותר מהר, לדוגמה בעשרה אחוז או בעשרים אחוז... בצורה
+  // שהיא פיין ובזמן אמת"; MIND lane S). {"speed":x} (0.25–1.5) → the mouth's session.update audio.output.speed AND
+  // the narrator's tempo (ffplay atempo — the narrator socket lives in providers.ts, outside this file's remit, and
+  // atempo is pitch-preserving, so ONE VOICE holds); {"text":…,"speed":x} overrides one narrator line. Persisted in
+  // ~/.livemind/settings.json (speed, mind_speed) so it survives rotation and relaunch — read at connect, no launcher
+  // work needed. His standing default: the mind narrator 20% faster (1.2). A speed the API refuses is echoed and
+  // the mouth falls back to 1.0 — the narrator keeps its tempo regardless.
+  const clampSpeed = (v: unknown, dflt: number): number => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.min(1.5, Math.max(0.25, n)) : dflt; };
+  const readSpeeds = () => { try { const j = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")); return { mouth: clampSpeed(j.speed, 1.0), mind: clampSpeed(j.mind_speed, 1.2) }; } catch { return { mouth: 1.0, mind: 1.2 }; } };
+  let speedMouth = readSpeeds().mouth;        // the mouth's API-side speed (1.0 = natural)
+  let speedMind = readSpeeds().mind;          // narrator base tempo (his default 1.2)
+  const persistSpeeds = () => { try { const p = `${LM_HOME}/settings.json`; let j: any = {}; try { j = JSON.parse(fs.readFileSync(p, "utf8")); } catch {} j.speed = speedMouth; j.mind_speed = speedMind; ensureDir(LM_HOME); fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n"); } catch {} };
   let mindQueue: { text: string; who?: string }[] = [];   // bound to the live inject queue below — the lines never spoken
   let mindStatus = "idle";
   let mindStateAt = 0;
@@ -3046,7 +3059,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       return false;
     };
     let evaAddressedAt = 0;   // his last Eva-addressed turn — the mouth stays out of it
-    const injectQueue: { text: string; who?: string; bytes?: Uint8Array }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay)
+    const injectQueue: { text: string; who?: string; bytes?: Uint8Array; speed?: number }[] = [];   // bytes = an already-rendered line (parked at ready, or a replay); speed = per-line narrator tempo
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
     // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
@@ -3074,7 +3087,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       } catch {}
       return EVA_GAIN_DEFAULT;
     };
-    const sendInjected = (text: string, who?: string, bytes?: Uint8Array) => {
+    const sendInjected = (text: string, who?: string, bytes?: Uint8Array, lineSpeed?: number) => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
       // THE MIND'S OWN VOICE — mechanistic verbatim by construction. Driving the mouth's
       // conversational model with "say this word for word" instructions proved FLAKY: it
@@ -3107,7 +3120,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // then, with the waited-notice). The user-barge cut stays as the last line of defence.
         const heStartedMeanwhile = userSpeaking && Date.now() - speechStartedAt < 120000;
         if (heStartedMeanwhile) {
-          injectQueue.unshift({ text, who, bytes: r.bytes });   // keep the render — no second 8 s wait when it is released
+          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed });   // keep the render — no second 8 s wait when it is released
           queueHeldForHim = true;
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (user speaking) — audio parked, queue ${injectQueue.length}`,
@@ -3128,7 +3141,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (closed) { mindBusy = false; return; }
         const f = `/tmp/apiplan-mind-${Date.now()}.wav`;
         await Bun.write(f, r.bytes);
-        const ms = ((r.bytes.length - 44) / 2 / RATE) * 1000;
+        // REALTIME SPEED — narrator tempo: the per-line override, else his default (settings mind_speed, 1.2).
+        // atempo is pitch-preserving (same voice, faster) and accepts 0.5–100; the clamp keeps it there.
+        const tempo = Math.max(0.5, clampSpeed(lineSpeed ?? speedMind, 1.0));
+        const ms = (((r.bytes.length - 44) / 2 / RATE) * 1000) / tempo;   // audible length AT this tempo — gates, barge accounting and karaoke all read it
         playingUntil = Math.max(playingUntil, Date.now()) + ms;   // mic stays gated while the MIND talks (echo-safe)
         // Low-latency flags: without them ffplay holds a read-ahead buffer that stays
         // audible ~40-100ms after SIGKILL — the post-barge self-hear window (verified).
@@ -3153,8 +3169,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const mindPan = mindGain
           ? ["-af", `pan=stereo|c0=${(mindGain.l * mindTrim).toFixed(4)}*c0|c1=${(mindGain.r * mindTrim).toFixed(4)}*c0`]
           : mindTrim < 1 ? ["-af", `volume=${mindTrim.toFixed(4)}`] : [];
+        // ONE filter graph (ffplay fixes it at spawn): pan/volume first, then the tempo — never a second -af.
+        const mindAf = tempo !== 1
+          ? (mindPan.length ? ["-af", `${mindPan[1]},atempo=${tempo.toFixed(3)}`] : ["-af", `atempo=${tempo.toFixed(3)}`])
+          : mindPan;
         if (spkState === "muted" || spkState === "vol0") {          // MUTED-SPEAKER HOLD at playback-ready
-          injectQueue.unshift({ text, who, bytes: r.bytes });   // keep the render — no second 8 s wait when it is released
+          injectQueue.unshift({ text, who, bytes: r.bytes, speed: lineSpeed });   // keep the render — no second 8 s wait when it is released
           mindBusy = false;
           say("info", `mind line HELD at playback-ready (speaker muted) — audio parked, queue ${injectQueue.length}`, { parked_at_ready: true, speaker_muted: true, spk: spkState, chars: text.length });
           if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3205,11 +3225,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         }
         mindPlayer = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
           "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-          ...mindPan, f],
+          ...mindAf, f],
           { stdout: "ignore", stderr: "ignore" });
         // startAt is biased by ffplay spin-up (measured 200-300ms before first audible
         // sample) so the barge cut never over-counts words as spoken.
         mindLine = mindLast = { text, ms, startAt: Date.now() + (Number(process.env.APIPLAN_MIND_START_MS) || 250), cut: -1, who };
+        if (tempo !== 1) rec({ ev: "info", text: `narrator tempo ${tempo.toFixed(2)}${lineSpeed !== undefined ? " (per-line)" : " (default)"}`, tempo, per_line: lineSpeed !== undefined });
         // FRESH LINE, FRESH ACCUMULATOR (his complaint on air, call 35497: "המוח לא אמור
         // להיקטע אליי אם לא התפרצתי אליו"). `bargeMs` is a LEAKY accumulator with call-long
         // lifetime; nothing zeroed it when a narrator line begins, so leak from the mouth
@@ -3501,7 +3522,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       lastMouthBargeAt = now;
       mouthBargeTailUntil = now + MOUTH_BARGE_TAIL;
     };
-    const injectContext = (text: string, mode: string, who?: string, bytes?: Uint8Array) => {
+    const injectContext = (text: string, mode: string, who?: string, bytes?: Uint8Array, speed?: number) => {
       // No chunking needed anymore: the MIND's narrator voice reads the whole text verbatim
       // by construction (the chunk-splitting workaround existed only because the mouth's
       // model summarized long instruction-driven lines).
@@ -3538,7 +3559,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       speakerCheck();
       const speakerMutedNow = spkState === "muted" || spkState === "vol0";
       if (speakerMutedNow) {
-        injectQueue.push({ text, who, bytes });
+        injectQueue.push({ text, who, bytes, speed });
         say("info", `mind line HELD (speaker muted) — queue ${injectQueue.length}`, { speaker_muted: true, spk: spkState });
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 1000);
@@ -3549,13 +3570,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // has to say, exactly as his own turn does. Queued, never dropped; `queueHeldForHim` is
         // deliberately NOT set — the "I wanted to say this earlier but you were speaking"
         // opener would be a lie about a turn that was never addressed to us.
-        injectQueue.push({ text, who, bytes });
+        injectQueue.push({ text, who, bytes, speed });
         say("info", `mind line HELD (external conversation — canon 045) — queue ${injectQueue.length}`);
         if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);
         return;
       }
       if (userSpeaking && Date.now() - speechStartedAt < 120000) {
-        injectQueue.push({ text, who, bytes });
+        injectQueue.push({ text, who, bytes, speed });
         queueHeldForHim = true;   // mind-never-interrupts: this line waited out his speech — it will open with the waited-notice
         say("info", `mind line HELD (user speaking) — queue ${injectQueue.length}`);
         // QUEUE MERGE LAW (fire17, voice, 2026-08-20: "כמה הודעות במקביל נכנסות למחסנית
@@ -3569,8 +3590,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       // Same one-active guard as the queue flush: while a predecessor is finishing its sentence
       // the floor is not free, so a fresh MIND line QUEUES (≤ the drain window) instead of
       // speaking over the tail of the old voice.
-      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes); return; }
-      injectQueue.push({ text, who, bytes });
+      if (!responseActive && !awaitingResponse && !mindBusy && !prevRespId) { sendInjected(text, who, bytes, speed); return; }
+      injectQueue.push({ text, who, bytes, speed });
       if (injectQueue.length > 1) say("info", `mind queue MERGE (${injectQueue.length} held) — weave into one`);   // queue-merge law: one woven line, never a stack
     };
     // Send at most ONE per call: sendInjected sets awaitingResponse, so the loop stops after one
@@ -3632,7 +3653,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const q = injectQueue.shift()!;
         let t = q.text;
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
-        sendInjected(t, q.who, t === q.text ? q.bytes : undefined);   // a prefixed line is new words — render them
+        sendInjected(t, q.who, t === q.text ? q.bytes : undefined, q.speed);   // a prefixed line is new words — render them
       }
     };
     /** {"replay":"last"|"<mind-NNN-*.wav>"} — play a stored narrator render AGAIN (his 13:21 ask), through the very same
@@ -3720,6 +3741,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       const hold = j.pause === true;
                       if (hold) pauseAll(); else resumeAll();
                       say("info", hold ? "playback paused (mechanistic hold — ESC/resume releases)" : "playback resumed");
+                    } else if (j.speed !== undefined && j.text === undefined) {   // REALTIME SPEED: mouth + narrator, persisted
+                      speedMouth = clampSpeed(j.speed, speedMouth); speedMind = speedMouth; persistSpeeds();
+                      if (!closed && ws.readyState === WebSocket.OPEN) {
+                        try { ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", audio: { output: { speed: speedMouth } } } })); } catch {}
+                      }
+                      say("info", `speed set ${speedMouth} (mouth+narrator)`, { speed: speedMouth, mind_speed: speedMind });
                     } else if (j.ping) {   // no-op probe: proves the inject channel is being read, with zero side effects
                       say("info", "pong");
                     } else if (j.context) {
@@ -3749,7 +3776,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       replayNarration(j.replay);
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
-                    } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined);
+                    } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined, undefined,
+                      j.speed !== undefined ? clampSpeed(j.speed, speedMind) : undefined);   // per-line narrator tempo (MIND picks: technical 1.0, chatty 1.3)
                   } catch {}
                 }
               }
@@ -4604,6 +4632,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // never once been on disk. It is recorded here and it may only TIGHTEN the floor.
           sessT0 = Date.now();
           sessExpiresAt = expiresMs(ev.session?.expires_at);
+          if (speedMouth !== 1 || speedMind !== 1.2) say("info", `speed at connect: mouth ${speedMouth}, narrator ${speedMind} (settings.json)`, { speed: speedMouth, mind_speed: speedMind });
           {
             // OFF-MODE PURITY. With rotation unarmed this handler must add nothing to the turn
             // stream the MIND and the monitor read — the whole worth of an opt-in knob is that it
@@ -5618,6 +5647,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "error":
+          if (speedMouth !== 1 && /speed/i.test(String(ev.error?.message ?? ev.error?.param ?? ""))) {
+            say("info", `speed rejected by the API (${ev.error?.message ?? ev.error?.code ?? "?"}) — mouth back to 1.0; narrator keeps tempo ${speedMind} via ffplay atempo`, { speed_rejected: true, mind_speed: speedMind });
+            speedMouth = 1.0; persistSpeeds();
+            break;
+          }
           // A cancel that lost the race with response.done is expected during barge-in,
           // not a call failure — log it quietly and don't mark the call errored.
           if (ev.error?.code === "response_cancel_not_active") {
