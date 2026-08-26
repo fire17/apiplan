@@ -1036,15 +1036,39 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
     return best ? { ...best, kind: best.pos < startChars ? "start" : "end" } : null;
   };
-  let fillerPhrases: string[] = FILLER_DEFAULT; let fillerAt = 0;
+  // CLOSERS (MIND evidence 15:5x, same call: with the ban at the TOP of the live session the mouth still closed with
+  // "אם תרצה לבדוק משהו ספציפי עכשיו, אני כאן." — the END branch is the one that fires most). A closer is matched
+  // as a PREFIX ("רוצה ש…") and only in the TAIL of a finished reply (second half), so "אם תרצה" inside real content
+  // never cuts it; the reply is truncated where the closer begins. settings.json `banned_closers`, live.
+  const CLOSER_DEFAULT = ["אני כאן", "אני פה", "אני איתך", "איתכם", "אם תרצה", "לכל המשך", "אפשר להמשיך", "רוצה ש"];
+  const closerMatch = (text: string, closers: string[]): { phrase: string; pos: number } | null => {
+    const n = normFiller(text); if (!n) return null;
+    const floor = Math.floor(n.length / 2);
+    let best: { phrase: string; pos: number } | null = null;
+    for (const raw of closers) {
+      const ph = normFiller(raw); if (!ph) continue;
+      let i = n.indexOf(ph, Math.max(0, floor - ph.length));
+      while (i >= 0) {
+        if (i >= floor && (i === 0 || n[i - 1] === " ") && (!best || i < best.pos)) { best = { phrase: raw, pos: i }; break; }
+        i = n.indexOf(ph, i + 1);
+      }
+    }
+    return best;
+  };
+  let fillerPhrases: string[] = FILLER_DEFAULT; let fillerClosers: string[] = CLOSER_DEFAULT; let fillerAt = 0;
   const bannedPhrases = (): string[] => {
     const now = Date.now();
     if (now - fillerAt > 2000) {
       fillerAt = now;
-      try { const v = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).banned_phrases; if (Array.isArray(v)) fillerPhrases = v.filter((x: any) => typeof x === "string" && x.trim()); } catch {}
+      try {
+        const j = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8"));
+        if (Array.isArray(j.banned_phrases)) fillerPhrases = j.banned_phrases.filter((x: any) => typeof x === "string" && x.trim());
+        if (Array.isArray(j.banned_closers)) fillerClosers = j.banned_closers.filter((x: any) => typeof x === "string" && x.trim());
+      } catch {}
     }
     return fillerPhrases;
   };
+  const bannedClosers = (): string[] => { bannedPhrases(); return fillerClosers; };
   const FILLER_START_CHARS = Number(process.env.APIPLAN_FILLER_START_CHARS) || 40;
   // Privacy switch (fire17, voice, 2026-08-20): archive_mode "always" (default) keeps
   // every frame even while muted; "caps-only" archives only what the model can hear.
@@ -2322,7 +2346,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length} phrases bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length}+${bannedClosers().length} phrases bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -6089,6 +6113,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // After a mouth barge mouthBuf holds only the HEARD prefix (the detector trimmed it),
           // so this single write stores exactly what left the speakers — the echo corpus never
           // learns words that were never audible, and mouthLast stays "what the mouth said".
+          if (!fillerCutPos && !mindResponse && fillerBuf) {
+            const c = closerMatch(fillerBuf, bannedClosers());
+            if (c) { fillerCutPos = c.pos; fillerCutPhrase = c.phrase; }
+          }
           if (fillerCutPos > 0 && !mindResponse && curItemId && itemQueuedMs > 0) {
             // END filler: cut playback where the phrase begins. Deltas run ahead of playback, so the cut is a
             // char-ratio of the reply's queued audio — APPROXIMATE by construction (TTS pace varies); his ear
