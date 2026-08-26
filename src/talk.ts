@@ -259,6 +259,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Structural allow-list: a tool name the caller never declared is never dispatched,
   // no matter what the model asks for. The mouth's own switch is always declared.
   const toolNames = new Set([MOUTH_TOOL.name, ...(o.tools ?? []).map((t: any) => t?.name).filter(Boolean)]);
+  // TOOL ALIASES (2026-08-26, call 21729: the model called the BARE name open_app ×3 and each was refused,
+  // while the previous call used quick{action} 11 times — same tool list). The allow-list stays structural:
+  // an alias only ever lands on a DECLARED target, rewritten as {action:<bare name>, params:<original args>}.
+  // Grammar: APIPLAN_TOOL_ALIAS="target:name,name;target2:name". Unset = exactly today's behaviour.
+  const parseToolAliases = (raw: string | undefined): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const group of String(raw ?? "").split(";")) {
+      const i = group.indexOf(":"); if (i <= 0) continue;
+      const target = group.slice(0, i).trim(); if (!target) continue;
+      for (const n of group.slice(i + 1).split(",")) { const name = n.trim(); if (name) out.set(name, target); }
+    }
+    return out;
+  };
+  const TOOL_ALIASES = parseToolAliases(process.env.APIPLAN_TOOL_ALIAS);
 
   // The microphone-input half of the session config.
   // Transcription stays at connect time: hot-adding it mid-response required resending the
@@ -1796,6 +1810,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // durable separator is the VPIO echo-cancelled mic (LM_BARGE_VP), currently off because
     // its binary is unversioned — see hands/research/settings-drift-2026-08-22.md.
     const BARGE_PEAK = envBar("APIPLAN_MIND_BARGE_PEAK", 1800);
+    // CAPS OFF = NEITHER HEARD NOR INTERRUPTS (his voice 2026-08-26 15:22, call 21729: "כשהקפסלוק כבוי זה עדיין
+    // מתפרץ אליך כשאני מדבר, מה שלא רציתי שיהיה"). Reverses CAPS DECISION (a) below: a VP barge may cut
+    // playback while the mic is muted ONLY with APIPLAN_MIND_BARGE_WHILE_MUTED=1 (the pre-08-26 behaviour).
+    const BARGE_WHILE_MUTED = envBar("APIPLAN_MIND_BARGE_WHILE_MUTED", 0) === 1;
     const BARGE_SUSTAIN = Number(process.env.APIPLAN_MIND_BARGE_MS) || 250;
     // ── MIND BARGE NEEDS SPEECH EVIDENCE (MIND spec 2026-08-23 05:18; hands engine lane) ──
     // A LOUD SOUND IS NOT A HUMAN INTERRUPTING. The two legs above (level bar + leaky sustain)
@@ -2254,7 +2272,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -2450,7 +2468,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // two playback branches below will take it, and each of those ends in `continue`, so
           // a muted frame still cannot reach input_audio_buffer.append. Their overlap-capture
           // sites are muted-guarded for the same reason (muted audio is never resent either).
-          const vpCut = vpFresh() && ((!!mindPlayer && !!mindLine) || (stillAudible() && !bargeOn));
+          const vpCut = (BARGE_WHILE_MUTED || !micMuted) && vpFresh() && ((!!mindPlayer && !!mindLine) || (stillAudible() && !bargeOn));
           // DEFECT 2.3. The mute body does THREE jobs, and only one of them is "drop the frame".
           // Letting a vpCut frame skip the whole body silenced the "speaking while muted" warning
           // in exactly the window he is most likely to talk (it is the fix for the 13:37
@@ -5852,6 +5870,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             runMouthTool(ev.item);
           } else if (ev.item?.type === "function_call" && o.onTool && toolNames.has(ev.item.name)) {
             runTool(ev.item);
+          } else if (ev.item?.type === "function_call" && o.onTool && TOOL_ALIASES.has(ev.item.name) && toolNames.has(TOOL_ALIASES.get(ev.item.name)!)) {
+            // a mis-named call still lands (rule 1: seamlessness in the engine) — never refused, never guessed beyond the map
+            const target = TOOL_ALIASES.get(ev.item.name)!;
+            const aliasArgs = (() => { try { return ev.item.arguments ? JSON.parse(ev.item.arguments) : {}; } catch { return {}; } })();
+            rec({ ev: "info", text: `tool ${ev.item.name} aliased -> ${target}` });
+            runTool({ ...ev.item, name: target, arguments: JSON.stringify({ action: ev.item.name, params: aliasArgs }) });
           } else if (ev.item?.type === "function_call") {
             rec({ ev: "info", text: `tool ${ev.item.name} refused — not in the declared tool list` });
           }
