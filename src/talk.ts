@@ -857,6 +857,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // the recovery path stays age-blind, exactly as before.
   const recentSpoken: Array<{ t: number; text: string }> = [];
   let mouthBuf = "";
+  // filler gate state (one reply's worth): the transcript so far, whether the gate already ruled, when the one
+  // re-prompt was spent, and the END cut it scheduled. Counters ride every echo line.
+  let fillerBuf = ""; let fillerDone = false; let fillerRepromptAt = 0; let fillerCutPos = 0; let fillerCutPhrase = "";
+  let fillerCancelled = 0, fillerTruncated = 0; let fillerCutTimer: ReturnType<typeof setTimeout> | null = null;
   const rememberSpoken = (t: string) => { if (t.trim()) { recentSpoken.push({ t: Date.now(), text: t }); if (recentSpoken.length > 6) recentSpoken.shift(); } };
   // Hoisted so a window loop never rebuilds them (this runs inside ws.onmessage, the same
   // handler that writes audio deltas to the player's stdin — a long block would stutter it).
@@ -1009,6 +1013,39 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // (= the user-turn boundary per fire17), on mute flips, and at a 10-minute failsafe;
   // segments that never rise above the silence floor are deleted. APIPLAN_ARCHIVE=0 off.
   const archOn = process.env.APIPLAN_ARCHIVE !== "0" && process.env.LM_PRIVATE !== "1";
+  // ── NO-READINESS-FILLER GATE (his voice 2026-08-26 15:41:12, call 21729: "תפסיק להגיד כן אני איתך וכאלה, זה מאוד
+  // חזרתי ורובוטי… בואי נוודא שהפה מתנהג כמו שתמיד אמרתי"). The persona ban did NOT hold — "אני כאן, לגמרי איתכם" was
+  // spoken AFTER the live persona update carrying it — so the ban is code (rule 1). The list lives in settings.json
+  // `banned_phrases` (live, 2 s cache); the default is the persona law's own list, verbatim.
+  const FILLER_DEFAULT = ["אני איתך", "אני כאן איתך", "אני פה איתך", "אני כאן", "אני פה", "אני מוכן", "לכל המשך", "אני איתך להמשיך", "שומע אותך ברור", "אני פה איתכם", "אני כאן איתכם", "לגמרי איתכם", "אני איתכם"];
+  const normFiller = (t: string): string => t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, "").replace(/\s+/g, " ").trim();
+  /** Where a banned phrase sits in a reply so far. `start` = inside the first `startChars` normalised chars
+   *  (the reply OPENED with filler → cancel + re-prompt); `end` = later (a closer → truncate at its boundary).
+   *  Whole-word only, so "כאן" inside a real sentence never trips it. Pure. */
+  const fillerMatch = (text: string, phrases: string[], startChars: number): { phrase: string; pos: number; kind: "start" | "end" } | null => {
+    const n = normFiller(text); if (!n) return null;
+    let best: { phrase: string; pos: number } | null = null;
+    for (const raw of phrases) {
+      const ph = normFiller(raw); if (!ph) continue;
+      let i = n.indexOf(ph);
+      while (i >= 0) {
+        const before = i === 0 || n[i - 1] === " "; const after = i + ph.length === n.length || n[i + ph.length] === " ";
+        if (before && after && (!best || i < best.pos)) { best = { phrase: raw, pos: i }; break; }
+        i = n.indexOf(ph, i + 1);
+      }
+    }
+    return best ? { ...best, kind: best.pos < startChars ? "start" : "end" } : null;
+  };
+  let fillerPhrases: string[] = FILLER_DEFAULT; let fillerAt = 0;
+  const bannedPhrases = (): string[] => {
+    const now = Date.now();
+    if (now - fillerAt > 2000) {
+      fillerAt = now;
+      try { const v = JSON.parse(fs.readFileSync(`${LM_HOME}/settings.json`, "utf8")).banned_phrases; if (Array.isArray(v)) fillerPhrases = v.filter((x: any) => typeof x === "string" && x.trim()); } catch {}
+    }
+    return fillerPhrases;
+  };
+  const FILLER_START_CHARS = Number(process.env.APIPLAN_FILLER_START_CHARS) || 40;
   // Privacy switch (fire17, voice, 2026-08-20): archive_mode "always" (default) keeps
   // every frame even while muted; "caps-only" archives only what the model can hear.
   // Read live from settings.json (2s cache) so the dashboard toggle applies instantly.
@@ -2285,7 +2322,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length} phrases bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -3552,6 +3589,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (prevRespId) { prevRespId = null; speaking = false; rec({ ev: "info", rotation: true, text: "predecessor drain cut — the MIND is taking the floor", drain_cut: true }); }
       if (responseActive && !mindResponse) bargeNow();       // still generating: cancel + truncate + stop
       else { stopPlayer(); speaking = false; playingUntil = 0; }   // done generating, still AUDIBLE: kill the tail
+    };
+    /** The filler gate's ruling on the reply streaming NOW. START → the reply opened with filler: cancel it like a
+     *  barge (cancel + truncate + kill the tail) and re-prompt ONCE per user turn with the persona + a rider
+     *  (response.instructions is an OVERRIDE, so the persona travels with it). END → a closer: remember where it
+     *  begins; response.done knows the reply's audio length and cuts playback there. MIND lines never enter here. */
+    const fillerCheck = () => {
+      const m = fillerMatch(fillerBuf, bannedPhrases(), FILLER_START_CHARS);
+      if (!m) return;
+      fillerDone = true;
+      if (m.kind === "start") {
+        fillerCancelled++;
+        const canReprompt = fillerRepromptAt < lastRealTurnStart && !suppressAuto;
+        say("info", `filler cancelled: "${m.phrase}" at ${m.pos} (#${fillerCancelled})${canReprompt ? " — re-prompting once: answer the content only" : " — re-prompt already spent for this turn"}`,
+          { filler_cancelled: true, phrase: m.phrase, pos: m.pos, reprompt: canReprompt });
+        if (responseActive) bargeNow(); else { stopPlayer(); speaking = false; playingUntil = 0; }
+        if (canReprompt && ws.readyState === WebSocket.OPEN) {
+          fillerRepromptAt = Date.now(); retryResponse = true; awaitingResponse = true;
+          const base = (livePersona || "").trim();
+          try { ws.send(JSON.stringify({ type: "response.create", response: { instructions: `${base}\n\nAnswer the content only. Do not open or close with any readiness or presence phrase — no "I am here", no "with you", no "ready". If there is nothing to add, say one natural word.` } })); }
+          catch { awaitingResponse = false; retryResponse = false; }
+        }
+      } else {
+        fillerCutPos = m.pos; fillerCutPhrase = m.phrase;   // the cut itself waits for the reply's audio length
+      }
     };
     /** THE DUPLEX MOUTH CUT — one body, two triggers.
      *  `vad`  the server's speech_started (today's path, unchanged in shape and in its guard).
@@ -4942,6 +5003,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             const dead = cancelledResponses.has(ev.response_id ?? curResponseId ?? "");
             rec({ ev: "model_delta", text: ev.delta, ...(dead ? { cancelled: true } : {}) });
             if (!dead) { mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
+            if (!dead && !mindResponse && !fillerDone) { fillerBuf += ev.delta; fillerCheck(); }
             if (!dead && !mindResponse && lastMouthOutputAt < curResponseBornAt) lastMouthOutputAt = Date.now();   // lane E
           }
           break;
@@ -5026,6 +5088,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.created":
           curResponseId = ev.response?.id ?? null;
           curResponseBornAt = Date.now();
+          fillerBuf = ""; fillerDone = false; fillerCutPos = 0; fillerCutPhrase = "";
           // POSITIVE RECORD OF CREATION — counted BEFORE any gate below can cancel it, because the
           // question the answer watch asks is "did the server create anything for him", not "did it
           // survive". A cancelled reply is a different (and already logged) failure from no reply.
@@ -6026,6 +6089,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // After a mouth barge mouthBuf holds only the HEARD prefix (the detector trimmed it),
           // so this single write stores exactly what left the speakers — the echo corpus never
           // learns words that were never audible, and mouthLast stays "what the mouth said".
+          if (fillerCutPos > 0 && !mindResponse && curItemId && itemQueuedMs > 0) {
+            // END filler: cut playback where the phrase begins. Deltas run ahead of playback, so the cut is a
+            // char-ratio of the reply's queued audio — APPROXIMATE by construction (TTS pace varies); his ear
+            // is the verdict. The item is truncated at the same point so the model does not remember the closer.
+            fillerTruncated++;
+            const finalChars = Math.max(normFiller(fillerBuf).length, fillerCutPos + 1);
+            const cutMs = Math.round(itemQueuedMs * fillerCutPos / finalChars);
+            const delay = Math.max(0, itemFirstDeltaAt + cutMs - Date.now());
+            const rid = curResponseId; const iid = curItemId;
+            try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: iid, content_index: 0, audio_end_ms: cutMs })); } catch {}
+            say("info", `filler truncated: "${fillerCutPhrase}" — playback cut at ${cutMs}ms of ${itemQueuedMs}ms, in ${delay}ms (#${fillerTruncated})`,
+              { filler_truncated: true, phrase: fillerCutPhrase, cut_ms: cutMs, total_ms: itemQueuedMs });
+            if (fillerCutTimer) clearTimeout(fillerCutTimer);
+            fillerCutTimer = setTimeout(() => { fillerCutTimer = null; if (curResponseId !== rid) return; stopPlayer(); speaking = false; playingUntil = 0; }, delay);
+            const cutChars = Math.round(mouthBuf.length * fillerCutPos / finalChars);
+            mouthBuf = mouthBuf.slice(0, cutChars);   // the echo corpus / mouth_last learn only what was audible
+            fillerCutPos = 0;
+          }
           if (mouthBuf.trim()) { rememberSpoken(mouthBuf); mouthLast = mouthBuf.trim(); saveMindState(undefined, false); }   // echo-dedupe corpus + LANE 15 last-spoken
           mouthBuf = ""; mouthChars = 0;   // one reply's transcript accounting ends here, spoken or not
           // Now that the out-of-band MIND line has actually been spoken, record it in the
