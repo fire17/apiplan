@@ -102,6 +102,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // gpt-4o-mini-transcribe hallucinates far less than whisper-1 on near-silence; override
   // via env if a deployment needs whisper-1 back.
   const transcribeModel = process.env.APIPLAN_TRANSCRIBE || "gpt-4o-mini-transcribe";
+  // E754 (2026-08-26, EVA on call 44957: 29% of his turns transcribed with ZERO Hebrew, 58% of the short ones —
+  // 'Λοιπόν', 'საკლივ შეტაპ', 'Não só pela'). The transcriber had no language hint and no prompt. Two knobs:
+  // APIPLAN_TRANSCRIBE_LANGUAGE (ISO-639-1, opt-in — a hard pin mangles the OTHER language of a bilingual speaker)
+  // and a decode-bias PROMPT — inline APIPLAN_TRANSCRIBE_PROMPT, else APIPLAN_TRANSCRIBE_PROMPT_FILE (live-editable).
+  // Unset = the session config is byte-identical to before.
+  const transcribePromptFrom = (inline: string | undefined, file: string | undefined): string => {
+    let raw = (inline ?? "").trim();
+    if (!raw && file) { try { raw = fs.readFileSync(file, "utf8"); } catch { raw = ""; } }
+    return raw.replace(/\s+/g, " ").trim().slice(0, 1000);
+  };
+  const transcribeLanguage = (process.env.APIPLAN_TRANSCRIBE_LANGUAGE || "").trim();
+  const transcribePrompt = transcribePromptFrom(process.env.APIPLAN_TRANSCRIBE_PROMPT, process.env.APIPLAN_TRANSCRIBE_PROMPT_FILE);
 
   // Structured event log: one JSON line per event, flushed immediately. A launcher TAILS
   // this for live monitoring, and it is how every reliability fix gets verified. Never
@@ -196,6 +208,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const sha = new TextDecoder().decode(Bun.spawnSync(["git", "-C", dirname(new URL(import.meta.url).pathname), "rev-parse", "--short", "HEAD"]).stdout).trim();
     if (sha) rec({ ev: "info", text: `engine ${sha}` });
   } catch { /* never block a call on git */ }
+  rec({ ev: "info", text: `transcribe: ${transcribeModel} language=${transcribeLanguage || "auto"} prompt=${transcribePrompt.length} chars` });
 
   // ── LANE 15 (canon 011): SPEECH SURVIVES A RESTART ───────────────────────────
   // fire17's law: a restart that cuts the mouth mid-sentence must not lose the sentence —
@@ -281,7 +294,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const audioInput: Record<string, unknown> = {
     format: { type: "audio/pcm", rate: RATE },
     // gpt-4o-mini-transcribe hallucinates far less than whisper-1 on near-silence.
-    transcription: { model: transcribeModel },
+    transcription: { model: transcribeModel, ...(transcribeLanguage ? { language: transcribeLanguage } : {}), ...(transcribePrompt ? { prompt: transcribePrompt } : {}) },
     // Filter room noise / speaker bleed BEFORE VAD. near_field assumes headphones (which
     // barge-in already requires); far_field suits a laptop/room mic.
     noise_reduction: { type: bargeOn ? "near_field" : "far_field" },
@@ -4237,6 +4250,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // "did a SECOND response appear" — which is nearly never, hence a ~62% false-positive rate.
     // A timestamp compared against the turn's OWN start asks the real question instead.
     let lastResponseCreatedAt = 0;
+    // LATE-TRANSCRIPT RESURRECTION (E754 half b, 2026-08-26; call 44957: three 'ANSWERED BY NOBODY' in 40 s — a
+    // reply was created, the blip gate killed it at birth, and his real transcript landed ~800 ms later). The gate
+    // stamps the segment it cancelled; when a REAL transcript for THAT segment lands within the window, ONE
+    // response.create brings the answer back. A newer segment never resurrects — his next turn has its own reply.
+    let blipCancelAt = 0, blipCancelSeg = 0;
+    const BLIP_RESURRECT_MS = Math.max(0, Number(process.env.APIPLAN_BLIP_RESURRECT_MS ?? 2000));
+    const blipResurrectDue = (cancelAt: number, cancelSeg: number, seg: number, now: number): boolean =>
+      BLIP_RESURRECT_MS > 0 && cancelAt > 0 && cancelSeg > 0 && cancelSeg === seg && now - cancelAt <= BLIP_RESURRECT_MS;
     // LANE E — THE EMPTY REPLY (call 48629, 28 'said NOTHING' replies; MIND lane 2026-08-25). Every one of them was
     // a reply the server CREATED and then a speech_started 60–400 ms later — the server's own turn detection cancels
     // a newborn reply when he keeps talking or the mic reopens; none was a silent completed reply. Three facts
@@ -5073,6 +5094,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (curResponseId) cancelledResponses.add(curResponseId);   // drop its audio deltas
               responsesCancelled++; sessResponsesCancelled++;
               responseActive = false;
+              if (noiseBlip) { blipCancelAt = Date.now(); blipCancelSeg = speechStartedAt; }
               if (noiseBlip && !suppressAuto) say("info", `noise-blip auto-reply cancelled (speech ${lastSpeechMs}ms < ${minSpeech}ms)`);
               if (selfEcho && !suppressAuto && !noiseBlip) say("info", `auto-reply cancelled at birth — self-echo hold (segment began ${speechStartedAt - echoHoldSetAt}ms vs the verdict)`, { echo_suppressed: true, echo_hold: true, segment_vs_verdict_ms: speechStartedAt - echoHoldSetAt });
               if (evaTurn && !suppressAuto && !noiseBlip && !selfEcho) say("info", "auto-reply cancelled at birth — he addressed Eva", { addressee: "eva" });
@@ -5798,6 +5820,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (curResponseId) { cancelledResponses.add(curResponseId); responsesCancelled++; sessResponsesCancelled++; }
             responseActive = false;
             say("info", `short-transcript auto-reply cancelled (${echoTurnChars} chars)`, { short_transcript: true, chars: echoTurnChars });
+          }
+          // LATE-TRANSCRIPT RESURRECTION (E754 b) — the blip gate ruled ~800 ms before this transcript existed. If the
+          // transcript is REAL (not short, not echo, not garble, not external) and the mouth is idle and allowed to
+          // answer, bring the killed reply back with one response.create. Guarded exactly like the empty-reply retry.
+          const tLate = ev.transcript?.trim() ?? "";
+          if (tLate && blipResurrectDue(blipCancelAt, blipCancelSeg, speechStartedAt, Date.now()) && !echoTurnShort && !echoTurnSuspect && !garbleTurn(tLate) && !externalMarked
+              && !responseActive && !awaitingResponse && !suppressAuto && !mindBusy && !closing && !xconvHeld() && Date.now() - evaAddressedAt >= 3000 && ws.readyState === WebSocket.OPEN) {
+            const late = Date.now() - blipCancelAt; blipCancelAt = 0;
+            retryResponse = true; awaitingResponse = true;
+            say("info", `blip-cancelled reply RESURRECTED — a real transcript landed ${late}ms after the gate ("${tLate.slice(0, 40)}")`, { blip_resurrected: true, late_ms: late, chars: echoTurnChars });
+            try { ws.send(JSON.stringify({ type: "response.create" })); } catch { awaitingResponse = false; retryResponse = false; }
           }
           // Noise gate, layer 4 — THE MOUTH MUST NOT ANSWER AN ECHO (the MIND's order, part c).
           // echoTeeth() already kills the reply on every door that RULED on this turn (live text
