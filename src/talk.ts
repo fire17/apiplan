@@ -1867,6 +1867,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // surface only after it ends — chunked mid-playback recovery is the revisit.
     let ovStart = -1; let ovEnd = 0; let ovPath = ""; let ovAt = 0; let ovSrc = "";
     let recovering = false;
+    // RESEND-SOURCED TURN RULES (pure; tested in hands/tests/recovery-identity.test.mjs).
+    // TIMING BELT floor made PROPORTIONAL (88140 11:21:24 'Amorkan, alze.': a 1.5 s resend of the mouth's own
+    // 'המוח כאן, על זה.' came back transliterated — text belt 0.00 — and the fixed 1500 ms bulk floor exempted
+    // every resend under 3 s). Under 3 s the margin is half the resend; above, 1500 ms as before.
+    const resendBulk = (turnStartedAt: number, lastResendAt: number, turnMs: number, lastResendMs: number): boolean =>
+      !!lastResendAt && turnStartedAt >= lastResendAt && turnStartedAt - lastResendAt <= 2000 && turnMs > 0
+      && lastResendMs - turnMs > Math.min(1500, lastResendMs * 0.5);
+    // IDENTITY BELT (EVA, same turn: "tag the transcript arriving for a recovery-committed item as echo AT THE
+    // SOURCE, by identity, and the script of the transcription stops mattering"). A resent window that was LOUD
+    // over ≥ 90% of its length is our own playback by construction — his voice over the mouth never fills a
+    // window wall to wall — so a short resend of that shape is echo regardless of what the transcriber wrote.
+    // Bounded to resends ≤ 3 s: a long window can hold him AND leak, and there the residual test rules.
+    const resendLeakShaped = (wasRecovered: boolean, loudShare: number, resentMs: number): boolean =>
+      wasRecovered && loudShare >= 0.9 && resentMs > 0 && resentMs <= 3000;
+    let lastResendLoudShare = 0;   // loud ms / window ms of the last resend (set where the slice is cut)
     // USER BARGES MIND (fire17's law: his voice outranks everything, including the MIND's
     // own audio). While the MIND narrator plays, mic frames are gated (echo-safe) but still
     // observed LOCALLY: sustained loud audio well above speaker-leak level means the human
@@ -2461,6 +2476,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           return;
         }
         const slice = buf.subarray(from, to);
+        lastResendLoudShare = got > 0 ? Math.min(1, loudMs / ((got / 2 / RATE) * 1000)) : 0;
         const tmp = `${archDir}/overlap-${Date.now()}.wav`;
         fs.writeFileSync(tmp, Buffer.concat([archHeader(slice.length), slice]));
         // REENTRANT-SAFE suppress (root cause of the 14:19 mouth outage, call 86130: two
@@ -3651,7 +3667,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (canReprompt && ws.readyState === WebSocket.OPEN) {
           fillerRepromptAt = Date.now(); retryResponse = true; awaitingResponse = true;
           const base = (livePersona || "").trim();
-          try { ws.send(JSON.stringify({ type: "response.create", response: { instructions: `${base}\n\nAnswer the content only. Do not open or close with any readiness or presence phrase — no "I am here", no "with you", no "ready". If there is nothing to add, say one natural word.` } })); }
+          try { ws.send(JSON.stringify({ type: "response.create", response: { instructions: `${base}\n\nAnswer the content only. Do not open or close with any readiness or presence phrase — no "I am here", no "with you", no "ready". Never speak AS the mind and never announce the mind's status ("המוח כאן", "Mind here", "on it") — you are the mouth. If there is nothing to add, say one natural word.` } })); }
           catch { awaitingResponse = false; retryResponse = false; }
         }
       } else {
@@ -5506,8 +5522,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // before the speech inside it ends (every genuine turn in the corpus ran 2.98-104.73s,
             // n=31). The 1500ms FLOOR keeps a LONG resend from making a merged turn — his voice
             // inside a 19.6s window — look bulk-appended on a bare `<`.
-            const bulkAppended = !!lastResendAt && turnStartedAt >= lastResendAt
-              && turnStartedAt - lastResendAt <= 2000 && turnMs > 0 && lastResendMs - turnMs > 1500;
+            const bulkAppended = resendBulk(turnStartedAt, lastResendAt, turnMs, lastResendMs);
+            const leakShaped = resendLeakShaped(wasRecovered, lastResendLoudShare, lastResendMs);
             // RESIDUAL TEST — the sacred rule made structural (fire17: the human is NEVER
             // censored). `conversation.item.delete` removes a WHOLE item, and a recovered item can
             // carry leak AND his live speech together: 44292@15:05:38 was a verbatim MIND tail
@@ -5637,6 +5653,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               say("info", `recovered turn was speaker echo — removed from the model's context, KEPT in the log (sim ${m.score.toFixed(2)}, resent ${Math.round(lastResendMs)}ms vs turn ${turnMs}ms, no residual)`);
               if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
               echoTeeth("recovery");   // the item is gone; a reply born from it must go too, and the next create is held
+              flushReply();
+              break;
+            }
+            // IDENTITY DOOR — the belt above needs the text to MATCH; this one needs nothing from the text:
+            // the resent window was our own playback wall to wall (see resendLeakShaped). 88140 11:21:24:
+            // 'Amorkan, alze.' = 'המוח כאן, על זה.' in Latin letters, sim 0.00, resend 1.5 s loud 1.5 s.
+            // Removed from the model's context, KEPT in the log with the evidence, teeth armed.
+            if (leakShaped && !echoish) {
+              turnsTranscribed++; sessTurnsTranscribed++;
+              say("you", tScript, {
+                echo_deleted_from_context: true, echo_identity: true,
+                echo_sim: Number(m.score.toFixed(2)), echo_recovered: true, echo_belt: `identity${bulkAppended ? "+timing" : ""}`,
+                loud_share: Number(lastResendLoudShare.toFixed(2)),
+                resent_ms: Math.round(lastResendMs), speech_ms: turnMs, item_id: ev.item_id ?? null,
+              });
+              say("info", `recovered turn was our own playback by identity — removed from the model's context, KEPT in the log (loud ${Math.round(lastResendLoudShare * 100)}% of a ${Math.round(lastResendMs)}ms resend, sim ${m.score.toFixed(2)}, turn ${turnMs}ms)`);
+              if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+              echoTeeth("identity");
               flushReply();
               break;
             }
