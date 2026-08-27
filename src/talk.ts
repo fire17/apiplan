@@ -4352,7 +4352,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       // exactly what a local ask would, nothing more. A closed mouth / busy reply is a HOLD, never a drop.
                       const ftext = String(j.forward);
                       const fsrc = String(j.source || "phone-forward");
-                      say("you", ftext, { src: fsrc, forwarded: true });
+                      // ORIGIN fields (EVA's ingest, 2026-08-27): device is not cosmetic — the same words mean different
+                      // actions per device, and EVA dedupes by content so the first-landing copy wins attribution. Carrying
+                      // the originating session + ORIGINAL timestamp makes the forward a delivery detail, never a
+                      // provenance rewrite. Passed through verbatim when the sender provides them.
+                      say("you", ftext, { src: fsrc, forwarded: true,
+                        ...(j.origin_session ? { origin_session: String(j.origin_session) } : {}),
+                        ...(Number.isFinite(Number(j.origin_t)) && Number(j.origin_t) > 0 ? { origin_t: Number(j.origin_t) } : {}) });
                       if (ws.readyState === WebSocket.OPEN && !closing) {
                         try {
                           ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
