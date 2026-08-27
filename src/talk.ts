@@ -114,6 +114,22 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   };
   const transcribeLanguage = (process.env.APIPLAN_TRANSCRIBE_LANGUAGE || "").trim();
   const transcribePrompt = transcribePromptFrom(process.env.APIPLAN_TRANSCRIBE_PROMPT, process.env.APIPLAN_TRANSCRIBE_PROMPT_FILE);
+  // PROMPT ECHO (EVA + MIND, call 88140 2026-08-27 11:23:38 sim 0.62 and 11:25:40 sim 0.92 — 7ea20e3's own
+  // vocabulary hint came back as HIS turn, twice, complete with "Languages: English, Hebrew."). A prompted
+  // transcriber handed no clear speech returns its prompt as the transcription. There is NO utterance behind
+  // such a turn, so no echo guard can ever see it — only the prompt itself can. One token comparison per
+  // finalized turn, language- and script-agnostic: ≥ PROMPT_ECHO_MIN_TOKENS tokens of which ≥ PROMPT_ECHO_SHARE
+  // are prompt vocabulary. The floor is what keeps "כן" / "רגע, תודה" — deliberately IN the vocabulary — real.
+  // Per-segment prompt suppression is not available: the transcription config is fixed at connect.
+  const PROMPT_ECHO_MIN_TOKENS = Math.max(3, envBar("APIPLAN_PROMPT_ECHO_MIN_TOKENS", 5));
+  const PROMPT_ECHO_SHARE = Math.min(1, Math.max(0.5, (Number(process.env.APIPLAN_PROMPT_ECHO_SHARE) || 0.85)));
+  const promptTokens = (t: string): string[] => t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, " ").split(/\s+/).filter(Boolean);
+  const promptVocab = new Set(promptTokens(transcribePrompt));
+  const promptEchoMatch = (t: string, vocab: Set<string>, minTokens: number, share: number): { tokens: number; hits: number; share: number } | null => {
+    const toks = promptTokens(t); if (toks.length < minTokens || vocab.size === 0) return null;
+    const hits = toks.filter((w) => vocab.has(w)).length; const sh = hits / toks.length;
+    return sh >= share ? { tokens: toks.length, hits, share: Number(sh.toFixed(2)) } : null;
+  };
 
   // Structured event log: one JSON line per event, flushed immediately. A launcher TAILS
   // this for live monitoring, and it is how every reliability fix gets verified. Never
@@ -2346,7 +2362,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length}+${bannedClosers().length} phrases bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length}+${bannedClosers().length} phrases promptecho=${promptVocab.size ? `${PROMPT_ECHO_MIN_TOKENS}tok/${PROMPT_ECHO_SHARE}` : "off"} bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -5448,6 +5464,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               pendingMouthReply = false;   // and nothing parked may be released into a caps-closed turn
               flushReply();
               break;
+            }
+
+            // ── PROMPT-ECHO GATE — the transcriber returned its own prompt (see promptEchoMatch) ──
+            // Withheld exactly like a caps-closed turn: deleted from the model, its reply cut, never a
+            // `you` event, never a responder's input. The words are NOT his, so they are logged in
+            // full — the eye that audits this gate needs to see what the transcriber invented.
+            {
+              const pe = tScript ? promptEchoMatch(tScript, promptVocab, PROMPT_ECHO_MIN_TOKENS, PROMPT_ECHO_SHARE) : null;
+              if (pe) {
+                turnsTranscribed++; sessTurnsTranscribed++;
+                say("info", `prompt echo — the transcriber returned its own prompt (${pe.hits}/${pe.tokens} tokens in the vocabulary, share ${pe.share}) — withheld from every responder: ${tScript.slice(0, 160)}`,
+                  { prompt_echo: true, tokens: pe.tokens, hits: pe.hits, share: pe.share, speech_ms: turnMs, item_id: ev.item_id ?? null });
+                if (ev.item_id) { try { ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: ev.item_id })); } catch {} }
+                if (!mindResponse && !closing && lastResponseCreatedAt >= turnStartedAt
+                    && (responseActive ? curResponseBornAt >= turnStartedAt : (speaking || playingUntil > Date.now()))) {
+                  const wasActive = responseActive;
+                  silenceMouth();
+                  say("info", `prompt-echo withhold cut the mouth's reply (${wasActive ? "cancelled in flight" : "audible tail killed"})`, { prompt_echo_cut: true, in_flight: wasActive });
+                }
+                echoHoldUntil = Date.now() + ECHO_HOLD_MS; echoHoldSetAt = Date.now();
+                pendingMouthReply = false;
+                flushReply();
+                break;
+              }
             }
 
             // TEXT BELT. A recovered turn is judged against everything we spoke; a LIVE turn only
