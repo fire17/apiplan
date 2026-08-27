@@ -543,6 +543,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // call from the LOG). ponytail: osascript on demand; CoreAudio listener only if this
   // ever needs to be event-driven.
   let spkState = "unknown"; let spkAt = 0; let mutedSpoken = 0; let spkMutedSince = 0;
+  // SCOPE SEAM (hands 2026-08-27, tsc TS2304 ×7): injectQueue/flushTimer live in the call scope below; speakerCheck runs
+  // here at talk() top scope, so the MUTED-SPEAKER HOLD (7ffb8b79) referenced names that do not exist here — a ReferenceError
+  // inside speakerCheck's .then on the first real speaker unmute (same class as the envBar launch death e088ea7). The call
+  // scope installs the hook once its queue exists; until then the edge is a no-op, never a throw.
+  let onSpeakerAudible: ((since: string) => void) | null = null;
   const speakerCheck = (force = false) => {
     if (!force && Date.now() - spkAt < 5000) return;   // force: the muted-speaker hold polls 1 s while lines wait, and only then
     spkAt = Date.now();
@@ -561,16 +566,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // 13:01:46 into a speaker he had muted at ~12:54 — lost; this read fired 135 ms AFTER
         // playback began). On the muted->audible edge the lines held below flow under the stack
         // law, and the mouth is told BY CODE to open its next reply with the fact.
-        if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && injectQueue.length) {
-          const since = new Date(spkMutedSince || spkAt).toTimeString().slice(0, 5);
-          say("info", `speaker unmuted — ${injectQueue.length} held mind line(s) flow (muted since ${since})`, { speaker_unmuted: true, held: injectQueue.length, muted_since: spkMutedSince });
-          if (ws.readyState === WebSocket.OPEN) {
-            try {
-              ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text",
-                text: `[His speaker was muted since ${since}; ${injectQueue.length} line(s) from the mind were held and will play now. Open your next reply by telling him exactly that, in one short sentence, then answer him.]` }] } }));
-            } catch {}
-          }
-          if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 200);
+        if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && onSpeakerAudible) {
+          onSpeakerAudible(new Date(spkMutedSince || spkAt).toTimeString().slice(0, 5));
         }
         if ((prev === "muted" || prev === "vol0") && (spkState === "ok" || spkState === "low") && mutedSpoken) {
           say("info", `mac output audible again — ${mutedSpoken} line(s) were spoken while ${prev}; he may have missed them (replay from LOG if he asks)`);
@@ -4143,6 +4140,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         if (queueHeldForHim) { t = "I wanted to say this earlier but you were speaking. " + t; queueHeldForHim = false; }
         sendInjected(t, q.who, t === q.text ? q.bytes : undefined, q.speed, q.adaptive);   // a prefixed line is new words — render them
       }
+    };
+    onSpeakerAudible = (since: string) => {   // MUTED-SPEAKER HOLD (MIND spec, call 48629 2026-08-25) — installed here where injectQueue exists
+      if (!injectQueue.length) return;
+      say("info", `speaker unmuted — ${injectQueue.length} held mind line(s) flow (muted since ${since})`, { speaker_unmuted: true, held: injectQueue.length, muted_since: spkMutedSince });
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text",
+            text: `[His speaker was muted since ${since}; ${injectQueue.length} line(s) from the mind were held and will play now. Open your next reply by telling him exactly that, in one short sentence, then answer him.]` }] } }));
+        } catch {}
+      }
+      if (!flushTimer) flushTimer = setTimeout(flushInjectQueue, 200);
     };
     /** {"replay":"last"|"<mind-NNN-*.wav>"} — play a stored narrator render AGAIN (his 13:21 ask), through the very same
      *  gates and player as a fresh line: stack law, muted-speaker hold, one voice, mouth-knows-first. The words come from
