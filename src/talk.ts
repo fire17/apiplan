@@ -991,6 +991,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // replies. Short, no Hebrew letter, no common English word = garble. He speaks Hebrew and English; anything else this
   // short is the recogniser, not him. The transcript is still RECORDED (never-lose) — only the reply is withheld.
   const EN_COMMON = new Set("the a an and or but so if to of in on at for with from by is are was were be been am do does did have has had not no yes ok okay hi hello hey bye thanks thank please what when where who why how which this that these those it its i you he she we they me him her us them my your his our their can could will would should may might must just now then here there also very really good bad fine great sure right wrong stop go come wait listen tell say said talk speak mind mouth eva hands call restart reset reconnect mute unmute volume louder quieter again more less".split(" "));
+  // PRAISE GATE — HEART BY CODE (MIND lane 2026-08-27, his words 11:44:30 call 88140, canon 175: "אתה צריך להגיד לי
+  // בכיף או באהבה ואז מיד לעשות לי לב על המסך, זה מה שסיכמנו לו. למה זה לא קורה?"). The heart law lived as persona
+  // prose only (model discretion); 11:43:44 his 'מדהים, תודה רבה' reached the transcript as 'What do you do about?'
+  // and no heart came. Rule 1: seamlessness lives in the ENGINE. A finalized genuine `you` turn that carries a
+  // praise/thanks word → the heart is fired BY CODE (APIPLAN_PRAISE_CMD, detached, zero model) and the reply for that
+  // turn is constrained to ONE warm word — בכיף / באהבה. Thanks counts on a SHORT turn (his proportion law: "אם עשינו
+  // back and forth קצר כזה ואני אומר לך תודה … במילה אחת"); the praise words count on any length.
+  const PRAISE_WORDS = ["מדהים", "נייס", "מטורף", "יפה", "איזה כיף", "מעולה", "אלוף", "אדיר", "וואו", "nice", "amazing", "awesome", "wow", "great job", "love it"];
+  const THANKS_WORDS = ["תודה", "תודה רבה", "thanks", "thank you"];
+  const PRAISE_THANKS_MAX_TOKENS = 8;
+  const praiseMatch = (t: string): { word: string; kind: "praise" | "thanks" } | null => {
+    const n = ` ${t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, " ").replace(/\s+/g, " ").trim()} `;
+    if (!n.trim()) return null;
+    for (const w of PRAISE_WORDS) if (n.includes(` ${w} `)) return { word: w, kind: "praise" };
+    const toks = n.trim().split(" ").filter(Boolean).length;
+    if (toks <= PRAISE_THANKS_MAX_TOKENS) for (const w of THANKS_WORDS) if (n.includes(` ${w} `)) return { word: w, kind: "thanks" };
+    return null;
+  };
   const garbleTurn = (t: string): boolean => {
     const s = t.trim();
     if (!s || s.length >= 25 || hasHebrew(s)) return false;
@@ -2389,7 +2407,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // pan= rides along because the whole mouth-barge calibration is a LOUDNESS measurement and
     // the stereo knob (canon 023) changes the acoustic field live, mid-call — a forensic reading
     // of a cut must show the gains that were in force when it fired, next to the bars it beat.
-    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length}+${bannedClosers().length} phrases promptecho=${promptVocab.size ? `${PROMPT_ECHO_MIN_TOKENS}tok/${PROMPT_ECHO_SHARE}` : "off"} bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
+    say("info", `bars: duplex=${bargeOn ? "ON(APIPLAN_BARGE_OK)" : o.barge ? "requested-but-OFF(set APIPLAN_BARGE_OK=1)" : "off"} barge=${BARGE_PEAK}/${BARGE_SUSTAIN}ms(onair ×${BARGE_ONAIR_FACTOR}/×${BARGE_ONAIR_MS_FACTOR} ⇒ ${Math.round(BARGE_PEAK * BARGE_ONAIR_FACTOR)}/${Math.round(BARGE_SUSTAIN * BARGE_ONAIR_MS_FACTOR)}ms) mouthbarge=${MOUTH_BARGE_PEAK}/${MOUTH_BARGE_SUSTAIN}ms grace=${MOUTH_BARGE_GRACE}ms killtail=${MOUTH_BARGE_TAIL}ms confirm=${MOUTH_BARGE_CONFIRM}ms recover=${envBar("APIPLAN_RECOVER_PEAK", 2000)} tail=${RECOVER_TAIL_MS}ms echo=${ECHO_BAR}/${ECHO_LIVE_BAR} latch=${LATCH_MS}/${LATCH_HOLD_MS}ms@${LATCH_PEAK}(relatch ${LATCH_RELATCH_MS}ms) mutedwarn=${MUTEDWARN_PEAK} filler=${bannedPhrases().length}+${bannedClosers().length} phrases praise=${PRAISE_CMD ? "heart" : "off"}/${RETRANSCRIBE_CMD ? "retranscribe" : "no-retranscribe"} promptecho=${promptVocab.size ? `${PROMPT_ECHO_MIN_TOKENS}tok/${PROMPT_ECHO_SHARE}` : "off"} bargemuted=${BARGE_WHILE_MUTED ? "ON" : "off"} pan=${stereoEnabled() ? `mouth ${panGains("mouth").l}/${panGains("mouth").r}` : "mono"}`
       + ` trim=mouth ${voiceGain("mouth")}/mind ${voiceGain("mind")} adaptive=${ADAPTIVE_BARS ? `on base ${LEAK_BASE} min ${LEAK_MIN} margin ${LEAK_MARGIN}` : LEAK_LOG ? "measure-only" : "off"}`
       + ` halfduplex=${HD_ON ? `ON(${HD_MODE})` : "off"}${HD_ON ? ` tail=${HD_TAIL}ms` : ""}${HD_ON && bargeOn ? " YIELDED(duplex barge)" : ""}`);
     const framePeak = (v: Uint8Array) => {
@@ -3657,6 +3675,63 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (prevRespId) { prevRespId = null; speaking = false; rec({ ev: "info", rotation: true, text: "predecessor drain cut — the MIND is taking the floor", drain_cut: true }); }
       if (responseActive && !mindResponse) bargeNow();       // still generating: cancel + truncate + stop
       else { stopPlayer(); speaking = false; playingUntil = 0; }   // done generating, still AUDIBLE: kill the tail
+    };
+    /** PRAISE GATE (see PRAISE_WORDS above). Fires the heart by code and constrains this turn's reply to one warm
+     *  word. Idempotent per turn (praiseFiredAt). Never blocks: the heart command is spawned detached. */
+    const PRAISE_CMD = (process.env.APIPLAN_PRAISE_CMD || "").trim();
+    const RETRANSCRIBE_CMD = (process.env.APIPLAN_RETRANSCRIBE_CMD || "").trim();
+    const RETRANSCRIBE_MS = envBar("APIPLAN_RETRANSCRIBE_MS", 15000);   // warm run 2.0 s, cold model load ~14 s (measured 2026-08-27)
+    let praiseFiredAt = 0; let praiseHearts = 0;
+    const praiseGate = (text: string, turnStartedAt: number, via: "realtime" | "retranscript") => {
+      const m = praiseMatch(text); if (!m) return false;
+      if (praiseFiredAt && turnStartedAt && praiseFiredAt >= turnStartedAt) return true;   // once per turn
+      praiseFiredAt = Date.now(); praiseHearts++;
+      let heart = "no APIPLAN_PRAISE_CMD";
+      if (PRAISE_CMD) { try { Bun.spawn([PRAISE_CMD, "heart"], { stdout: "ignore", stderr: "ignore", stdin: "ignore" }); heart = "spawned"; } catch (e) { heart = `spawn failed: ${String(e).slice(0, 80)}`; } }
+      say("info", `heart by code — ${m.kind} "${m.word}" (${via}, #${praiseHearts}, ${heart})`, { praise: true, praise_kind: m.kind, praise_word: m.word, praise_via: via, heart });
+      // ONE WARM WORD. The auto reply for this turn is usually already born (transcript lands after
+      // response.created): cancel it like a barge and re-create with the constraint. Already DONE playing →
+      // nothing to constrain (never a second reply). Not born yet → our create claims it (awaitingResponse).
+      if (mindResponse || closing || suppressAuto || ws.readyState !== WebSocket.OPEN) return true;
+      const bornForTurn = lastResponseCreatedAt >= turnStartedAt;
+      if (bornForTurn && !responseActive && !(speaking || playingUntil > Date.now())) { say("info", "praise reply already spoken — no constraint applied", { praise_reply_done: true }); return true; }
+      if (bornForTurn && responseActive && curResponseBornAt >= turnStartedAt) silenceMouth();
+      const base = (livePersona || "").trim();
+      try {
+        retryResponse = true; awaitingResponse = true;
+        ws.send(JSON.stringify({ type: "response.create", response: { instructions: `${base}\n\nHe just ${m.kind === "praise" ? "praised you" : "thanked you"} ("${text.slice(0, 80)}"). Answer with exactly ONE warm word — בכיף or באהבה — and nothing else. No sentence, no follow-up.` } }));
+        say("info", `praise reply constrained to one word (בכיף / באהבה)`, { praise_reply_constrained: true });
+      } catch { awaitingResponse = false; retryResponse = false; }
+      return true;
+    };
+    /** GARBLE → LOCAL RETRANSCRIPT (the 11:43:44 class: caps ON, mic live, 'מדהים, תודה רבה' returned as
+     *  'What do you do about?'). The never-lose archive holds the audio; slice this turn's window out of the open
+     *  segment, hand it to the local Hebrew whisper (APIPLAN_RETRANSCRIBE_CMD <wav> → text on stdout), log the
+     *  retranscript beside the turn, and run the praise gate on it. Never blocks the event loop; bounded. */
+    let retranscribing = false;
+    const retranscribeTurn = async (tScript: string, turnStartedAt: number, stopAt: number) => {
+      if (!RETRANSCRIBE_CMD || retranscribing || !turnStartedAt || archFd < 0 || !archPath) return;
+      const now = Date.now();
+      const fromMs = Math.max(0, now - (turnStartedAt - 300)); const toMs = Math.max(0, now - ((stopAt || now) + 300));
+      const from = Math.max(0, archBytes - Math.round(fromMs / 1000 * RATE * 2)) & ~1;
+      const to = Math.max(0, archBytes - Math.round(toMs / 1000 * RATE * 2)) & ~1;
+      if (to - from < RATE * 2 * 0.3) return;
+      retranscribing = true;
+      const tmp = `${archDir}/retranscribe-${now}.wav`;
+      try {
+        const fd = fs.openSync(archPath, "r"); const buf = Buffer.alloc(to - from);
+        const got = fs.readSync(fd, buf, 0, to - from, 44 + from); fs.closeSync(fd);
+        if (got < RATE * 2 * 0.3) return;
+        fs.writeFileSync(tmp, Buffer.concat([archHeader(got), buf.subarray(0, got)]));
+        const proc = Bun.spawn([RETRANSCRIBE_CMD, tmp], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
+        const timer = setTimeout(() => { try { proc.kill(); } catch {} }, RETRANSCRIBE_MS);
+        const local = (await new Response(proc.stdout).text()).trim(); clearTimeout(timer);
+        if (!local) { say("info", `garble retranscript: empty (${((got / 2 / RATE)).toFixed(1)}s) — realtime "${tScript.slice(0, 60)}" stands`, { retranscript_empty: true }); return; }
+        say("info", `garble retranscript: "${local.slice(0, 160)}" (local, ${((got / 2 / RATE)).toFixed(1)}s) — realtime read "${tScript.slice(0, 60)}"`,
+          { retranscript: local.slice(0, 400), realtime: tScript.slice(0, 200), turn_started_at: turnStartedAt, seconds: Number((got / 2 / RATE).toFixed(2)) });
+        praiseGate(local, turnStartedAt, "retranscript");
+      } catch (e) { say("info", `garble retranscript failed: ${String(e).slice(0, 120)}`, { retranscript_failed: true }); }
+      finally { retranscribing = false; try { fs.unlinkSync(tmp); } catch {} }
     };
     /** The filler gate's ruling on the reply streaming NOW. START → the reply opened with filler: cancel it like a
      *  barge (cancel + truncate + kill the tail) and re-prompt ONCE per user turn with the persona + a rider
@@ -5752,6 +5827,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (cutWhy.length) { ann.incomplete = strongCut ? "strong" : "weak"; ann.incomplete_why = cutWhy; }
               lastYouText = tScript;   // lane M-A: the self-mute allow-list judges HIS words
               say("you", tScript, (suspect || externalMarked || cutWhy.length) ? ann : undefined);
+              // ── PRAISE GATE + GARBLE RETRANSCRIPT (heart by code; canon 175) ──
+              if (!suspect && !externalMarked) {
+                if (!praiseGate(tScript, turnStartedAt, "realtime") && garbleTurn(tScript)) void retranscribeTurn(tScript, turnStartedAt, turn?.stopAt ?? 0);
+              }
               if (strongCut)
                 say("info", `turn INCOMPLETE (${cutWhy.join("; ")}) — recover before acting`,
                   { incomplete: true, why: cutWhy, turn_started_at: turnStartedAt, turn_stop_at: turn?.stopAt ?? 0, chars: tScript.length });
