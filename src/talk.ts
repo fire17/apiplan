@@ -4343,6 +4343,32 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     } else if (typeof j.adaptive_volume === "boolean" && j.text === undefined) {   // ADAPTIVE VOLUME toggle — both players, from the next line
                       setAdaptive(j.adaptive_volume);
                       say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
+                    } else if (typeof j.forward === "string" && j.forward.trim()) {
+                      // PHONE-FORWARD (his order via droidhand relay, hands canon 180; MIND lane 2026-08-27): a phone-mouth
+                      // ask aimed at the computer executes on the mac mouth's quick tools AT ONCE, as if he said it here.
+                      // Attribution is constitutional: the turn is published tagged src=phone-forward, NEVER a raw local
+                      // you-turn (the cross-device leak class stays closed); the model receives his words VERBATIM as a
+                      // user item and answers with the SAME tools and gates a local ask gets — a forwarded ask authorizes
+                      // exactly what a local ask would, nothing more. A closed mouth / busy reply is a HOLD, never a drop.
+                      const ftext = String(j.forward);
+                      const fsrc = String(j.source || "phone-forward");
+                      say("you", ftext, { src: fsrc, forwarded: true });
+                      if (ws.readyState === WebSocket.OPEN && !closing) {
+                        try {
+                          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+                            content: [{ type: "input_text", text: ftext }] } }));
+                          if (!suppressAuto && !responseActive && !awaitingResponse && !mindBusy) {
+                            ws.send(JSON.stringify({ type: "response.create" }));
+                            awaitingResponse = true;
+                            say("info", `phone forward consumed — executing as if said at the computer (${ftext.length} chars, ${fsrc})`,
+                              { phone_forward: true, chars: ftext.length });
+                          } else {
+                            pendingMouthReply = true; pendingMouthAt = Date.now();
+                            say("info", `phone forward consumed — HELD (${responseActive || awaitingResponse ? "reply in flight" : suppressAuto ? "mouth closed" : "mind busy"}); the hold machinery releases it`,
+                              { phone_forward: true, held: true, chars: ftext.length });
+                          }
+                        } catch {}
+                      }
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined, undefined,
                       j.speed !== undefined ? clampSpeed(j.speed, speedMind) : undefined,   // per-line narrator tempo (MIND picks: technical 1.0, chatty 1.3)
                       typeof j.adaptive_volume === "boolean" ? j.adaptive_volume : undefined);   // per-line EXPRESSIVE bypass (adaptive_volume:false)
