@@ -3434,6 +3434,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const whoCount = (w?: string): number => injectQueue.filter((q) => whoKey(q.who) === whoKey(w)).length;
     mindQueue = injectQueue;   // LANE 15: close() records the lines that never got spoken
     let injectOff = 0;
+    const forwardPath = process.env.APIPLAN_FORWARD_FILE || "";   // the stable cross-relaunch forward channel (launcher pins ~/.livemind/phone-forward.jsonl)
+    let forwardOff = 0;
     // EVA'S VOICE (canon 010/011, fire17 to her: "תבחרי לך קול נעים" — a girl's voice of her
     // own, distinct from the MIND's). Read HERE, once per utterance, exactly like the stereo
     // gains: writing ~/.livemind/eva-voice.txt moves her voice on her very next line — no
@@ -4222,9 +4224,49 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         injectContext(String(meta.text || "(archived narrator render)"), "graceful", meta.who && meta.who !== "mind" ? String(meta.who) : undefined, bytes);
       } catch (e) { say("info", `narrator replay failed: ${String((e as any)?.message ?? e)}`); }
     };
+    // PHONE-FORWARD consumption (his orders, hands canons 180+181; MIND lane 2026-08-27): a phone-mouth ask
+    // aimed at the computer executes on the mac mouth's quick tools AT ONCE, as if he said it here — his phase-1
+    // spec verbatim: "the mouth on the computer should answer - unknowing where the input came from", which is
+    // exactly this shape: the MODEL receives his words verbatim as a role=user item (no origin visible to it),
+    // while the published LOG turn is tagged src=phone-forward + origin fields (never a raw local you-turn — the
+    // cross-device leak class stays closed, EVA attributes to origin regardless of arrival order). Same tools,
+    // same gates as a local ask. A closed mouth / busy reply is a HOLD, never a drop. Reached from BOTH doors:
+    // the inject verb {"forward":…} and the forward FILE the tick tails (DroidHand appends there — one stable
+    // path across relaunches; an inject path dies with its call, the corpse-gate class of 2026-08-27 12:13).
+    const consumeForward = (j: any) => {
+      const ftext = String(j.forward);
+      const fsrc = String(j.source || "phone-forward");
+      const ot = Number(j.origin_t ?? j.t);   // DroidHand's landing line carries t=ms; origin_t wins when both exist
+      say("you", ftext, { src: fsrc, forwarded: true,
+        ...(j.origin_session ? { origin_session: String(j.origin_session) } : {}),
+        ...(Number.isFinite(ot) && ot > 0 ? { origin_t: ot } : {}) });
+      if (ws.readyState === WebSocket.OPEN && !closing) {
+        try {
+          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+            content: [{ type: "input_text", text: ftext }] } }));
+          if (!suppressAuto && !responseActive && !awaitingResponse && !mindBusy) {
+            ws.send(JSON.stringify({ type: "response.create" }));
+            awaitingResponse = true;
+            say("info", `phone forward consumed — executing as if said at the computer (${ftext.length} chars, ${fsrc})`,
+              { phone_forward: true, chars: ftext.length });
+          } else {
+            pendingMouthReply = true; pendingMouthAt = Date.now();
+            say("info", `phone forward consumed — HELD (${responseActive || awaitingResponse ? "reply in flight" : suppressAuto ? "mouth closed" : "mind busy"}); the hold machinery releases it`,
+              { phone_forward: true, held: true, chars: ftext.length });
+          }
+        } catch {}
+      }
+    };
     function startInjectLoop() {
       if (!injectPath) return;
       try { injectOff = Bun.file(injectPath).size || 0; } catch { injectOff = 0; }  // ignore pre-existing lines
+      // FORWARD FILE (canon 181): seek to EOF at arm — "זמן רגעי" means a forward from hours ago must NEVER
+      // execute on a relaunch; stale entries are skipped by construction (DroidHand mirrors every forward to the
+      // MIND's channel anyway, so nothing is lost — it is simply not executed late).
+      if (forwardPath) {
+        try { forwardOff = Bun.file(forwardPath).size || 0; } catch { forwardOff = 0; }
+        say("info", `phone-forward channel armed (${basename(forwardPath)}) — entries before this moment skipped`, { forward_armed: true });
+      }
       const tick = async () => {
         if (closed) return;
         // LANE M-A: a self-mute reopens by itself after SELF_MUTE_MS; the countdown is echoed every 20 s.
@@ -4344,37 +4386,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       setAdaptive(j.adaptive_volume);
                       say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
                     } else if (typeof j.forward === "string" && j.forward.trim()) {
-                      // PHONE-FORWARD (his order via droidhand relay, hands canon 180; MIND lane 2026-08-27): a phone-mouth
-                      // ask aimed at the computer executes on the mac mouth's quick tools AT ONCE, as if he said it here.
-                      // Attribution is constitutional: the turn is published tagged src=phone-forward, NEVER a raw local
-                      // you-turn (the cross-device leak class stays closed); the model receives his words VERBATIM as a
-                      // user item and answers with the SAME tools and gates a local ask gets — a forwarded ask authorizes
-                      // exactly what a local ask would, nothing more. A closed mouth / busy reply is a HOLD, never a drop.
-                      const ftext = String(j.forward);
-                      const fsrc = String(j.source || "phone-forward");
-                      // ORIGIN fields (EVA's ingest, 2026-08-27): device is not cosmetic — the same words mean different
-                      // actions per device, and EVA dedupes by content so the first-landing copy wins attribution. Carrying
-                      // the originating session + ORIGINAL timestamp makes the forward a delivery detail, never a
-                      // provenance rewrite. Passed through verbatim when the sender provides them.
-                      say("you", ftext, { src: fsrc, forwarded: true,
-                        ...(j.origin_session ? { origin_session: String(j.origin_session) } : {}),
-                        ...(Number.isFinite(Number(j.origin_t)) && Number(j.origin_t) > 0 ? { origin_t: Number(j.origin_t) } : {}) });
-                      if (ws.readyState === WebSocket.OPEN && !closing) {
-                        try {
-                          ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
-                            content: [{ type: "input_text", text: ftext }] } }));
-                          if (!suppressAuto && !responseActive && !awaitingResponse && !mindBusy) {
-                            ws.send(JSON.stringify({ type: "response.create" }));
-                            awaitingResponse = true;
-                            say("info", `phone forward consumed — executing as if said at the computer (${ftext.length} chars, ${fsrc})`,
-                              { phone_forward: true, chars: ftext.length });
-                          } else {
-                            pendingMouthReply = true; pendingMouthAt = Date.now();
-                            say("info", `phone forward consumed — HELD (${responseActive || awaitingResponse ? "reply in flight" : suppressAuto ? "mouth closed" : "mind busy"}); the hold machinery releases it`,
-                              { phone_forward: true, held: true, chars: ftext.length });
-                          }
-                        } catch {}
-                      }
+                      consumeForward(j);   // PHONE-FORWARD verb (canon 180/181) — shared with the forward-file tail below
                     } else if (j.text) injectContext(String(j.text), String(j.mode || "graceful"), j.who ? String(j.who) : undefined, undefined,
                       j.speed !== undefined ? clampSpeed(j.speed, speedMind) : undefined,   // per-line narrator tempo (MIND picks: technical 1.0, chatty 1.3)
                       typeof j.adaptive_volume === "boolean" ? j.adaptive_volume : undefined);   // per-line EXPRESSIVE bypass (adaptive_volume:false)
@@ -4384,6 +4396,31 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             }
           }
         } catch {}
+        // PHONE-FORWARD FILE TAIL (canon 181, DroidHand's preferred landing — zero inject writes anywhere):
+        // same cadence and read discipline as the inject channel; only forward-shaped lines are consumed.
+        if (forwardPath) {
+          try {
+            const ff = Bun.file(forwardPath);
+            if (await ff.exists()) {
+              const fsize = ff.size;
+              if (forwardOff > fsize) forwardOff = 0;          // file replaced/truncated
+              if (fsize > forwardOff) {
+                const fchunk = await ff.slice(forwardOff, fsize).text();
+                const fcut = fchunk.lastIndexOf("\n");
+                if (fcut >= 0) {
+                  forwardOff += Buffer.byteLength(fchunk.slice(0, fcut + 1), "utf8");
+                  for (const fln of fchunk.slice(0, fcut).split("\n")) {
+                    const fsl = fln.trim(); if (!fsl) continue;
+                    try {
+                      const fj = JSON.parse(fsl);
+                      if (typeof fj.forward === "string" && fj.forward.trim()) consumeForward(fj);
+                    } catch {}
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
         // CANON 044 WATCHDOG — his live complaint was "לפעמים הוא לא עונה באופן עקבי", and every
         // hold in this file is a promise to speak LATER. A promise nobody keeps is indistinguishable
         // from a mute, so one is force-kept here rather than waiting for the path that parked it.
