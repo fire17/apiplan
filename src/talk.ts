@@ -1437,7 +1437,71 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  which is exactly the "two voices at once" overlap when an injection interrupts.
    *  Kills the DRAINING players too — a finished-generating reply is still coming out of the
    *  speaker, and that tail is what the MIND used to talk over. */
+  // ── ANSWER RELAY TAP (Phase 2 — his order: the mac mouth's answer "מגיע ומנגן כמו שצריך פה בטלפון";
+  // droidhand phase2-audio design §1, MIND routing 2026-08-27). The engine taps its OWN answer bytes and hands
+  // them to the resident daemon over a unix socket; the daemon owns the phone wire. Load-bearing choices:
+  //   · tap the RAW delta buf PRE-pan/PRE-trim/PRE-pace — a room's stereo field, volume knob and player pacing
+  //     are that room's and never travel (design §1.1); the mac speaker path is untouched by construction.
+  //   · never block the audio handler: bounded ring (≤ ~2 s of PCM), drop-oldest counted — a slow phone must
+  //     never stutter his desk (§1.4). No re-encode, no base64 on this hop (loopback, raw blob frames).
+  //   · an absent/failed socket is the NORMAL no-phone case: one info line, no-op, no retry storm (§1.5);
+  //     one reconnect attempt at most per RELAY_RETRY_MS.
+  //   · framing = the phone wire's own: [u32 BE len][type][payload]; type 0 json (begin/text/last/cancel),
+  //     type 2 raw PCM blob (belongs to the last begin on this ordered stream).
+  //   · APIPLAN_RELAY=0 disables the whole tap; APIPLAN_ANSWER_SOCK overrides the path.
+  const RELAY_ON = process.env.APIPLAN_RELAY !== "0";
+  const RELAY_SOCK = process.env.APIPLAN_ANSWER_SOCK || `${LM_HOME}/answer-audio.sock`;
+  const RELAY_RING_MAX = 96_000 * 2;   // ≈2 s of 24 kHz mono PCM16 in flight, max
+  const RELAY_RETRY_MS = 60_000;
+  let relaySock: any = null; let relayUp = false; let relayTriedAt = 0; let relayDropped = 0;
+  let relayRing: Buffer[] = []; let relayRingBytes = 0; let relaySaidOnce = false; let relayResp = "";
+  const relayFrame = (type: number, payload: Buffer): Buffer => {
+    const h = Buffer.alloc(5); h.writeUInt32BE(payload.length + 1, 0); h.writeUInt8(type, 4);
+    return Buffer.concat([h, payload]);
+  };
+  const relayDrain = () => {
+    if (!relayUp || !relaySock) return;
+    while (relayRing.length) {
+      const f = relayRing.shift()!; relayRingBytes -= f.length;
+      try { relaySock.write(f); } catch { relayDown("write failed"); return; }
+    }
+  };
+  const relayDown = (why: string) => {
+    if (relayUp || relaySock) say("info", `answer relay DOWN (${why}) — mac speaker unaffected`, { relay_down: true });
+    try { relaySock?.end(); } catch {}
+    relaySock = null; relayUp = false; relayRing = []; relayRingBytes = 0;
+  };
+  const relayConnect = () => {
+    if (!RELAY_ON || relaySock || Date.now() - relayTriedAt < RELAY_RETRY_MS) return;
+    relayTriedAt = Date.now();
+    try {
+      (Bun as any).connect({ unix: RELAY_SOCK, socket: {
+        open(sock: any) { relaySock = sock; relayUp = true; say("info", `answer relay UP (${RELAY_SOCK})`, { relay_up: true }); relayDrain(); },
+        data() {},
+        close() { relayDown("socket closed"); },
+        error() { relayDown("socket error"); },
+      } }).catch(() => { if (!relaySaidOnce) { relaySaidOnce = true; say("info", `answer relay: no listener at ${RELAY_SOCK} — phone relay off (normal without the daemon)`); } });
+    } catch { if (!relaySaidOnce) { relaySaidOnce = true; say("info", `answer relay: connect unavailable — phone relay off`); } }
+  };
+  const relayPush = (f: Buffer) => {
+    if (!RELAY_ON) return;
+    relayConnect();
+    if (!relaySock && !relayUp) { relayDropped++; return; }
+    relayRing.push(f); relayRingBytes += f.length;
+    while (relayRingBytes > RELAY_RING_MAX && relayRing.length > 1) { const d = relayRing.shift()!; relayRingBytes -= d.length; relayDropped++; }
+    relayDrain();
+  };
+  const relayJson = (o: Record<string, unknown>) => relayPush(relayFrame(0, Buffer.from(JSON.stringify(o), "utf8")));
+  const relayTap = (buf: Buffer, src: string, resp: string) => {
+    if (!RELAY_ON) return;
+    if (resp && resp !== relayResp) { relayResp = resp; relayJson({ begin: true, resp, src, t0: Date.now() }); }
+    relayPush(relayFrame(2, buf));
+  };
+  const relayText = (delta: string, resp: string) => { if (RELAY_ON && delta) relayJson({ text: delta, resp: resp || relayResp }); };
+  const relayEnd = (resp: string) => { if (RELAY_ON && (resp || relayResp)) { relayJson({ last: true, resp: resp || relayResp, dropped: relayDropped, t0: Date.now() }); relayResp = ""; } };
+  const relayCancel = () => { if (RELAY_ON && relayResp) { relayJson({ cancel: true, resp: relayResp, t0: Date.now() }); relayResp = ""; } };
   const stopPlayer = () => {
+    relayCancel();   // Phase 2: the phone flushes its queue in the same beat the mac speaker goes quiet (design §1.3)
     const hadLive = !!player;
     const droppedMs = paceClear();          // canon 013: the un-written queue dies FIRST, so the
     pace.paused = false;                    // kill below only ever silences ≤ LOOKAHEAD ms of pipe
@@ -4237,6 +4301,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       const ftext = String(j.forward);
       const fsrc = String(j.source || "phone-forward");
       const ot = Number(j.origin_t ?? j.t);   // DroidHand's landing line carries t=ms; origin_t wins when both exist
+      // ECHO BELT AT THE CONSUMING END (MIND, 2026-08-27 ~19:00 — live loop on 24790: the phone mic heard the MAC
+      // SPEAKER and forwarded the mouth's own words back as his; each answer fed the next forward). A forward whose
+      // text near-matches the mouth's own recent spoken lines (echoScore vs the rememberSpoken corpus, 90 s window,
+      // the same 0.6 bar the phone's overlap guard uses) is published TAGGED — suspect_echo, never a clean you-turn —
+      // and NEVER given to the model or answered: the loop cannot close at this end even when the phone gate misses.
+      // TAG, never drop (never-lose); his real words never match the mouth's corpus, so nothing of his is gated.
+      const fecho = echoScore(ftext, 90_000);
+      if (fecho.score >= 0.6) {
+        say("you", ftext, { src: fsrc, forwarded: true, suspect_echo: "mac-speaker", echo_sim: Number(fecho.score.toFixed(2)), echo_src: fecho.src.slice(0, 120),
+          ...(j.origin_session ? { origin_session: String(j.origin_session) } : {}),
+          ...(Number.isFinite(ot) && ot > 0 ? { origin_t: ot } : {}) });
+        say("info", `phone forward REFUSED as mac-speaker echo (sim ${fecho.score.toFixed(2)} vs "${fecho.src.slice(0, 60)}") — published tagged, not answered`, { phone_forward_echo: true, echo_sim: Number(fecho.score.toFixed(2)) });
+        return;
+      }
       say("you", ftext, { src: fsrc, forwarded: true,
         ...(j.origin_session ? { origin_session: String(j.origin_session) } : {}),
         ...(Number.isFinite(ot) && ot > 0 ? { origin_t: ot } : {}) });
@@ -4915,6 +4993,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.audio.delta": {
           if (!ev.delta || !prevRespId || (ev.response_id && ev.response_id !== prevRespId)) return;
           const buf = Buffer.from(ev.delta, "base64");
+          relayTap(buf, "drain", prevRespId || "");   // Phase 2 §1.2: a reply spanning a rotation must not go silent in the far room
           if (!mindResponse && lastMouthOutputAt < curResponseBornAt) lastMouthOutputAt = Date.now();   // lane E: the reply became audible
           queueAudio(buf.length);
           paceFeed(stereo ? panChunk(buf, "mouth") : trimMono(buf, "mouth"), (buf.length / 2 / RATE) * 1000);   // canon 013
@@ -4924,7 +5003,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // `speaking` belongs to the PROCESS, not to the socket: the live handler's response.done
           // will never fire for this reply, so if it is not cleared here the flag latches true and
           // the NEXT rotation's quiet gate can never open again.
-          if (prevRespId && ev.response?.id === prevRespId) { prevRespId = null; speaking = false; paceEnd(); rotDrainRelease(); }
+          if (prevRespId && ev.response?.id === prevRespId) { relayEnd(prevRespId); prevRespId = null; speaking = false; paceEnd(); rotDrainRelease(); }
           return;
         case "conversation.item.input_audio_transcription.completed": {
           const t = ev.transcript?.trim(); if (!t) return;
@@ -5292,6 +5371,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       switch (ev.type) {
         case "response.output_audio_transcript.delta":
         case "response.audio_transcript.delta":
+          relayText(String(ev.delta ?? ""), ev.response_id ?? curResponseId ?? "");   // Phase 2 §1.3: the phone echo guard needs the words
           // mouthChars counts what the clamp throws away, so the barge split can be taken
           // against the WHOLE reply instead of the last 2000 chars of it.
           // A CANCELLED response still streams its transcript. Its audio deltas are already
@@ -6358,6 +6438,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // flush(): Bun's stdin is a buffered sink, so without it the audio sits in
             // the buffer instead of reaching the speaker.
             const buf = Buffer.from(ev.delta, "base64");
+            relayTap(buf, mindResponse ? "mind" : "mouth", ev.response_id ?? curResponseId ?? "");   // Phase 2: pre-pan, pre-trim, pre-pace (design §1.1)
             queueAudio(buf.length);                          // MONO bytes: stereo doubles the bytes, never the duration
             itemQueuedMs += (buf.length / 2 / RATE) * 1000;
             // The voice field is applied HERE, per chunk — so a knob edit he makes mid-sentence
@@ -6400,6 +6481,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "response.done":
+          relayEnd(ev.response?.id ?? curResponseId ?? "");   // Phase 2: last:true closes the reply on the phone
           speaking = false;
           responseActive = false;
           awaitingResponse = false;
