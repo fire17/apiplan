@@ -121,7 +121,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // finalized turn, language- and script-agnostic: ≥ PROMPT_ECHO_MIN_TOKENS tokens of which ≥ PROMPT_ECHO_SHARE
   // are prompt vocabulary. The floor is what keeps "כן" / "רגע, תודה" — deliberately IN the vocabulary — real.
   // Per-segment prompt suppression is not available: the transcription config is fixed at connect.
-  const PROMPT_ECHO_MIN_TOKENS = Math.max(3, envBar("APIPLAN_PROMPT_ECHO_MIN_TOKENS", 5));
+  // FLOOR 8, not 5 (EVA calibration on 88140 11:30:51: "אוקיי, סבבה. רגע. תודה." is 4 tokens at share 1.00 —
+  // the prompt is BUILT from his commonest short utterances, so on short turns echo and speech are the same
+  // string and only the ECHO guard, which knows what the mouth played, may judge them. The two real
+  // fabrications were 18 and 30 tokens; nothing genuine of his has ever looked like that.)
+  const PROMPT_ECHO_MIN_TOKENS = Math.max(6, envBar("APIPLAN_PROMPT_ECHO_MIN_TOKENS", 8));
   const PROMPT_ECHO_SHARE = Math.min(1, Math.max(0.5, (Number(process.env.APIPLAN_PROMPT_ECHO_SHARE) || 0.85)));
   const promptTokens = (t: string): string[] => t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, " ").split(/\s+/).filter(Boolean);
   const promptVocab = new Set(promptTokens(transcribePrompt));
