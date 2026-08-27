@@ -2372,6 +2372,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // Leaky sustain behind the re-latch — one loud frame is a chair scrape, not a turn.
     const LATCH_RELATCH_MS = (() => { const v = envBar("APIPLAN_LATCH_RELATCH_MS", 300); return Number.isFinite(v) && v > 0 ? v : 300; })();
     let lastVoiceAt = 0;        // last mic frame at/above LATCH_PEAK, or last you_delta
+    // ROTATION-CUT PARTIAL (V2's 2x2 over 97 calls: 77 orphan you_delta lines, all 13 orphan calls rotating,
+    // zero orphans in 80 non-rotating calls — rotation NECESSARY, not sufficient; no causal story claimed).
+    // The BOUNDARY is closed mechanistically: the open turn's partial transcript is accumulated here, and a
+    // rotation that swaps while it is open (planned past-grace OR cap-death) finalizes it as a TAGGED partial
+    // and carries it into the successor's seed — deltas can no longer exist without a final. Cleared the
+    // moment any real final for the segment lands (live handler or predecessor drain).
+    let openPartial = "";
     let latchVoiceMs = 0;       // leaky accumulator behind the re-latch
     let latchHadVoice = false;  // any voice heard inside THIS latch? (picks which stretch applies)
     // VAD LATCH RELEASE (MIND lane L, call 48629 2026-08-25: 14:16:02 speech_started and NO speech_stopped for 3 min
@@ -4955,6 +4962,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         recap = `${kept[i].who === "he" ? "He" : "You"}: ${kept[i].text}\n${recap}`; carried++;
       }
       recap = recap.trim();
+      // ROTATION-CUT PARTIAL, the carry half: a turn still open at the swap travels as CONTEXT (marked
+      // incomplete — the NEVER-ACT-ON-A-CUT-MESSAGE law rides in the marking) and is finalized in the LOG
+      // as a TAGGED partial you-event, so V2's orphan class (deltas with no final) is structurally closed.
+      // If the predecessor's drain still delivers the real final afterwards, both exist — the partial is
+      // tagged partial:true/rot_cut:true and content-dedupe prefers the full; duplication over loss.
+      if (openPartial.trim()) {
+        say("you", openPartial.trim(), { partial: true, rot_cut: true, src: "rotation-cut" });
+        say("info", `rotation: his open turn finalized as PARTIAL (${openPartial.trim().length} chars) and carried into the successor — a swap can no longer orphan his deltas`,
+          { rotation: true, rot_partial_chars: openPartial.trim().length });
+        recap = (recap + "\nHe (MID-SENTENCE \u2014 cut by the session swap; incomplete, do not act on it, wait for him to continue): " + openPartial.trim()).trim();
+        openPartial = "";
+      }
       const seen = kept.slice(kept.length - carried);
       const persona = (livePersona || "").trim();
       // PERSONA FIRST AND AUTHORITATIVE, RECAP SUBORDINATE. On 11776 the two arrived as peers in
@@ -5035,6 +5054,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           return;
         case "conversation.item.input_audio_transcription.completed": {
           const t = ev.transcript?.trim(); if (!t) return;
+          openPartial = "";   // the predecessor finalized the cut segment after all — the partial record is not needed
           // SACRED — HIS WORDS ARE NEVER WITHHELD, not even at a mid-utterance swap. The
           // predecessor only ever received audio UP TO the swap and the successor only what came
           // AFTER it: the two transcripts are DISJOINT HALVES of one sentence, not two copies of
@@ -5424,7 +5444,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // A transcription delta IS voice: a quiet talker under the peak bar must never let
           // the stuck-latch timeout fire on him. (On this rig deltas arrive in a burst after the
           // commit, so this is a belt — the mic frames are the working signal.)
-          if (ev.delta) { lastVoiceAt = Date.now(); lastDeltaAt = lastVoiceAt; if (userSpeaking) latchHadVoice = true; rec({ ev: "you_delta", text: ev.delta }); }
+          if (ev.delta) { lastVoiceAt = Date.now(); lastDeltaAt = lastVoiceAt; if (userSpeaking) latchHadVoice = true; openPartial += String(ev.delta); rec({ ev: "you_delta", text: ev.delta }); }
           break;
       }
       switch (ev.type) {
@@ -5760,6 +5780,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
           break;
         case "conversation.item.input_audio_transcription.completed":
+          openPartial = "";   // a real final arrived for the open segment — the rotation-cut belt stands down
           transcriptPending = 0;   // lane S: the owed transcript arrived
           // Overlap recovery done: the recovered turn transcribed — reopen the mouth to
           // whatever it was before (MIND's explicit {"autospeak"} always wins, see below).
