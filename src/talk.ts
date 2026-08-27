@@ -2269,6 +2269,13 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     /** Pure, so the test can replay the three clocks of call 48629 against it. */
     const latchSynthDue = (openMs: number, quietMs: number, synthAt: number, segmentOpen: boolean): boolean =>
       segmentOpen && !synthAt && openMs >= LATCH_SYNTH_OPEN_MS && quietMs >= LATCH_SYNTH_QUIET_MS;
+    // MUTED-START LATCH (MIND, call 88140 11:46:50 → 11:49:26, 156 s held, 4 MIND lines merged and dropped): the
+    // server opened a segment right AFTER the duck-mute ('mic muted' THEN speech_started — the reverse order of call
+    // 86130's mute-flip synth), no frames flow while muted, so neither the frame-riding latch nor the mute-flip synth
+    // could ever close it and the MIND queue sat HELD until his next caps-on. A muted mic cannot open a real turn.
+    // Rule (pure, tested): a speech_started that lands while the mic is muted is closed at once — the same silence
+    // flush the caps release uses (canon 124) — unless duplex has the mic open on purpose.
+    const mutedStartSynthDue = (micMuted: boolean, duplexOn: boolean): boolean => micMuted && !duplexOn;
     let latchTimedOut = false;  // the latch was cleared by timeout, not by the server
     // p16 LATCH WATCH (call 37249, 15:57:02→16:00:34): a segment sat open 3m31s with ZERO latch echoes —
     // neither the 4/12s local timeout nor the lane-L synth ever spoke, and the LOG cannot say whether the
@@ -5428,6 +5435,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           latchSynthAt = 0;      // lane L: a fresh segment may be released once
           // Fresh latch — the stuck-latch timeout clock starts here, with no voice heard yet.
           lastVoiceAt = Date.now(); latchVoiceMs = 0; latchHadVoice = false; latchTimedOut = false;
+          if (mutedStartSynthDue(micMuted, bargeOn)) {   // see mutedStartSynthDue — 88140 11:46:50
+            releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
+            userSpeaking = false; latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;
+            lastSpeechStopAt = Date.now(); lastSpeechMs = 0; latchSynthAt = Date.now();
+            say("info", `speech_started while the mic is muted — stop synthesized at once (a muted mic cannot open a turn; flushing ${RELEASE_FLUSH_MS}ms of silence so the server closes the segment)`,
+              { muted_start_synth: true, flush_ms: RELEASE_FLUSH_MS });
+            if (injectQueue.length) setTimeout(flushInjectQueue, 2600);   // the MIND queue is not held behind a turn that never was
+            break;
+          }
           // Supersede fix (EVA's 17:01 question, proven real): the held-reply clear used to
           // happen HERE, at speech_started — before the turn's duration is even knowable. A
           // noise blip (<minSpeech, frequent at VAD 500) would clear the hold and then its own
