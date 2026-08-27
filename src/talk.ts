@@ -1038,6 +1038,11 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // spoken AFTER the live persona update carrying it — so the ban is code (rule 1). The list lives in settings.json
   // `banned_phrases` (live, 2 s cache); the default is the persona law's own list, verbatim.
   const FILLER_DEFAULT = ["אני איתך", "אני כאן איתך", "אני פה איתך", "אני כאן", "אני פה", "אני מוכן", "לכל המשך", "אני איתך להמשיך", "שומע אותך ברור", "אני פה איתכם", "אני כאן איתכם", "לגמרי איתכם", "אני איתכם"];
+  // ONE VOICE, engine half (MIND rider + EVA 2026-08-27; 88140 11:21:21 the mouth's re-prompted reply was 'המוח כאן, על
+  // זה.' — the MIND's identifying prefix, in Hebrew, from the MOUTH). His law: he tells the tiers apart by the prefix,
+  // so a mouth reply that OPENS with it is a lie about who is speaking. Always on, never settings-driven: the mouth
+  // may not begin a reply with the mind prefix in any language; the filler gate cancels it and re-prompts once.
+  const MIND_PREFIX_BAN = ["mind here", "the mind here", "המוח כאן", "המוח פה", "מוח כאן", "המוח איתך", "המוח על זה", "המוח מטפל"];
   const normFiller = (t: string): string => t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, "").replace(/\s+/g, " ").trim();
   /** Where a banned phrase sits in a reply so far. `start` = inside the first `startChars` normalised chars
    *  (the reply OPENED with filler → cancel + re-prompt); `end` = later (a closer → truncate at its boundary).
@@ -3655,7 +3660,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
      *  (response.instructions is an OVERRIDE, so the persona travels with it). END → a closer: remember where it
      *  begins; response.done knows the reply's audio length and cuts playback there. MIND lines never enter here. */
     const fillerCheck = () => {
-      const m = fillerMatch(fillerBuf, bannedPhrases(), FILLER_START_CHARS);
+      const m = fillerMatch(fillerBuf, bannedPhrases(), FILLER_START_CHARS)
+        ?? (() => { const p = fillerMatch(fillerBuf, MIND_PREFIX_BAN, FILLER_START_CHARS); return p && p.kind === "start" ? p : null; })();
       if (!m) return;
       fillerDone = true;
       if (m.kind === "start") {
