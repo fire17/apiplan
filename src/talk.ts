@@ -4485,6 +4485,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const emptyRetryDue = (status: string, mind: boolean, toolOnly: boolean, canAnswer: boolean, speaking: boolean, retriedAt: number, turnStart: number): boolean =>
       EMPTY_RETRY && status === "completed" && !mind && !toolOnly && canAnswer && !speaking && retriedAt < turnStart;
     const ANSWER_WATCH_MS = Number(process.env.APIPLAN_ANSWER_WATCH_MS) || 2500;
+    // ANSWERED-BY-NOBODY RESURRECTION (EVA's measured flow lane, 2026-08-27; 88140 11:36:49 — "מה אחים אתה שומע אותי?…"
+    // a reply was created and said NOTHING, and the next thing in the LOG was his own turn 98 s later). The watch below
+    // already excludes every DELIBERATE silence (mouth closed, mind answered, something in flight) before it prints;
+    // when it still fires, the turn is owed an answer — fire the ONE resurrection the engine already owns, on the same
+    // per-turn latch as the empty retry (emptyRetryAt < turnStart) so a late self-recovery (EVA's 4th case, +1.1 s)
+    // and this can never double-answer: whichever comes first spends the latch. APIPLAN_NOBODY_RESURRECT=0 disables.
+    const NOBODY_RESURRECT = process.env.APIPLAN_NOBODY_RESURRECT !== "0";
+    const nobodyResurrectDue = (on: boolean, retriedAt: number, turnStart: number, wsOpen: boolean, mind: boolean, closingNow: boolean): boolean =>
+      on && retriedAt < turnStart && wsOpen && !mind && !closingNow;
     /** Exclusions are RECORDED, not silent — one line per reason per window. A bare `return` made
      *  the one cause-agnostic instrument indistinguishable from an instrument that never armed,
      *  and `suppress_auto` stuck true across a seam is itself a failure hypothesis. */
@@ -4522,6 +4531,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           responses_cancelled: responsesCancelled, responses_empty: responsesEmpty,
           turns_transcribed: turnsTranscribed, rot_n: rotN };
         if (ROT_ON) say("info", line, extra); else rec({ ...extra, ev: "info", text: line });
+        if (nobodyResurrectDue(NOBODY_RESURRECT, emptyRetryAt, turnStart, ws.readyState === WebSocket.OPEN, mindResponse, closing)) {
+          emptyRetryAt = Date.now();                                   // the one shot this turn gets — shared with the empty retry
+          retryResponse = true; awaitingResponse = true;
+          try {
+            ws.send(JSON.stringify({ type: "response.create" }));
+            say("info", `unanswered turn RESURRECTED — one response.create, ${((Date.now() - turnAt) / 1000).toFixed(1)}s after his turn (streak ${unansweredStreak})`, { nobody_resurrected: true, streak: unansweredStreak });
+          } catch { awaitingResponse = false; retryResponse = false; }
+        }
       }, ANSWER_WATCH_MS);
     };
 
