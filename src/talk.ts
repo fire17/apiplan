@@ -1454,6 +1454,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   const RELAY_RING_MAX = 96_000 * 2;   // ≈2 s of 24 kHz mono PCM16 in flight, max
   const RELAY_RETRY_MS = 60_000;
   let relaySock: any = null; let relayUp = false; let relayTriedAt = 0; let relayDropped = 0;
+  let relayInBuf: Buffer = Buffer.alloc(0);
+  let onPhoneBarge: ((resp: string, heardMs: number) => void) | null = null;   // installed by the call scope (scope law — never reference call names here)
   let relayRing: Buffer[] = []; let relayRingBytes = 0; let relaySaidOnce = false; let relayResp = "";
   const relayFrame = (type: number, payload: Buffer): Buffer => {
     const h = Buffer.alloc(5); h.writeUInt32BE(payload.length + 1, 0); h.writeUInt8(type, 4);
@@ -1477,7 +1479,23 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     try {
       (Bun as any).connect({ unix: RELAY_SOCK, socket: {
         open(sock: any) { relaySock = sock; relayUp = true; say("info", `answer relay UP (${RELAY_SOCK})`, { relay_up: true }); relayDrain(); },
-        data() {},
+        data(_sock: any, chunk: Buffer) {
+          // BACKCHANNEL (§2.3/§3.4): the daemon writes ack frames back on this socket — the only one that
+          // matters here is a phone BARGE, which must reach response.cancel + truncate within one chunk period.
+          relayInBuf = Buffer.concat([relayInBuf, chunk]);
+          while (relayInBuf.length >= 5) {
+            const len = relayInBuf.readUInt32BE(0);
+            if (relayInBuf.length < 4 + len) break;
+            const type = relayInBuf.readUInt8(4); const payload = relayInBuf.subarray(5, 4 + len);
+            relayInBuf = relayInBuf.subarray(4 + len);
+            if (type === 0) {
+              try {
+                const j = JSON.parse(payload.toString("utf8"));
+                if (j.barge === true) onPhoneBarge?.(String(j.resp || ""), Number(j.heard_ms) || 0);
+              } catch {}
+            }
+          }
+        },
         close() { relayDown("socket closed"); },
         error() { relayDown("socket error"); },
       } }).catch(() => { if (!relaySaidOnce) { relaySaidOnce = true; say("info", `answer relay: no listener at ${RELAY_SOCK} — phone relay off (normal without the daemon)`); } });
@@ -4334,6 +4352,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
         } catch {}
       }
+    };
+    // PHONE BARGE (Phase 2 §3.4 — "a barge in the far room is a barge"; the room he is IN owns audio_end_ms).
+    // Installed here where ws/curResponseId/curItemId/cancelledResponses/stopPlayer exist; the top-scope relay
+    // socket calls it when the daemon acks {barge:true, heard_ms} — the phone's playback head, never our clock.
+    onPhoneBarge = (resp: string, heardMs: number) => {
+      say("info", `phone BARGE — his ear on the phone cut the reply at ${heardMs}ms (resp ${resp.slice(0, 16)})`, { phone_barge: true, heard_ms: heardMs, resp });
+      if (resp) cancelledResponses.add(resp);
+      if (curResponseId && (resp === curResponseId || !resp)) { try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+      if (curItemId) { try { ws.send(JSON.stringify({ type: "conversation.item.truncate", item_id: curItemId, content_index: 0, audio_end_ms: Math.round(heardMs) })); } catch {} }
+      stopPlayer();   // mirror mode: his voice at the phone silences the desk too — one voice, one cut
     };
     function startInjectLoop() {
       if (!injectPath) return;
