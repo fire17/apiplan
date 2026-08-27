@@ -125,7 +125,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // the prompt is BUILT from his commonest short utterances, so on short turns echo and speech are the same
   // string and only the ECHO guard, which knows what the mouth played, may judge them. The two real
   // fabrications were 18 and 30 tokens; nothing genuine of his has ever looked like that.)
-  const PROMPT_ECHO_MIN_TOKENS = Math.max(6, envBar("APIPLAN_PROMPT_ECHO_MIN_TOKENS", 8));
+  // (top-of-talk scope: envBar is defined deeper, inside the call body — using it here threw 'envBar is not defined'
+  //  at launch and killed two relaunches instantly on 2026-08-27 12:13/12:14. Parse locally.)
+  const PROMPT_ECHO_MIN_TOKENS = Math.max(6, (() => { const v = Number(process.env.APIPLAN_PROMPT_ECHO_MIN_TOKENS); return Number.isFinite(v) && v > 0 ? v : 8; })());
   const PROMPT_ECHO_SHARE = Math.min(1, Math.max(0.5, (Number(process.env.APIPLAN_PROMPT_ECHO_SHARE) || 0.85)));
   const promptTokens = (t: string): string[] => t.toLowerCase().replace(/['"’`.,!?;:()\-–—]+/g, " ").split(/\s+/).filter(Boolean);
   const promptVocab = new Set(promptTokens(transcribePrompt));
