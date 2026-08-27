@@ -9,7 +9,7 @@
 import { join } from "node:path";
 import { STATE_DIR, readJson, writeJson } from "./platform.ts";
 
-export type ProviderId = "anthropic" | "openai";
+export type ProviderId = "anthropic" | "openai" | "google";
 export type Model = {
   id: string;             // the wire id, e.g. "claude-opus-5"
   provider: ProviderId;
@@ -26,6 +26,9 @@ export type Model = {
  * this file never has to be edited when models ship. Kept so a fresh machine with
  * no network still resolves every alias.
  */
+/** Google serves exactly three, and they ride in the WIRE ID rather than the body. */
+export const GOOGLE_EFFORTS = ["low", "medium", "high"];
+
 const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string[] }[]> = {
   anthropic: [
     { id: "claude-opus-5", label: "Claude Opus 5" },
@@ -39,6 +42,17 @@ const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string
     { id: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5" },
     { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
     { id: "claude-opus-4-1-20250805", label: "Claude Opus 4.1" },
+  ],
+  google: [
+    // Read live from `agy models` on 2026-08-27 against the Antigravity subscription.
+    // The EFFORT is part of Google's wire id (gemini-3.7-flash-low), unlike OpenAI where it
+    // is a request field — so these ids carry family/variant only and the provider appends
+    // the effort in build(). Baking it in here would break the alias law: `gemini` must mean
+    // the newest gemini, not one arbitrary effort of it.
+    { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", efforts: GOOGLE_EFFORTS },
+    { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash", efforts: GOOGLE_EFFORTS },
+    { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", efforts: GOOGLE_EFFORTS },
+    { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro", efforts: ["low", "high"] },
   ],
   openai: [
     { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh"] },
@@ -69,16 +83,40 @@ function parseOpenai(id: string, label: string, efforts?: string[]): Model | nul
   if (!m) return null;
   return { id, provider: "openai", family: "gpt", version: m[2].split(".").map(Number), variant: m[3], label, efforts };
 }
+/** "gemini-3.7-flash" → family gemini, version [3,7], variant flash. A trailing effort
+ *  (…-low) is NOT part of the model identity — the provider appends it at call time. */
+function parseGoogle(id: string, label: string, efforts?: string[]): Model | null {
+  const m = id.match(/^gemini-([\d.]+)-(flash|pro)(?:-(?:low|medium|high))?$/);
+  if (!m) return null;
+  return { id: `gemini-${m[1]}-${m[2]}`, provider: "google", family: "gemini",
+           version: m[1].split(".").map(Number), variant: m[2], label,
+           efforts: efforts ?? (m[2] === "pro" ? ["low", "high"] : GOOGLE_EFFORTS) };
+}
+
+/**
+ * One parser per provider, in a TABLE.
+ *
+ * Both call sites below used to pick the parser with a two-way conditional on the provider id.
+ * Adding a third provider without changing both would have routed every gemini id to the
+ * OpenAI parser, which returns null for them — so Google would have listed ZERO models with no
+ * error at all: exactly the silent truncation `unparseable()` exists to report. A table cannot
+ * fail that way, because a new ProviderId with no entry here is a compile error.
+ */
+const PARSERS: Record<ProviderId, (id: string, label: string, efforts?: string[]) => Model | null> = {
+  anthropic: parseAnthropic,
+  openai: parseOpenai,
+  google: parseGoogle,
+};
 
 /** Which of these ids this registry can actually address (exported so callers can
  *  report what was dropped instead of silently truncating a provider's list). */
 export function unparseable(p: ProviderId, raw: { id: string }[]): string[] {
-  const parse = p === "anthropic" ? parseAnthropic : parseOpenai;
+  const parse = PARSERS[p];
   return raw.filter((r) => !parse(r.id, "")).map((r) => r.id);
 }
 
 function normalizeList(p: ProviderId, raw: { id: string; label: string; efforts?: string[] }[]): Model[] {
-  const parse = p === "anthropic" ? parseAnthropic : parseOpenai;
+  const parse = PARSERS[p];
   return raw.map((r) => parse(r.id, r.label, r.efforts)).filter(Boolean) as Model[];
 }
 const cmpVersion = (a: Model, b: Model) => {
@@ -93,7 +131,7 @@ const cmpVersion = (a: Model, b: Model) => {
  * a model lookup must not add latency to a call.
  */
 export function models(p?: ProviderId): Model[] {
-  const ps: ProviderId[] = p ? [p] : ["anthropic", "openai"];
+  const ps: ProviderId[] = p ? [p] : ["anthropic", "openai", "google"];
   const out: Model[] = [];
   for (const id of ps) {
     const cached = readJson<{ fetched_at?: number; models?: any[] }>(CACHE(id), {});
