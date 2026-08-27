@@ -366,14 +366,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // fallback in sendInjected) comes back as an ordinary mouth transcript, arrives here long after
   // the flag that would have classified it was cleared, and so used to be filed as the mouth's own
   // words — the one path on which "Mind here —" survived into a successor's seed.
-  const pending: Array<{ text: string; mind: boolean }> = [];
+  // FILLER-LOG (MIND, 88140 11:21:13-15): a reply the filler gate CANCELLED mid-flight still printed as a plain
+  // `model` line, so a reader counted it as spoken. A cancelled reply's record now carries cancelled:true and the
+  // audible estimate heard_ms — the text stays verbatim (our words, kept), the flag says how much of it was heard.
+  const pending: Array<{ text: string; mind: boolean; cancelled?: boolean; heard_ms?: number }> = [];
   let replyTimer: ReturnType<typeof setTimeout> | null = null;
   const flushReply = () => {
     if (replyTimer) { clearTimeout(replyTimer); replyTimer = null; }
     while (pending.length) {
       const p = pending.shift()!;
       mindNarrating = p.mind;                     // classification only — the record and the text are identical
-      try { say("model", p.text); } finally { mindNarrating = false; }
+      try { say("model", p.text, p.cancelled ? { cancelled: true, heard_ms: p.heard_ms ?? 0 } : undefined); } finally { mindNarrating = false; }
     }
   };
 
@@ -3667,8 +3670,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       if (m.kind === "start") {
         fillerCancelled++;
         const canReprompt = fillerRepromptAt < lastRealTurnStart && !suppressAuto;
-        say("info", `filler cancelled: "${m.phrase}" at ${m.pos} (#${fillerCancelled})${canReprompt ? " — re-prompting once: answer the content only" : " — re-prompt already spent for this turn"}`,
-          { filler_cancelled: true, phrase: m.phrase, pos: m.pos, reprompt: canReprompt });
+        const heardSoFar = itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : 0;
+        say("info", `filler cancelled: "${m.phrase}" at ${m.pos} (#${fillerCancelled}, ~${Math.round(heardSoFar)}ms audible before the cut)${canReprompt ? " — re-prompting once: answer the content only" : " — re-prompt already spent for this turn"}`,
+          { filler_cancelled: true, phrase: m.phrase, pos: m.pos, reprompt: canReprompt, heard_ms: Math.round(heardSoFar) });
         if (responseActive) bargeNow(); else { stopPlayer(); speaking = false; playingUntil = 0; }
         if (canReprompt && ws.readyState === WebSocket.OPEN) {
           fillerRepromptAt = Date.now(); retryResponse = true; awaitingResponse = true;
@@ -6140,7 +6144,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // `pendingMindHistory` is set ONLY by the narrator-fallback path and is still set here
             // (it is cleared at response.done, which follows this event) — so it is the exact tell
             // that these words are the MIND's line coming back through the mouth.
-            pending.push({ text: ev.transcript.trim(), mind: mindResponse && !!pendingMindHistory });
+            const ridDone = ev.response_id ?? curResponseId ?? "";
+            const wasCancelledReply = !!ridDone && cancelledResponses.has(ridDone);
+            const heardMsDone = wasCancelledReply && itemFirstDeltaAt ? Math.max(0, Math.min(Date.now() - itemFirstDeltaAt, itemQueuedMs)) : undefined;
+            pending.push({ text: ev.transcript.trim(), mind: mindResponse && !!pendingMindHistory, ...(wasCancelledReply ? { cancelled: true, heard_ms: Math.round(heardMsDone ?? 0) } : {}) });
             replyTimer = setTimeout(flushReply, 2000);   // transcript never came; print anyway
           }
           break;
