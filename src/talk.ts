@@ -137,6 +137,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     return sh >= share ? { tokens: toks.length, hits, share: Number(sh.toFixed(2)) } : null;
   };
 
+  // THE CUT FACT (S153, BARGE lane B18 — fire17 voice call 415 15:13:32: the mouth answered "where did
+  // I cut you?" from feeling; the engine computes the cut exactly and only PRINTED it). Pure text
+  // builders at module scope: barge/tools/cut_fact.py is the reference implementation and
+  // barge/research/golden/cut-facts-livemind-415.json pins these strings byte-for-byte —
+  // hands/tests/cut-fact.test.mjs diffs them. Change either side only together with the fixture.
+  const cutFactText = (seq: number, heardMs: number, queuedMs: number, heard: string, remainder: string): string => {
+    const h = heard.trim();
+    const words = h.split(/\s+/).filter(Boolean);
+    const lastWord = words.length ? words[words.length - 1] : "";
+    const body = !h
+      ? `He heard NONE of that reply — you were cut ${heardMs}ms into ${queuedMs}ms, before any word reached him.`
+      : `He HEARD ${heardMs}ms of the ${queuedMs}ms you had queued. The last words that actually reached his ears were: "${h.slice(-120)}" — the final word he heard is "${lastWord}". He did NOT hear: "${remainder.trim().slice(0, 200)}".`;
+    return `[MECHANICAL CUT RECORD #${seq} — absorb silently, do NOT respond to this, do NOT mention receiving it. He interrupted you. This is measured by code, not estimated. ${body} If he asks where he cut you, where you stopped, or what the last thing you said was, answer from THIS RECORD ONLY, exactly and briefly. Never answer that question from feeling, impression, or from what you had generated — you generate ahead of what he hears, so your own sense of where you were is always WRONG. This record supersedes any earlier cut record.]`;
+  };
+  const cutRetractionText = (seq: number, leakShaped: boolean): string => leakShaped
+    ? `[CUT RECORD #${seq} RETRACTED — that was our own speaker leak, not him. Disregard it entirely.]`
+    : `[CUT RECORD #${seq} RETRACTED — nothing confirmed that cut; treat it as uncertain and never claim an interruption from it.]`;
+
   // Structured event log: one JSON line per event, flushed immediately. A launcher TAILS
   // this for live monitoring, and it is how every reliability fix gets verified. Never
   // write audio bytes or the bearer token here.
@@ -667,6 +685,30 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // half and by saveMindState (LANE 15), so a call that dies mid-barge still resumes.
   // `confirmed` is filled a beat later: null = still waiting, false = nothing followed the cut
   // (a possible self-barge on speaker leak — the record is then discarded, never resumed).
+  // B18 senders (call scope: ws/closed/say live here; the text is built by the module-scope pure
+  // builders above). An item.create generates NOTHING (see the design note beside the preview
+  // item) — this cannot make the mouth start talking. APIPLAN_CUT_FACT=0 disables both.
+  let cutFactSeq = 0;
+  const sendCutFact = (b: { heardMs: number; queuedMs: number; heard: string; remainder: string }): number => {
+    if (process.env.APIPLAN_CUT_FACT === "0" || closed || ws.readyState !== WebSocket.OPEN) return 0;
+    const seq = ++cutFactSeq;
+    const words = b.heard.trim().split(/\s+/).filter(Boolean);
+    try {
+      ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system",
+        content: [{ type: "input_text", text: cutFactText(seq, b.heardMs, b.queuedMs, b.heard, b.remainder) }] } }));
+      say("info", `cut fact sent to the mouth — last word heard "${words.length ? words[words.length - 1] : "(none)"}" (${b.heardMs}/${b.queuedMs}ms)`,
+        { cut_fact: true, seq, heard_ms: b.heardMs, queued_ms: b.queuedMs });
+    } catch {}
+    return seq;
+  };
+  const sendCutRetraction = (seq: number, leakShaped: boolean) => {
+    if (!seq || process.env.APIPLAN_CUT_FACT === "0" || closed || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system",
+        content: [{ type: "input_text", text: cutRetractionText(seq, leakShaped) }] } }));
+      say("info", `cut fact #${seq} RETRACTED (${leakShaped ? "leak-shaped" : "unconfirmed"})`, { cut_fact_retracted: true, seq, leak_shaped: leakShaped });
+    } catch {}
+  };
   let mouthBarge: {
     at: number; heardMs: number; queuedMs: number; itemId: string | null; responseId: string | null;
     cancelled: boolean; said: string; heard: string; remainder: string; peak: number; sustainMs: number;
@@ -2944,6 +2986,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     leak_ref: leakRef || undefined, bar_scale: barScale !== 1 ? Number(barScale.toFixed(3)) : undefined,
                     sustain_ms: sustained, cancelled: cancelling, item_id: itemId });
                 saveMindState(undefined, true);   // FORCED: a cut is the one thing that must survive a SIGKILL
+                const mbSeq = sendCutFact(mb);   // B18: same tick as the truncate — he may ask in his next breath
                 // SELF-REPORTING MIS-TUNE. A real barge is followed by his turn (the gate reopens
                 // after the kill tail), by the recovered audio of what he said under the playback
                 // (a resend commits), or by the resume half consuming this record. None of the
@@ -2970,6 +3013,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       }
                       return;
                     }
+                    // B18 failure-mode 1: a false cut fact left standing makes the mouth confidently
+                    // report an interruption that never happened — worse than the bug being fixed. Any
+                    // unconfirmed record is retracted for the MODEL. The P0-B distinction below only
+                    // shades the wording: a peak clearing the leak floor is retracted as UNCERTAIN
+                    // (never asserted as leak), a leak-shaped one as leak.
+                    sendCutRetraction(mbSeq, !(leakRef > 0 && pk > leakRef * LEAK_ESCALATE_RATIO));
                     // REDTEAM (P0-B) — DO NOT ESCALATE AGAINST HIM. "Unconfirmed" means the three
                     // confirmation channels stayed quiet; it does NOT mean leak. The engine already
                     // measures the leak floor (leakRef, the median grace-window peak of our own
@@ -3842,6 +3891,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             heard_chars: heardChars, chars: full, peak: mbD.peak || undefined,
             sustain_ms: mbD.sustainMs || undefined, item_id: curItemId });
         saveMindState(undefined, true);   // FORCED: a cut is the one thing that must survive a SIGKILL
+        const mbDSeq = sendCutFact(mbD);   // B18: duplex site — a patch that touches only the local rig fixes only speakers
         // SELF-DISARM (redteam S3). Same shape as the local cut's MOUTH_BARGE_CONFIRM belt:
         // a REAL cut is followed by his turn, by recovered audio, or by the resume consuming
         // the record. Two duplex cuts in a row that nothing follows means the server VAD is
@@ -3858,6 +3908,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             if (closed || mbD.confirmed !== null) return;
             mbD.confirmed = mutedAtCut || mbD.consumed || speechStartedAt !== seenAt || lastResendAt !== resendAt;
             if (mbD.confirmed) { duplexUnconfirmed = 0; return; }
+            sendCutRetraction(mbDSeq, false);   // B18: duplex has no leak-floor read — retract as uncertain, never as leak
             if (++duplexUnconfirmed >= 2 && bargeOn) {
               bargeOn = false;
               // Retreating to half-duplex means ducked() starts dropping mic frames during every
@@ -4826,10 +4877,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           const m = echoScore(t, 45000);
           const echoish = m.score >= ECHO_LIVE_BAR;
           if (echoish) say("info", `possible speaker echo on the predecessor tail — turn FLAGGED, not removed (text${prevSpanning ? ", spans the swap" : ""}); it is kept out of the successor's context, never out of the log`);
+          // B79 residual 2 (MIND ruling 2026-08-27): the drain NEVER gates — it TAGS. A drain turn
+          // matching the transcriber-prompt signature is published (never-lose outranks filtering on
+          // a drain: a mid-swap fragment has no duplicate anywhere) but marked SUSPECT-ECHO in the
+          // event itself, and it moves NO mechanism: it is not carried into the successor's context.
+          const pecho = promptEchoMatch(t, promptVocab, PROMPT_ECHO_MIN_TOKENS, PROMPT_ECHO_SHARE);
           say("you", t, { src: "predecessor-tail", rotation: true, rot_n: rotN,
             ...(prevSpanning ? { partial_before_swap: true } : {}),
-            ...(echoish ? { echo_suspect: true, echo_sim: Number(m.score.toFixed(2)), echo_belt: "text", echo_src: m.src.slice(0, 200) } : {}) });
-          if (!echoish) prevTail.push(t);
+            ...(echoish ? { echo_suspect: true, echo_sim: Number(m.score.toFixed(2)), echo_belt: "text", echo_src: m.src.slice(0, 200) } : {}),
+            ...(pecho ? { suspect_echo: "transcriber-prompt", prompt_echo_share: pecho.share, prompt_echo_hits: `${pecho.hits}/${pecho.tokens}` } : {}) });
+          if (!echoish && !pecho) prevTail.push(t);
           return;
         }
         case "error":
