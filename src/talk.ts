@@ -3429,7 +3429,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // response TEXT-MODE — its audio deltas are dropped at the player (not one syllable aloud, by
     // construction), while its transcript streams as {"ev":"typed_reply"} LOG events the bridge
     // carries into the pill. Caps ON leaves every path byte-identical.
+    // TURN-SCOPED, not response-scoped (his live catch 21:26, call 25060: a caps-off typed ask
+    // answered through a TOOL spoke aloud — the post-tool follow-up response carries a NEW id the
+    // one-shot marking never saw; same class as the weld follow-on plumbing). While the typed
+    // turn's answer cycle is OPEN, EVERY response created inherits TEXT-MODE; the window closes on
+    // the first done response with no function_call (the chain's real answer), on genuine speech
+    // (his voice outranks a lingering window — a spoken turn must never be wrongly silenced), or
+    // on a 90s belt (a stuck chain fails toward speech, like every caps-sensor seam here).
     let typedTextModePending = false;
+    let typedTurnOpen = false;
+    let typedTurnOpenedAt = 0;
     const textModeResponses = new Set<string>();
     let imgSeq = 0;
     const pendingImages = new Map<string, { path: string; at: number; follow?: boolean }>();
@@ -5646,14 +5655,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.created":
           curResponseId = ev.response?.id ?? null;
           curResponseBornAt = Date.now();
-          // canon 194: the response a TEXT-MODE typed turn forced — remember its id so the audio
-          // gate below (delta handler) can drop its sound. Consumed here, exactly once.
-          if (typedTextModePending) {
-            typedTextModePending = false;
-            if (curResponseId) {
-              textModeResponses.add(curResponseId);
-              say("info", `typed reply TEXT-MODE — audio suppressed for ${curResponseId}`, { typed_text_mode: true, resp: curResponseId });
-            }
+          // canon 194: while a TEXT-MODE typed turn's answer cycle is open, EVERY created response
+          // inherits the mode — the tool-chain follow-up carries a new id and spoke aloud when the
+          // marking was one-shot (his live catch, call 25060). 90s belt: a stuck chain reopens the
+          // voice rather than silencing the mouth indefinitely.
+          if (typedTurnOpen && Date.now() - typedTurnOpenedAt > 90_000) {
+            typedTurnOpen = false;
+            say("info", "typed TEXT-MODE window expired (90s) — voice resumes", { typed_text_mode: false });
+          }
+          if (typedTextModePending) { typedTextModePending = false; typedTurnOpen = true; typedTurnOpenedAt = Date.now(); }
+          if (typedTurnOpen && curResponseId) {
+            textModeResponses.add(curResponseId);
+            say("info", `typed reply TEXT-MODE — audio suppressed for ${curResponseId}`, { typed_text_mode: true, resp: curResponseId });
           }
           fillerBuf = ""; fillerDone = false; fillerCutPos = 0; fillerCutPhrase = "";
           // POSITIVE RECORD OF CREATION — counted BEFORE any gate below can cancel it, because the
@@ -5845,6 +5858,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           }
           break;
         case "input_audio_buffer.speech_started":
+          // canon 194: his VOICE outranks a lingering typed window — a spoken turn's reply must
+          // never be wrongly silenced by a text-mode chain that has not closed yet.
+          if (typedTurnOpen) { typedTurnOpen = false; say("info", "typed TEXT-MODE window closed (he spoke)", { typed_text_mode: false }); }
           speechStartedAt = Date.now();
           userSpeaking = true;   // stack law: MIND lines hold from this instant
           latchSynthAt = 0;      // lane L: a fresh segment may be released once
@@ -6695,6 +6711,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // created, 9 spoken, 6 tool calls — every one of them would have read as "empty").
             const toolOnly = Array.isArray(ev.response?.output)
               && ev.response.output.some((it: any) => it?.type === "function_call");
+            // canon 194 turn-scope close: the typed answer chain ends at its first NON-tool done —
+            // a tool-only done means the real answer is still coming (and must stay silent too).
+            if (typedTurnOpen && textModeResponses.has(doneId) && !toolOnly) {
+              typedTurnOpen = false;
+              say("info", "typed TEXT-MODE window closed (answer delivered)", { typed_text_mode: false, resp: doneId });
+            }
             // lane E: the server names the reason — cancelled/turn_detected (he kept talking), completed (truly mute),
             // incomplete (max tokens / content filter), failed (error). Read it instead of guessing.
             const rStatus = String(ev.response?.status ?? "?");
