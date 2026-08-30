@@ -3426,8 +3426,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // the exec-is-a-noop class — every branch has a distinct echo, none can be mistaken for another.
     const IMG_ON = process.env.APIPLAN_IMAGE !== "0";
     let imgSeq = 0;
-    const pendingImages = new Map<string, { path: string; at: number }>();
-    async function injectImage(path: string) {
+    const pendingImages = new Map<string, { path: string; at: number; follow?: boolean }>();
+    // `follow` (canon 210, his design change: "i want it to remain async, but still be able to be
+    // injected and also told to follow on with the conversation naturally"): once the model ACCEPTS
+    // the image, force a natural continuation — the mouth speaks from the pixels unprompted, seconds
+    // after his one ask. Without it, today's armed-no-reply behavior is unchanged.
+    async function injectImage(path: string, follow = false) {
       if (!IMG_ON) { say("info", `image inject disabled (APIPLAN_IMAGE=0): ${basename(path)}`, { image_failed: "disabled", path }); return; }
       try {
         const f = Bun.file(path);
@@ -3443,7 +3447,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         const b64 = Buffer.from(await f.arrayBuffer()).toString("base64");
         if (closed || ws.readyState !== WebSocket.OPEN) { say("info", `image inject failed: socket not open (${basename(path)})`, { image_failed: "socket", path }); return; }
         const id = `img_${Date.now()}_${++imgSeq}`;
-        pendingImages.set(id, { path, at: Date.now() });
+        pendingImages.set(id, { path, at: Date.now(), follow });
         ws.send(JSON.stringify({ type: "conversation.item.create", event_id: id, item: {
           id, type: "message", role: "user",
           content: [{ type: "input_image", image_url: `data:${mime};base64,${b64}` }] } }));
@@ -4569,8 +4573,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       replayNarration(j.replay);
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
-                    } else if (typeof j.image === "string") {   // QUICK-TOOLS SIGHT: a captured image into the live conversation (canon wave 822)
-                      injectImage(j.image);
+                    } else if (typeof j.image === "string") {   // QUICK-TOOLS SIGHT: a captured image into the live conversation (canon wave 822; follow = canon 210)
+                      injectImage(j.image, j.follow === true);
                     } else if (typeof j.adaptive_volume === "boolean" && j.text === undefined) {   // ADAPTIVE VOLUME toggle — both players, from the next line
                       setAdaptive(j.adaptive_volume);
                       say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
@@ -6709,8 +6713,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           const iid = (ev as any).item?.id;
           if (iid && pendingImages.has(iid)) {
             const p = pendingImages.get(iid)!; pendingImages.delete(iid);
-            say("info", `image accepted by model (${basename(p.path)}, ${Date.now() - p.at}ms)`,
-              { image_accepted: true, path: p.path, img_id: iid });
+            // canon 210 follow-on: the accept is the moment the pixels are really in the
+            // conversation — a create any earlier could answer blind. If a response is already
+            // active the server refuses this create (echoed by the error case) and the image
+            // stays armed for the next turn — degraded to today's behavior, never lost.
+            if (p.follow && !closing && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true;
+              say("info", `image accepted by model (${basename(p.path)}, ${Date.now() - p.at}ms) — following on`,
+                { image_accepted: true, path: p.path, img_id: iid, follow: true });
+            } else {
+              say("info", `image accepted by model (${basename(p.path)}, ${Date.now() - p.at}ms)`,
+                { image_accepted: true, path: p.path, img_id: iid });
+            }
           }
           break;
         }
