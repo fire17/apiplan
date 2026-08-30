@@ -3520,6 +3520,21 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         } catch {}
         return;
       }
+      // SIGHT WELD (canon 209, his verdict typed 2026-08-30 20:0x: "it took two tries, only when
+      // asking the second time did it say what was there"): a tool result carrying an image path
+      // gets the PIXELS created on the SAME socket BEFORE the function_call_output, so the forced
+      // response.create below answers FROM the image in the same cycle — one ask, zero mind
+      // latency, no new inject writer (the engine is already writer #0 of its own conversation).
+      // Two cases, two behaviors, both by code: a MIND-pushed {"image"} inject stays
+      // no-forced-reply (it arms); the mouth's OWN tool flow forces the reply — which this path
+      // already did. Contract: the tool handler returns a structured {"image":"<abs path>", …};
+      // anything else is byte-for-byte unchanged. An image that fails to attach echoes loudly
+      // (injectImage's belts) and the text output still lands — a blind answer over a silent one.
+      try {
+        const p = JSON.parse(output);
+        if (p && typeof p.image === "string" && p.image.startsWith("/")) await injectImage(p.image);
+      } catch { /* string outputs are the common case — no image to weld */ }
+      if (closed || asked !== ws || ws.readyState !== WebSocket.OPEN) return;   // re-check: injectImage awaited across time
       ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: item.call_id, output } }));
       if (!closing) { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
     };
