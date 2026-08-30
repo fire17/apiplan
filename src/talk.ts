@@ -3425,6 +3425,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // error names our event_id; `image UNCONFIRMED` = neither arrived in 8s. A silent drop here is
     // the exec-is-a-noop class — every branch has a distinct echo, none can be mistaken for another.
     const IMG_ON = process.env.APIPLAN_IMAGE !== "0";
+    // SILENT TEXT MODE plumbing (canon 194): a typed turn under caps-off marks the NEXT created
+    // response TEXT-MODE — its audio deltas are dropped at the player (not one syllable aloud, by
+    // construction), while its transcript streams as {"ev":"typed_reply"} LOG events the bridge
+    // carries into the pill. Caps ON leaves every path byte-identical.
+    let typedTextModePending = false;
+    const textModeResponses = new Set<string>();
     let imgSeq = 0;
     const pendingImages = new Map<string, { path: string; at: number; follow?: boolean }>();
     // `follow` (canon 210, his design change: "i want it to remain async, but still be able to be
@@ -4587,7 +4593,16 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       // any spoken turn (same guard, same echo). typed:true marks the you-event so
                       // never-lose audits know there is no covering WAV BY DESIGN for this turn.
                       const typedText = j.typed.trim();
-                      say("you", typedText, { typed: true, src: "typed-bypass" });
+                      // SILENT TEXT MODE (canon 194, his typed spec 21:16: "if the caps is off when
+                      // i send a message here ... instead of spoken answer, the mouth's responses
+                      // should stream into the box ... if the caps is on, speak out the answer
+                      // normally"). ONE caps boolean rules mic gate, read gate AND response
+                      // modality — capsNow() is the single reader (EVA's design note: never a
+                      // fourth reader with its own opinion). FAILS TOWARD SPEECH: an absent or
+                      // stale sensor answers aloud — a dead file must not mute the mouth.
+                      const capsJ = capsNow();
+                      const typedTextMode = !!(capsJ && capsJ.effective === false && Date.now() - (Number(capsJ.ts) || 0) < 4000);
+                      say("you", typedText, { typed: true, src: "typed-bypass", ...(typedTextMode ? { text_mode: true } : {}) });
                       if (whoCount(undefined) && !staleWho.has("mind")) {
                         staleWho.add("mind");
                         say("info", "mind queue STALE (new user turn) — awaiting re-weave");
@@ -4595,8 +4610,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       if (!closed && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
                           content: [{ type: "input_text", text: typedText }] } }));
-                        if (!closing) { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
-                        say("info", `typed turn injected (${typedText.length} chars)`, { typed_injected: true, chars: typedText.length });
+                        if (!closing) { typedTextModePending = typedTextMode; ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
+                        say("info", `typed turn injected (${typedText.length} chars${typedTextMode ? ", TEXT-MODE" : ""})`,
+                          { typed_injected: true, chars: typedText.length, ...(typedTextMode ? { text_mode: true } : {}) });
                       } else {
                         say("info", `typed turn NOT delivered — socket not open (${typedText.length} chars, kept in LOG only)`, { typed_failed: "socket", chars: typedText.length });
                       }
@@ -5540,6 +5556,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (ev.delta) {
             const dead = cancelledResponses.has(ev.response_id ?? curResponseId ?? "");
             rec({ ev: "model_delta", text: ev.delta, ...(dead ? { cancelled: true } : {}) });
+            // canon 194: TEXT-MODE reply deltas stream to the pill via the bridge — one event per
+            // delta, so the text is as live as the voice would have been.
+            if (!dead && textModeResponses.has(ev.response_id ?? curResponseId ?? ""))
+              rec({ ev: "typed_reply", text: String(ev.delta), final: false, resp: ev.response_id ?? curResponseId ?? "" });
             if (!dead) { mouthBuf += ev.delta; mouthChars += ev.delta.length; if (mouthBuf.length > 2000) mouthBuf = mouthBuf.slice(-2000); }
             if (!dead && !mindResponse && !fillerDone) { fillerBuf += ev.delta; fillerCheck(); }
             if (!dead && !mindResponse && lastMouthOutputAt < curResponseBornAt) lastMouthOutputAt = Date.now();   // lane E
@@ -5626,6 +5646,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "response.created":
           curResponseId = ev.response?.id ?? null;
           curResponseBornAt = Date.now();
+          // canon 194: the response a TEXT-MODE typed turn forced — remember its id so the audio
+          // gate below (delta handler) can drop its sound. Consumed here, exactly once.
+          if (typedTextModePending) {
+            typedTextModePending = false;
+            if (curResponseId) {
+              textModeResponses.add(curResponseId);
+              say("info", `typed reply TEXT-MODE — audio suppressed for ${curResponseId}`, { typed_text_mode: true, resp: curResponseId });
+            }
+          }
           fillerBuf = ""; fillerDone = false; fillerCutPos = 0; fillerCutPhrase = "";
           // POSITIVE RECORD OF CREATION — counted BEFORE any gate below can cancel it, because the
           // question the answer watch asks is "did the server create anything for him", not "did it
@@ -6576,6 +6605,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // A cancelled response's deltas are already dead — playing them is the
             // post-barge ghost-audio bug.
             if (ev.response_id && cancelledResponses.has(ev.response_id)) break;
+            // canon 194: a TEXT-MODE reply is never heard — its words stream into the pill instead.
+            if (ev.response_id && textModeResponses.has(ev.response_id)) break;
             if (ev.response_id && ev.response_id !== archLastResp) {   // mouth reply begins = user turn done
               archLastResp = ev.response_id; archRoll("mouth reply");
               speakerCheck(); warnIfUnheard("mouth");                  // LANE 18: async, never blocks the reply
@@ -6603,6 +6634,15 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           break;
         case "response.output_audio_transcript.done":
         case "response.audio_transcript.done":
+          // canon 194: close the TEXT-MODE stream — final carries the WHOLE reply text so the pill
+          // can render authoritatively even if a delta line was missed.
+          {
+            const tmId = ev.response_id ?? curResponseId ?? "";
+            if (textModeResponses.has(tmId)) {
+              rec({ ev: "typed_reply", text: String(ev.transcript ?? ""), final: true, resp: tmId });
+              textModeResponses.delete(tmId);
+            }
+          }
           if (ev.transcript?.trim()) {
             // STILLBORN REPLY (call 31599): cancelled at birth AND no audio delta ever reached the
             // player (itemFirstDeltaAt is still 0) = not one syllable was audible, so printing it
