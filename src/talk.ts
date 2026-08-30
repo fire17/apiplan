@@ -245,8 +245,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // Forensics anchor: log the engine's git sha so log analysis never infers the running
   // code version from process start times (verified pain: 61139 judged on unshipped code).
   try {
-    const sha = new TextDecoder().decode(Bun.spawnSync(["git", "-C", dirname(new URL(import.meta.url).pathname), "rev-parse", "--short", "HEAD"]).stdout).trim();
-    if (sha) rec({ ev: "info", text: `engine ${sha}` });
+    const srcDir = dirname(new URL(import.meta.url).pathname);
+    const sha = new TextDecoder().decode(Bun.spawnSync(["git", "-C", srcDir, "rev-parse", "--short", "HEAD"]).stdout).trim();
+    // +dirty when THIS FILE differs from HEAD (2026-08-30, the MIND briefed the mouth WRONG:
+    // bun runs the .ts on disk, so a launch from an edited-but-uncommitted talk.ts echoed the
+    // stale HEAD sha as if it were the running code. Scoped to talk.ts on purpose — the repo
+    // tree is permanently dirty with a foreign stream, a whole-tree flag would always be on).
+    const dirty = new TextDecoder().decode(Bun.spawnSync(["git", "-C", srcDir, "status", "--porcelain", "--", "talk.ts"]).stdout).trim();
+    if (sha) rec({ ev: "info", text: `engine ${sha}${dirty ? "+dirty (talk.ts differs from HEAD — the sha names less than what runs)" : ""}` });
   } catch { /* never block a call on git */ }
   rec({ ev: "info", text: `transcribe: ${transcribeModel} language=${transcribeLanguage || "auto"} prompt=${transcribePrompt.length} chars` });
 
