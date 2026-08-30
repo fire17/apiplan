@@ -4575,6 +4575,31 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       resendAudio(j.audio);
                     } else if (typeof j.image === "string") {   // QUICK-TOOLS SIGHT: a captured image into the live conversation (canon wave 822; follow = canon 210)
                       injectImage(j.image, j.follow === true);
+                    } else if (typeof j.typed === "string" && j.typed.trim()) {
+                      // TRANSCRIPT BYPASS (canon 217, his ask typed into the ring pill 2026-08-30 20:21,
+                      // verbatim: "when i press CMD+Enter here it is sent to the mouth (and you) as if it
+                      // was recieved directly from my voice - its like a transcript bypass - the mouth
+                      // should be triggered immediately and also you via the monitor in realtime"):
+                      // a FINALIZED USER TURN, by keyboard. The you-event is the MIND's realtime leg
+                      // (the existing monitor surfaces it); the item + forced create is the mouth's;
+                      // mute is irrelevant — typing IS deliberate intent to be heard, exactly like an
+                      // {"audio"} resend. Stack law honored: a typed turn STALEs held mind lines like
+                      // any spoken turn (same guard, same echo). typed:true marks the you-event so
+                      // never-lose audits know there is no covering WAV BY DESIGN for this turn.
+                      const typedText = j.typed.trim();
+                      say("you", typedText, { typed: true, src: "typed-bypass" });
+                      if (whoCount(undefined) && !staleWho.has("mind")) {
+                        staleWho.add("mind");
+                        say("info", "mind queue STALE (new user turn) — awaiting re-weave");
+                      }
+                      if (!closed && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+                          content: [{ type: "input_text", text: typedText }] } }));
+                        if (!closing) { ws.send(JSON.stringify({ type: "response.create" })); awaitingResponse = true; }
+                        say("info", `typed turn injected (${typedText.length} chars)`, { typed_injected: true, chars: typedText.length });
+                      } else {
+                        say("info", `typed turn NOT delivered — socket not open (${typedText.length} chars, kept in LOG only)`, { typed_failed: "socket", chars: typedText.length });
+                      }
                     } else if (typeof j.adaptive_volume === "boolean" && j.text === undefined) {   // ADAPTIVE VOLUME toggle — both players, from the next line
                       setAdaptive(j.adaptive_volume);
                       say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
