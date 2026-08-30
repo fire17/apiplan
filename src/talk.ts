@@ -3417,6 +3417,49 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       finally { rotResending = false; }
     }
 
+    // QUICK-TOOLS SIGHT (his order, call 43572 19:38:22, EVA canon wave 822): {"image":"<abs path>"}
+    // puts a captured image straight into the LIVE conversation, so the mouth's next answer can see
+    // it. item.create only — no response forced (parallel to {"context"}: it arms, never speaks).
+    // WRITE→VERIFY, both directions, out loud: `image injected` = sent; `image accepted by model` =
+    // the server created OUR item (client-chosen id read back); `image REFUSED by model` = the server
+    // error names our event_id; `image UNCONFIRMED` = neither arrived in 8s. A silent drop here is
+    // the exec-is-a-noop class — every branch has a distinct echo, none can be mistaken for another.
+    const IMG_ON = process.env.APIPLAN_IMAGE !== "0";
+    let imgSeq = 0;
+    const pendingImages = new Map<string, { path: string; at: number }>();
+    async function injectImage(path: string) {
+      if (!IMG_ON) { say("info", `image inject disabled (APIPLAN_IMAGE=0): ${basename(path)}`, { image_failed: "disabled", path }); return; }
+      try {
+        const f = Bun.file(path);
+        if (!(await f.exists())) { say("info", `image inject failed: not found ${path}`, { image_failed: "not-found", path }); return; }
+        const size = f.size;
+        if (size > 12 * 1024 * 1024) {
+          say("info", `image inject refused: ${(size / 1048576).toFixed(1)}MB is past the 12MB belt (base64 ~×1.37 on one ws frame) — downscale first: ${basename(path)}`,
+            { image_failed: "too-big", path, bytes: size });
+          return;
+        }
+        const ext = (path.split(".").pop() || "").toLowerCase();
+        const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "webp" ? "image/webp" : ext === "gif" ? "image/gif" : "image/png";
+        const b64 = Buffer.from(await f.arrayBuffer()).toString("base64");
+        if (closed || ws.readyState !== WebSocket.OPEN) { say("info", `image inject failed: socket not open (${basename(path)})`, { image_failed: "socket", path }); return; }
+        const id = `img_${Date.now()}_${++imgSeq}`;
+        pendingImages.set(id, { path, at: Date.now() });
+        ws.send(JSON.stringify({ type: "conversation.item.create", event_id: id, item: {
+          id, type: "message", role: "user",
+          content: [{ type: "input_image", image_url: `data:${mime};base64,${b64}` }] } }));
+        say("info", `image injected (${basename(path)}, ${(size / 1024).toFixed(0)}KB) — awaiting model accept`,
+          { image_injected: true, path, bytes: size, img_id: id });
+        setTimeout(() => {
+          const p = pendingImages.get(id);
+          if (p) {
+            pendingImages.delete(id);
+            say("info", `image UNCONFIRMED by model after 8s (no created, no error): ${basename(p.path)} — treat it as NOT seen`,
+              { image_unconfirmed: true, path: p.path, img_id: id });
+          }
+        }, 8000);
+      } catch (e) { say("info", `image inject failed: ${String(e).slice(0, 120)}`, { image_failed: "exception", path }); }
+    }
+
     /** The mouth's own mute switch (canons 035/040). Engine-side, so it is state and not a wish.
      *  Muting answers the call and STOPS — a mouth told to be quiet must not narrate its own
      *  silence. Unmuting answers and lets it speak, which is the point: he addressed it again. */
@@ -4410,11 +4453,27 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                     const j = JSON.parse(s);
                     if (j.session) {           // live persona/context swap — no reconnect
                       if (!closed && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", instructions: String(j.session) } }));
+                        // DEFECT B (EVA measured 2026-08-30: an edit + session verb showed 0
+                        // occurrences of the edit in the running session — the writer had re-sent
+                        // the LAUNCH-TIME fold). The engine cannot refresh what a writer already
+                        // folded into text, but it CAN read a file at verb time: an absolute path
+                        // is read from disk NOW, so edits land. Raw text keeps working verbatim;
+                        // the echo names which of the two happened — never a false "updated".
+                        let ptext = String(j.session);
+                        let pnote = "verbatim from writer — the engine cannot refresh what the writer folded; pass an abs file path to re-read from disk";
+                        if (ptext.startsWith("/") && !ptext.includes("\n")) {
+                          try { ptext = fs.readFileSync(ptext, "utf8"); pnote = `read fresh from disk: ${basename(String(j.session))}`; }
+                          catch (e) {
+                            say("info", `persona update FAILED — cannot read ${String(j.session)}: ${String(e).slice(0, 80)} (persona unchanged)`,
+                              { persona_failed: true, path: String(j.session) });
+                            continue;
+                          }
+                        }
+                        ws.send(JSON.stringify({ type: "session.update", session: { type: "realtime", instructions: ptext } }));
                         // FRESH PERSONA: remember what is now in force. Without this the swap lives
                         // only on this socket and the next rotation reverts to the launch text.
-                        livePersona = String(j.session); personaAt = Date.now(); personaSrc = "mind";
-                        say("info", "persona updated live");
+                        livePersona = ptext; personaAt = Date.now(); personaSrc = "mind";
+                        say("info", `persona updated live (${pnote})`, { persona_len: ptext.length });
                       }
                     } else if (typeof j.mute === "boolean") {   // mic mute toggle — stop/resume sending mic audio to the model
                       // lm-ptt re-asserts the same state every 5s (heartbeat) — roll and echo
@@ -4495,6 +4554,8 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       replayNarration(j.replay);
                     } else if (typeof j.audio === "string") {   // resend a recording as live speech
                       resendAudio(j.audio);
+                    } else if (typeof j.image === "string") {   // QUICK-TOOLS SIGHT: a captured image into the live conversation (canon wave 822)
+                      injectImage(j.image);
                     } else if (typeof j.adaptive_volume === "boolean" && j.text === undefined) {   // ADAPTIVE VOLUME toggle — both players, from the next line
                       setAdaptive(j.adaptive_volume);
                       say("info", `adaptive volume ${j.adaptive_volume ? "ON" : "OFF"} (mouth+narrator) — applies from the next line`, { adaptive_volume: j.adaptive_volume });
@@ -6626,7 +6687,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             setTimeout(() => { say("info", "goodbye — call ended"); done({ reason: "hangup" }); }, Math.max(0, playingUntil - Date.now()) + 400);
           }
           break;
+        case "conversation.item.added":      // GA event name — measured live 2026-08-30 (probe:
+        case "conversation.item.done":       // added+done at 167ms; "created" is the retired beta name)
+        case "conversation.item.created": {
+          // The image verb's positive confirmation: our client-chosen item id came back created.
+          const iid = (ev as any).item?.id;
+          if (iid && pendingImages.has(iid)) {
+            const p = pendingImages.get(iid)!; pendingImages.delete(iid);
+            say("info", `image accepted by model (${basename(p.path)}, ${Date.now() - p.at}ms)`,
+              { image_accepted: true, path: p.path, img_id: iid });
+          }
+          break;
+        }
         case "error":
+          {
+            // The image verb's LOUD refusal: the server error names our event_id. Never silent.
+            const ieid = String((ev as any).error?.event_id ?? (ev as any).event_id ?? "");
+            if (ieid && pendingImages.has(ieid)) {
+              const p = pendingImages.get(ieid)!; pendingImages.delete(ieid);
+              say("info", `image REFUSED by model (${ev.error?.code ?? "?"}: ${String(ev.error?.message ?? "").slice(0, 140)}) — ${basename(p.path)} was NOT seen`,
+                { image_refused: true, path: p.path, img_id: ieid, code: ev.error?.code });
+              break;
+            }
+          }
           if (speedMouth !== 1 && /speed/i.test(String(ev.error?.message ?? ev.error?.param ?? ""))) {
             say("info", `speed rejected by the API (${ev.error?.message ?? ev.error?.code ?? "?"}) — mouth back to 1.0; narrator keeps tempo ${speedMind} via ffplay atempo`, { speed_rejected: true, mind_speed: speedMind });
             speedMouth = 1.0; persistSpeeds();
