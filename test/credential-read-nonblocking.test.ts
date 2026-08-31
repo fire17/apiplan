@@ -100,7 +100,7 @@ function braceBody(code: string, from: number): string | null {
 function aliases(srcDir: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const f of GRAPH_FILES) {
-    const code = stripComments(readFileSync(join(srcDir, f), "utf8"));
+    const code = stripComments(readFileSync(join(srcDir, f), "utf8").replace(/\r\n?/g, "\n"));
     for (const m of code.matchAll(/^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*residentCache\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*([A-Za-z_$][\w$]*)\s*\)/gm)) {
       out.set(m[1], [m[2]]);
     }
@@ -110,7 +110,7 @@ function aliases(srcDir: string): Map<string, string[]> {
 function definitions(srcDir: string): Def[] {
   const defs: Def[] = [];
   for (const f of GRAPH_FILES) {
-    const code = stripComments(readFileSync(join(srcDir, f), "utf8"));
+    const code = stripComments(readFileSync(join(srcDir, f), "utf8").replace(/\r\n?/g, "\n"));
     const add = (name: string, body: string | null) => { if (body && !KEYWORD.has(name)) defs.push({ name, file: f, body }); };
     for (const m of code.matchAll(/^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*[(<]/gm)) add(m[1], braceBody(code, m.index!));
     for (const m of code.matchAll(/^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/gm)) {
