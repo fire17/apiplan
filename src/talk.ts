@@ -4585,12 +4585,37 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                       selfMuteUntil = 0;
                       say("info", j.autospeak ? "mouth OPEN (auto-speak on)" : suppressBy === "MIND" ? "mouth CLOSED (MIND-only)" : `mouth CLOSED (MIND-only) — by ${suppressBy}`);
                     } else if (typeof j.pause === "boolean" || j.resume === true) {
-                      // CANON 013/014 (fire17, typed): mechanistic pause of every audible agent
-                      // voice — mouth stream, draining tails, MIND narrator — via SIGSTOP/SIGCONT.
-                      // {"pause":true} holds, {"pause":false} or {"resume":true} releases. The ESC
-                      // key (lm-ptt) writes exactly these lines.
+                      // CANON 013/014 (fire17, typed): "watch for the esc key - if pressed while
+                      // agents are speaking - pause immediately" — SUPERSEDED IN SEMANTICS by
+                      // CANON 203 (his voice 2026-08-31 18:16): ESC must STOP the speaker sound
+                      // IMMEDIATELY — kill the current mouth/MIND audio and cancel the reply being
+                      // generated; queued/held lines may then play NEXT. Not a SIGSTOP hold: a
+                      // frozen voice resumes mid-sentence later, which is exactly what he pressed
+                      // ESC to prevent. {"pause":false}/{"resume":true} stays as a release for any
+                      // legacy hold (harmless after a stop). lm-ptt writes {"pause":true} on EVERY
+                      // ESC press (no toggle since canon 203 — a toggle made every second press a
+                      // silent no-op once true meant STOP).
                       const hold = j.pause === true;
-                      if (hold) pauseAll(); else resumeAll();
+                      if (hold) {
+                        const hadMouth = !!player || draining.size > 0;
+                        const hadMind = !!mindPlayer;
+                        if (mindPlayer) {   // orderly MIND cut — the exited handler records the spoken prefix
+                          if (mindLine) mindLine.cut = spokenChars(mindLine);
+                          try { mindPlayer.kill("SIGKILL"); } catch {}
+                        }
+                        stopPlayer();       // mouth stream + draining tails + un-written pace queue
+                        pace.paused = false;
+                        const hadResp = responseActive;
+                        if (responseActive && !closed && ws.readyState === WebSocket.OPEN) {
+                          try { ws.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+                          if (curResponseId) cancelledResponses.add(curResponseId);
+                          responsesCancelled++; sessResponsesCancelled++; responseActive = false;
+                        }
+                        say("info", `playback STOPPED on ESC (mouth=${hadMouth ? 1 : 0} mind=${hadMind ? 1 : 0}${hadResp ? ", reply cancelled" : ""}) — queued lines may play next (canon 203)`,
+                          { esc_stop: true, had_mouth: hadMouth, had_mind: hadMind });
+                        continue;
+                      }
+                      resumeAll();
                       say("info", hold ? "playback paused (mechanistic hold — ESC/resume releases)" : "playback resumed");
                     } else if (j.speed !== undefined && j.text === undefined) {   // REALTIME SPEED: mouth + narrator, persisted
                       speedMouth = clampSpeed(j.speed, speedMouth); speedMind = speedMouth; persistSpeeds();
