@@ -31,10 +31,9 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   TTS use the logged-in subscription; Gemini public vision/Veo/Lyria/TTS require the
   operator's Gemini API key and say so.
 
-**Cross-platform state:** macOS is live-verified in this release. Linux, WSL and Windows
-remain covered by the existing real-execution history and the GitHub Actions OS matrix;
-the v0.7.1 release remains blocked until its CI matrix is green and a fresh installation
-from the published archive passes.
+**Cross-platform state:** macOS is live-verified in this release. GitHub Actions run
+`33368645297` passed on Ubuntu, macOS, and Windows; the exact uploaded v0.7.1 archive was
+installed into an isolated HOME and exercised through `apiplan`, `opus --dry-run`, and models.
 
 **Local API:** `apiplan serve` speaks OpenAI and Anthropic shapes on 127.0.0.1:8787.
 `GET /health` is an evidence-based provider verdict rather than an always-green liveness
@@ -54,7 +53,7 @@ src/stream-shape.ts shared SSE/NDJSON framing and truncation detection
 src/api.ts          OpenAI/Anthropic-shaped local server and evidence health
 src/platform.ts     macOS · Linux · WSL · Windows differences
 freeauth/           experimental ChatGPT OAuth bridge, included and tested
-test/ bench/        271 tests and the seven-budget performance harness
+test/ bench/        272 tests and the seven-budget performance harness
 
 State lives in `~/.apiplan/`: `commands.json` (your commands — plain JSON, editable),
 `models.*.json` (cached model lists), `daemon.sock` / `daemon.json`.
@@ -71,11 +70,8 @@ Read in this order: `VISION.md` (what was asked) → `BUDGETS.md` (what "fast" m
 numbers) → `DARWIN.md` (five rounds of findings, including the fixes that mattered) →
 `LADDER.md` (why the TUI has the three views it has).
 
-1. Publish v0.7.1 only after version/docs tests, complete suite, perf gate and doctor pass.
-2. Wait for ubuntu/macos/windows GitHub Actions to finish green on the release commit.
-3. Install the v0.7.1 GitHub release tarball into a clean temporary HOME/PATH and exercise
-   `apiplan`, `opus --dry-run`, models and doctor.
-4. Stop the obsolete 8788 cache candidate after release cleanup; 8787 is the sole server.
+1. v0.7.1 is published with green Ubuntu/macOS/Windows CI and an install-tested tarball.
+2. Port 8788 is stopped; 8787 is the sole healthy production server.
 
 ## Traps worth knowing (learned the hard way)
 

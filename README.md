@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-271%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-272%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -75,7 +75,6 @@ No — 91 = 7 × 13.
 
 $ imagine a lighthouse keeper reading a letter by lamplight
 image saved: apiplan-20260802-1834.png (2936KB)
-
 $ tts the lighthouse keeper found a letter in the sand
 audio saved: apiplan-20260802-1835.wav (157KB, voice alloy via realtime)
 ```
@@ -514,7 +513,7 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 271 tests: cache, aliases, wire contracts, media, health, rotation, truncation
+bun test                  # 272 tests: cache, aliases, wire contracts, media, health, rotation, truncation
 bun bench/perf.ts         # all 7 performance budgets + observational network rows
 ```
 
