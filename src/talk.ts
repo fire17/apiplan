@@ -1256,8 +1256,24 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // state so we log only real transitions (never on the absent/stale/wrong-call assume-heard paths).
   let capsPrev: boolean | null = null;
   const CAPS_TL = `${LM_HOME}/caps-timeline.jsonl`;
+  let sensorLostMutedAt = 0;   // E823: nonzero while WE muted the mic for a dead sensor
   const capsWitness = () => {
     const j = capsNow();
+    // E823 FAIL-CLOSED (MIND direction ruling 2026-08-31, after the 18:32 leak): a publisher
+    // genuinely SEEN this call (capsPrev !== null) that goes silent >5s is a DEAD SENSOR.
+    // The READ gate below still fails toward publishing (never-lose: an absent sensor must not
+    // swallow his words) — but the MIC fails toward MUTED: a wrong OPEN is a privacy failure,
+    // a wrong CLOSED is a recoverable annoyance. lm-ptt's boot/5s re-assert owns the reopen.
+    const sensorStale = !j || Date.now() - (Number(j.ts) || 0) > 5000;
+    if (capsPrev !== null && sensorStale && !micMuted && !sensorLostMutedAt) {
+      sensorLostMutedAt = Date.now();
+      micMuted = true; archRoll("caps sensor lost");
+      say("info", "caps sensor LOST (caps.json stale >5s after a live publisher this call) — mic failed CLOSED; privacy over convenience (E823)",
+        { sensor_lost: true });
+    } else if (!sensorStale && sensorLostMutedAt) {
+      sensorLostMutedAt = 0;
+      say("info", "caps sensor BACK — mic stays muted until the gate speaks (lm-ptt boot/re-assert owns the reopen)", { sensor_back: true });
+    }
     if (!j) { capsOnAt = Date.now(); return; }                                   // no publisher → assume heard
     if (Date.now() - (Number(j.ts) || 0) > 4000) { capsOnAt = Date.now(); return; }   // stale → assume heard
     if (j.inject && injectPath && String(j.inject) !== injectPath) { capsOnAt = Date.now(); return; }  // gates another call
@@ -1277,6 +1293,26 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
     return capsJson;
   };
+  // E824 BOOT MIC STATE (his voice 2026-08-31 18:41 + the MIND's liveness ruling): the initial
+  // mic state is READ, never assumed — and only through the liveness check (writer pid alive AND
+  // ts fresh). Stale or unreadable = boot MUTED: never boot the mic open from a corpse's file
+  // (the 18:32 window did exactly that for 3.7 minutes). A box with NO caps.json at all has no
+  // gate ecosystem (standalone apiplan) and keeps the classic open-mic boot.
+  {
+    let why = "no caps.json on this box — no gate ecosystem, classic open-mic boot";
+    if (fs.existsSync(CAPS_PATH)) {
+      micMuted = true; why = "caps.json unreadable — a corpse's file never boots the mic open";
+      try {
+        const cj = JSON.parse(fs.readFileSync(CAPS_PATH, "utf8"));
+        const fresh = Date.now() - (Number(cj.ts) || 0) < 4000;
+        let alive = false;
+        try { process.kill(Number(cj.pid), 0); alive = true; } catch {}
+        if (fresh && alive) { micMuted = cj.caps !== true; why = `live gate (pid ${cj.pid}) says caps ${cj.caps === true ? "ON" : "OFF"}`; }
+        else { micMuted = true; why = `caps.json ${fresh ? "" : "STALE"}${!fresh && !alive ? " + " : ""}${alive ? "" : "writer DEAD"} — fail closed`; }
+      } catch {}
+    }
+    say("info", `boot mic state: ${micMuted ? "MUTED" : "open"} — ${why} (E824)`, { boot_mic_muted: micMuted });
+  }
   // p17 (call 37249, 16:00:34 x5): pid 38276 — aecmic2, the barge pipeline's child, a GRANDCHILD of this
   // process — read as foreign media and held the canon-048 auto-unmute. pid/ppid equality misses
   // grandchildren, so ancestry is walked through one cached `ps` snapshot (5s): any audio_out pid whose
@@ -4557,6 +4593,32 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         micMuted = j.mute;
                         archRoll(micMuted ? "mute flip" : "unmute flip");
                         say("info", micMuted ? "mic muted" : "mic unmuted");
+                        // E825 ONE-LEVER MUTE (his fix, voice 2026-08-31 18:40:24: a mute request must
+                        // actuate CAPS so physical and audio state cannot disagree — the lamp stayed lit
+                        // while the mic died at 18:24:03). A mute arriving while a FRESH gate for THIS
+                        // call says caps ON is a request from outside the gate (lm-ptt only sends
+                        // mute:true when caps is already off) → actuate caps OFF. One direction only:
+                        // unmute never actuates caps ON (software must not open his lamp; lm-ptt's 5s
+                        // re-assert re-mutes a capless virtual unmute by design). Echo is honest both ways.
+                        if (micMuted) {
+                          const cj = capsNow();
+                          if (cj && cj.caps === true && Date.now() - (Number(cj.ts) || 0) < 4000
+                              && (!cj.inject || !injectPath || String(cj.inject) === injectPath)) {
+                            const CAPS_BIN = process.env.APIPLAN_CAPS_BIN
+                              || `${process.env.HOME}/Creations/LiveMind/tools/lm-caps.bin`;
+                            try {
+                              Bun.spawn([CAPS_BIN, "off"], { stdout: "ignore", stderr: "ignore" }).exited.then((code) => {
+                                say("info", code === 0
+                                  ? "one-lever mute — caps actuated OFF, lamp now matches the mic (E825)"
+                                  : `one-lever mute — caps actuation FAILED rc=${code}: mic muted virtually but the LAMP MAY STILL BE LIT (E825)`,
+                                  { one_lever: code === 0 });
+                              });
+                            } catch (e) {
+                              say("info", `one-lever mute — caps actuator unavailable (${String(e).slice(0, 60)}): mic muted virtually, lamp state unknown (E825)`,
+                                { one_lever: false });
+                            }
+                          }
+                        }
                         // Stuck-latch fix (call 86130: speech_started then mic muted
                         // mid-speech → the server never sends speech_stopped → userSpeaking
                         // stayed true and held the MIND queue for 40s+). A mute IS the end
