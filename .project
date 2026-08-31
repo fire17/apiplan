@@ -2,5 +2,9 @@
 slug: apiplan
 first_shipped: 2026-07-28
 last_updated: 2026-08-31
-version: 0.7.0
+version: v0.7.0
+status: published
+repo: https://github.com/fire17/apiplan
+channels: github
+last_shipped: 2026-08-31
 ---
