@@ -120,6 +120,10 @@ describe("LM_GREET=announce — what it must NOT change", () => {
   test("the three noise gates are untouched — the absolute invariant", () => {
     expect(src).toContain("noise-blip auto-reply cancelled");
     expect(src).toContain("empty-transcript auto-reply cancelled");
-    expect(src).toContain("mindResponse = awaitingResponse;");
+    // Lane E (engine be3bb29) added ONE rider — a retry of an empty MOUTH reply is not the
+    // MIND speaking — so the assignment now reads `awaitingResponse && !retryResponse`. The
+    // invariant this guards is unchanged: a MIND-initiated response is still exempted from
+    // the noise gates, and that exemption is still derived from awaitingResponse.
+    expect(src).toMatch(/mindResponse = awaitingResponse(?: && !retryResponse)?;/);
   });
 });

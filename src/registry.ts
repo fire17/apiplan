@@ -66,6 +66,11 @@ const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string
     { id: "gpt-5.5", label: "GPT-5.5", efforts: ["low", "medium", "high", "xhigh"] },
     { id: "gpt-5.4", label: "GPT-5.4", efforts: ["low", "medium", "high", "xhigh"] },
     { id: "gpt-5.4-mini", label: "GPT-5.4-mini", efforts: ["low", "medium", "high"] },
+    // API-capable named products from the live Codex catalog. Keep them in the offline
+    // fallback too: a clean install has no models.openai.json yet, but exact model names
+    // must remain addressable before the first authenticated refresh.
+    { id: "gpt-reserve", label: "GPT Reserve", efforts: ["low", "medium", "high", "xhigh"] },
+    { id: "codex-auto-review", label: "Codex Auto Review", efforts: ["low", "medium", "high", "xhigh"] },
   ],
 };
 
