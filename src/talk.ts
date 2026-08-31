@@ -877,6 +877,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  script test (the same one the language profile uses), so "non-Hebrew" can never drift
    *  apart from what the rest of this file means by it. */
   const externalSuspect = (t: string, at: number) => EXTERNAL_MARK_ON && !!t.trim() && !hasHebrew(t) && xconvAdjacent(at);
+  // CAPS-ON-FRESH DOWNGRADE (MIND ruling 2026-08-31 19:48, after his English never-mind test was
+  // suppressed as the friend's speech): caps deliberately ON for the turn outranks the language
+  // profile — external-suspect becomes FLAG-ONLY and the mouth may answer. "Fresh" = the caps
+  // ON-edge landed within CAPS_FRESH_MS (90s) before the turn started AND caps was seen ON since
+  // the turn began — every PTT press qualifies per-turn; an hours-held caps session does NOT
+  // (leak risk rises with a forgotten key, so it keeps today's full suppression). caps-OFF and
+  // stale sensors keep FULL suppression, untouched. A downgraded turn logs itself, its
+  // you-record carries external_flag_only, and the reply marks answered_flag_only — one grep.
+  const CAPS_FRESH_MS = Number(process.env.APIPLAN_CAPS_FRESH_MS) || 90000;
+  let capsOnEdgeAt = 0;          // last GENUINE off→on transition this call (set in capsWitness)
+  let extFlagOnlyAt = 0; let extFlagOnlyText = "";   // learn-loop: confirmed by his next engaging turn
   const HOLD_MAX_MS = Number(process.env.APIPLAN_HOLD_MAX_MS) || 12000;     // a hold is not a mute
   let organFloorUntil = 0, organFloorWho = "", floorBogusAt = 0;
   let mutedSinceAt = 0, lastMutedNoteAt = 0;   // canon 044: a closed mouth announces itself
@@ -1289,6 +1300,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const off = j.caps !== true;
     if (off !== capsPrev) {   // a genuine transition — persist it for the cross-call resend gate
       capsPrev = off;
+      if (!off) capsOnEdgeAt = Date.now();   // the deliberate ON edge the caps-on-fresh downgrade reads
       try { fs.appendFileSync(CAPS_TL, JSON.stringify({ t: Date.now(), off }) + "\n"); } catch {}
     }
   };
@@ -3903,7 +3915,9 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // the successor to speak as the MIND (11776's seed replayed four "Mind here —" lines into a
         // persona whose own rules forbid that phrase).
         mindNarrating = true; lastMindSpokeAt = Date.now();
-        try { say("model", text); }   // the exact words now audible — the monitor/GUI see the true line
+        // answered_flag_only: this reply may be answering a caps-on-fresh downgraded turn — a wrong
+        // answer to a stranger is then traceable in one grep (the ruling's condition (c)).
+        try { say("model", text, extFlagOnlyAt && Date.now() - extFlagOnlyAt < 30000 ? { answered_flag_only: true } : undefined); }
         finally { mindNarrating = false; }
         rememberSpoken(text); // echo-dedupe: a recovered "you" matching this is speaker leak
         mindPlayer.exited.then(() => {
@@ -6483,10 +6497,28 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               //     "THE THRESHOLD BELONGS TO THE CONSEQUENCE, NOT TO THE SIGNAL"  — Eva
               // 60s is right for a MARK and catastrophic for a SUPPRESSION, so the consequence is
               // a mark. MARK, NEVER SUPPRESS: this line decides one thing and one thing only.
-              externalMarked = externalSuspect(tScript, Date.now());
+              const extRaw = externalSuspect(tScript, Date.now());
+              // CAPS-ON-FRESH downgrade (MIND ruling 19:48 — see the CAPS_FRESH_MS block): his
+              // deliberate press outranks the language profile; flag, never suppress.
+              const extFlagOnly = extRaw && capsOnEdgeAt > 0 && capsOnAt >= turnStartedAt
+                && turnStartedAt - capsOnEdgeAt <= CAPS_FRESH_MS;
+              externalMarked = extRaw && !extFlagOnly;
+              if (extFlagOnly) {
+                extFlagOnlyAt = Date.now(); extFlagOnlyText = tScript;
+                say("info", "external-suspect DOWNGRADED to flag-only — caps was deliberately ON for this turn (his press outranks the language profile; MIND ruling 19:48). The mouth may answer",
+                  { external_flag_only: true, caps_edge_before_turn_ms: Math.max(0, Math.round(turnStartedAt - capsOnEdgeAt)) });
+              }
               // LANGUAGE PROFILE: only turns NO belt suspects teach it which language he speaks,
               // so leak garbage can never talk the belt out of firing on more leak garbage.
               if (!suspect) { cleanTurns++; if (hasHebrew(tScript)) cleanHebrew++; }
+              // LEARN-LOOP CLOSE (the self-locking hole): a flag-only turn becomes learnable once
+              // HE continues the exchange — his next unsuspected turn within 90s confirms the
+              // flagged one was him, and only then does it teach the profile.
+              if (!suspect && !extRaw && extFlagOnlyText && Date.now() - extFlagOnlyAt <= 90000) {
+                cleanTurns++; if (hasHebrew(extFlagOnlyText)) cleanHebrew++;
+                say("info", "flag-only turn CONFIRMED his (he continued the exchange) — learned into the language profile", { flag_only_learned: true });
+                extFlagOnlyText = ""; extFlagOnlyAt = 0;
+              }
               if (suspect) say("info", `possible speaker echo — turn FLAGGED, not removed (${echoish ? "text" : "—"}/${bulkAppended ? "timing" : "—"}${echoish && residual ? ", residual kept" : ""})`);
               // The mark travels ON the you-record (an additive field, the text untouched) so the
               // MIND and Eva both see it without reading a second line.
@@ -6500,11 +6532,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                 ann.external_suspect = true; ann.external_belt = "lang+xconv";
                 ann.xconv_since_ms = xconvHeld() ? 0 : xconvSinceClose(Date.now());
               }
+              if (extFlagOnly) { ann.external_flag_only = true; ann.external_belt = "lang+xconv/caps-fresh"; }
               const cutWhy = truncationFlags(tScript, turn, Date.now());
               const strongCut = cutWhy.some((w) => !w.includes("weak"));
               if (cutWhy.length) { ann.incomplete = strongCut ? "strong" : "weak"; ann.incomplete_why = cutWhy; }
               lastYouText = tScript;   // lane M-A: the self-mute allow-list judges HIS words
-              say("you", tScript, (suspect || externalMarked || cutWhy.length) ? ann : undefined);
+              say("you", tScript, (suspect || externalMarked || extFlagOnly || cutWhy.length) ? ann : undefined);
               // ── NEVER-MIND + PRAISE GATE + GARBLE RETRANSCRIPT (heart by code; canon 175) ──
               if (!suspect && !externalMarked) {
                 if (!neverMindGate(tScript, turnStartedAt)
