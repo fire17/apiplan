@@ -925,6 +925,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let releaseCommitAt = 0;                     // the belt's one commit per released segment
   let releaseCommitPending = false;            // a `committed` is owed to the belt → run the stop bookkeeping there
   let releaseZeroMade = 0, releaseZeroSent = 0;   // flush zeros produced at the mute gate vs handed to the socket
+  let mutedLeakFrames = 0;                        // LEAK TRIPWIRE: muted non-zero frames that reached the socket (must stay 0 forever)
   /** Pure, replayable: fire once per segment, only while muted, only for a segment the server still
    *  holds open RELEASE_COMMIT_BELT_MS after the flush ended. */
   const releaseCommitDue = (now: number, flushAt: number, flushMs: number, beltMs: number,
@@ -3345,6 +3346,18 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (ws.readyState !== WebSocket.OPEN) { if (rotHold()) continue; break; }
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
           if (micMuted && Date.now() < releaseFlushUntil) releaseZeroSent++;   // a muted frame inside the flush IS a zero (gate above)
+          // LEAK TRIPWIRE (MIND order 2026-08-31 19:06, the "prove it with a measurement" half):
+          // by construction NOTHING muted reaches this send (the belt above drops zeros and real
+          // frames alike — measured 0/41 on call 36547). If a muted NON-ZERO frame ever gets here,
+          // audio spoken under mute is reaching OpenAI and this line is the proof — loud, counted,
+          // impossible to miss in any lm-mute-leak scan. Silence of this echo across calls IS the
+          // measurement that the engine's mute transmits nothing.
+          if (micMuted && value.some((b: number) => b !== 0)) {
+            mutedLeakFrames++;
+            if (mutedLeakFrames <= 3 || mutedLeakFrames % 50 === 0)
+              say("info", `LEAK TRIPWIRE: muted REAL frame #${mutedLeakFrames} reached the socket (${value.length} bytes) — audio under mute is being transmitted`,
+                { leak_tripwire: true, muted_leak_frames: mutedLeakFrames });
+          }
           ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: Buffer.from(value).toString("base64") }));
         }
       } catch { /* the socket or the mic went away; the loop above handles it */ }
@@ -4601,17 +4614,25 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         // unmute never actuates caps ON (software must not open his lamp; lm-ptt's 5s
                         // re-assert re-mutes a capless virtual unmute by design). Echo is honest both ways.
                         if (micMuted) {
+                          // FRESH read, cache bypassed: lm-ptt's own PTT-release mute raced the 500ms
+                          // cache at 19:09:49 (caps.json still said ON mid-flip) and fired a redundant
+                          // actuation with a mislabeled echo. The actuation is for a mute REQUEST that
+                          // arrives while caps is GENUINELY on — read the file as it is now.
+                          capsReadAt = 0;
                           const cj = capsNow();
                           if (cj && cj.caps === true && Date.now() - (Number(cj.ts) || 0) < 4000
                               && (!cj.inject || !injectPath || String(cj.inject) === injectPath)) {
                             const CAPS_BIN = process.env.APIPLAN_CAPS_BIN
                               || `${process.env.HOME}/Creations/LiveMind/tools/lm-caps.bin`;
                             try {
+                              // lm-caps exit map: 0 = state+lamp ok · 5 = state OK, lamp did not follow · else state failed
                               Bun.spawn([CAPS_BIN, "off"], { stdout: "ignore", stderr: "ignore" }).exited.then((code) => {
                                 say("info", code === 0
                                   ? "one-lever mute — caps actuated OFF, lamp now matches the mic (E825)"
-                                  : `one-lever mute — caps actuation FAILED rc=${code}: mic muted virtually but the LAMP MAY STILL BE LIT (E825)`,
-                                  { one_lever: code === 0 });
+                                  : code === 5
+                                  ? "one-lever mute — caps actuated OFF but the LAMP did not follow: his eyes may still read lit (E825, lm-caps rc 5)"
+                                  : `one-lever mute — caps actuation FAILED rc=${code}: mic muted virtually but caps may still be ON (E825)`,
+                                  { one_lever: code === 0 || code === 5, lamp_followed: code === 0 });
                               });
                             } catch (e) {
                               say("info", `one-lever mute — caps actuator unavailable (${String(e).slice(0, 60)}): mic muted virtually, lamp state unknown (E825)`,
