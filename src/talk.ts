@@ -3632,7 +3632,28 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
       const asked = ws;
       let output: string;
       try {
-        const args = item.arguments ? JSON.parse(item.arguments) : {};
+        let args: any;
+        try {
+          args = item.arguments ? JSON.parse(item.arguments) : {};
+        } catch (perr: any) {
+          // MALFORMED TOOL ARGS (2026-08-31 21:53: the model emitted 8 broken payloads in 7s and
+          // his caps-off order silently died behind a cheerful reply). Three duties:
+          // (1) the RAW payload is LOGGED — his order is recoverable, never vanished;
+          // (2) bounded rescue: a no-arg-safe action named inside the broken JSON runs anyway
+          //     (allowlist only — every entry reversible or privacy-CLOSING, never one that
+          //     needs the params the broken JSON failed to carry);
+          // (3) an unrescued failure TELLS THE MODEL TO SAY SO out loud.
+          rec({ ev: "info", text: `tool ${item.name} args MALFORMED (${String(perr?.message ?? perr).slice(0, 80)}) — raw: ${String(item.arguments ?? "").slice(0, 300).replace(/\s+/g, " ")}`,
+                tool_args_malformed: true });
+          const m = /"action"\s*:\s*"([a-z_]+)"/.exec(String(item.arguments ?? ""));
+          const SAFE_NOARG = new Set(["caps_off", "jessica_on", "jessica_off", "heart", "time", "show_desktop", "restore_windows"]);
+          if (m && SAFE_NOARG.has(m[1])) {
+            args = { action: m[1] };
+            rec({ ev: "info", text: `tool ${item.name} RESCUED — no-arg-safe action "${m[1]}" extracted from the malformed payload`, tool_args_rescued: m[1] });
+          } else {
+            throw new Error(`${String(perr?.message ?? perr).slice(0, 120)} — malformed tool arguments; TELL THE HUMAN the ${item.name} call failed and ask him to repeat the request`);
+          }
+        }
         const raw = await o.onTool!(item.name, args);
         // Handlers may return a string OR a structured object (JSON tool output is
         // common). String(obj) is "[object Object]" — serialize non-strings instead.
