@@ -53,7 +53,9 @@ async function timeSpawn(argv: string[], env: Record<string, string> = {}): Prom
 // B1 — client overhead: everything we do before the network exists.
 if (only("client")) {
   const runs: number[] = [];
-  for (let i = 0; i < Math.max(N, 8); i++) {
+  // A process-spawn floor needs enough trials to see one unscheduled launch. Eight was
+  // too small on a busy release machine (22 ms with N=40, 27 ms with N=8, same binary).
+  for (let i = 0; i < Math.max(N, 24); i++) {
     const r = await timeSpawn([ASK, "-m", "opus", "--dry-run", "hi"], { APIPLAN_DAEMON: "off" });
     if (r) runs.push(r.first);
   }

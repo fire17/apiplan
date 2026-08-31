@@ -16,62 +16,44 @@
  * themselves are asserted ABSENT from the rendered detail — a fingerprint is a hash, and a
  * secret must never reach a log, a probe line, or a bus message.
  */
-import { expect, test, describe, afterAll, beforeEach } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { expect, test, describe, afterAll } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DIR = mkdtempSync(join(tmpdir(), "apiplan-p2-fingerprint-"));
 const CRED = join(DIR, "google-cred.json");
+const HELPER = join(dirname(fileURLToPath(import.meta.url)), "helpers", "credential-fingerprint-probe.ts");
 
-// Env isolation: bun runs every test file in ONE process, so a variable this file pins
-// would otherwise decide what a SIBLING file's provider reads (it did — it silently
-// changed what test/api.test.ts saw on /health). Saved on entry, restored on exit.
-const SAVED: Record<string, string | undefined> = {};
-const pin = (k: string, v: string) => { if (!(k in SAVED)) SAVED[k] = process.env[k]; process.env[k] = v; };
-const unpin = () => { for (const [k, v] of Object.entries(SAVED)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
-pin("APIPLAN_GOOGLE_CRED_FILE", CRED);
+/** providers.ts and its resident credential caches are process-wide. This test owns a
+ * child so another concurrently loaded test file cannot redirect its credential well. */
+async function probe(): Promise<{ detail: string; before: string; after: string; stable: string }> {
+  const p = Bun.spawn([process.execPath, "run", HELPER], {
+    env: { ...process.env, APIPLAN_GOOGLE_CRED_FILE: CRED },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited,
+  ]);
+  if (code !== 0) throw new Error(`credential fingerprint probe exited ${code}: ${err || out}`);
+  return JSON.parse(out.trim().split(/\r?\n/).at(-1) ?? "{}");
+}
 
-const { google } = await import("../src/providers.ts");
-
-// One fixed expiry for every write, so the ONLY difference between two reads is the field
-// under test. Well in the future: an expired stub would add grace-window prose to detail.
-const EXPIRY_MS = Date.now() + 6 * 3600_000;
-const write = (access: string, refresh = "RT-same-account") => writeFileSync(CRED, JSON.stringify({
-  auth_method: "consumer",
-  token: { access_token: access, refresh_token: refresh, token_type: "Bearer", expiry: new Date(EXPIRY_MS).toISOString() },
-}));
-
-// Re-pinned per test: bun runs the suite in one process, and a sibling file that points
-// the same variable elsewhere must not decide what this one reads.
-beforeEach(() => { pin("APIPLAN_GOOGLE_CRED_FILE", CRED); });
-
-afterAll(() => { unpin(); try { rmSync(DIR, { recursive: true, force: true }); } catch {} });
+afterAll(() => { try { rmSync(DIR, { recursive: true, force: true }); } catch {} });
 
 describe("credential rendering", () => {
-  test("a rendered expiry carries an explicit zone", () => {
-    write("AT-one");
-    const detail = google.probe().detail;
+  test("a rendered expiry carries an explicit zone", async () => {
+    const { detail } = await probe();
     expect(detail).toContain("expires");
     const rendered = detail.slice(detail.indexOf("expires"));
-    // Z, an explicit UTC/GMT marker, or a numeric offset. Anything else is a bare local-
-    // looking timestamp, which is the defect.
     expect(rendered).toMatch(/(Z\b|UTC|GMT|[+-]\d{2}:?\d{2})/);
   });
 
-  // THE FINGERPRINT the outcome memory keys on — credFp() where a provider offers one,
-  // and the probe line (what it used to be for everyone) where it does not.
-  const fp = () => (google.credFp ? JSON.stringify(google.credFp()) : google.probe().detail);
-
-  test("the fingerprint changes when the access token is swapped inside the same minute", () => {
-    write("AT-one");
-    const before = fp();
-    write("AT-two");           // same account, same refresh token, same expiry — new access token
-    const after = fp();
+  test("the fingerprint changes when the access token is swapped inside the same minute", async () => {
+    const { before, after } = await probe();
     expect(before).toBeTruthy();
     expect(after).not.toBe(before);
-    // …and the swap is still visible as a CHANGE OF CREDENTIAL, not as a different account:
-    // both details must stay hashes, never the tokens themselves.
     for (const d of [before, after]) {
       expect(d).not.toContain("AT-one");
       expect(d).not.toContain("AT-two");
@@ -79,10 +61,8 @@ describe("credential rendering", () => {
     }
   });
 
-  test("an unchanged credential keeps a stable fingerprint", () => {
-    write("AT-stable");
-    const a = fp();
-    const b = fp();
-    expect(a).toBe(b);          // or every read would look like an account switch
+  test("an unchanged credential keeps a stable fingerprint", async () => {
+    const { after, stable } = await probe();
+    expect(after).toBe(stable);
   });
 });

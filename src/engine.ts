@@ -21,7 +21,7 @@ import { frameSep, framePayload, deltasOf, watchTerminal } from "./stream-shape.
 const wantsStream = (prov: Provider): boolean => prov.wantsStreamFlag !== false;
 
 export const START = performance.now();
-export const VERSION = "0.7.0";
+export const VERSION = "0.7.1";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the

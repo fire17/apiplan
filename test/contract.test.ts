@@ -20,7 +20,7 @@ import { join, dirname } from "node:path";
 
 // fileURLToPath, never url.pathname: on Windows the latter yields "/D:/a/…", which is
 // not a path any OS can open. CI on windows-latest caught exactly that.
-const readSource = (name: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", name), "utf8");
+const readSource = (name: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "src", name), "utf8").replace(/\r\n?/g, "\n");
 
 const CREDS = { token: "T", account: "ACC", source: "test" };
 const M = (n: string) => resolve(n)!;

@@ -7,7 +7,7 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.7.0, honest)
+## Current state (v0.7.1, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
@@ -22,8 +22,8 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   `gemini → gemini-3.7-flash`, `heretic → heretic:latest`. The live API lists 32 models:
   10 Anthropic, 8 OpenAI, 4 Google, 9 Ollama and jimmy.
 - 37 global commands are installed in `~/.bun/bin`; `apiplan doctor` reports all clear.
-- **271 tests green; 7 of 7 performance budgets met.** Release measurements: 24 ms
-  client overhead, 3 ms dispatch+drain, 55 MB idle daemon.
+- **272 tests green; 7 of 7 performance budgets met.** Release measurements: 23 ms
+  client overhead, 3 ms dispatch+drain, 66 MB idle daemon.
 - Text, images, speech, dictation, Gemini multimodal files/media, bounded video vision,
   tool-call round trips, credential rotation recovery, honest health verdicts and
   truncated-stream detection are all folded into this release.
@@ -33,8 +33,8 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
 
 **Cross-platform state:** macOS is live-verified in this release. Linux, WSL and Windows
 remain covered by the existing real-execution history and the GitHub Actions OS matrix;
-the release must not be called published until the pushed v0.7.0 CI run is green and a
-fresh installation from the published channel passes.
+the v0.7.1 release remains blocked until its CI matrix is green and a fresh installation
+from the published archive passes.
 
 **Local API:** `apiplan serve` speaks OpenAI and Anthropic shapes on 127.0.0.1:8787.
 `GET /health` is an evidence-based provider verdict rather than an always-green liveness
@@ -71,10 +71,10 @@ Read in this order: `VISION.md` (what was asked) → `BUDGETS.md` (what "fast" m
 numbers) → `DARWIN.md` (five rounds of findings, including the fixes that mattered) →
 `LADDER.md` (why the TUI has the three views it has).
 
-1. Publish v0.7.0 only after version/docs tests, complete suite, perf gate and doctor pass.
+1. Publish v0.7.1 only after version/docs tests, complete suite, perf gate and doctor pass.
 2. Wait for ubuntu/macos/windows GitHub Actions to finish green on the release commit.
-3. Install from `https://raw.githubusercontent.com/fire17/apiplan/main/install.sh` into a
-   clean temporary HOME/PATH and exercise `apiplan`, `opus --dry-run`, models and doctor.
+3. Install the v0.7.1 GitHub release tarball into a clean temporary HOME/PATH and exercise
+   `apiplan`, `opus --dry-run`, models and doctor.
 4. Stop the obsolete 8788 cache candidate after release cleanup; 8787 is the sole server.
 
 ## Traps worth knowing (learned the hard way)

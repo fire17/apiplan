@@ -115,7 +115,7 @@ Then `apiplan` shows you everything:
 
 ```console
 $ apiplan status
-apiplan v0.7.0  ·  macOS  ·  daemon warm
+apiplan v0.7.1  ·  macOS  ·  daemon warm
 
 PROVIDERS
   ● anthropic    Claude Code subscription · 10 models
