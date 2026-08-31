@@ -670,7 +670,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let suppressBy = "";            // who closed the mouth: "self" | "MIND" | "lm-calls" | "" — the suppress echo names the real closer
   let selfMuteUntil = 0, selfMuteEchoAt = 0;
   const SELF_MUTE_MS = Number(process.env.APIPLAN_SELF_MUTE_MS) || 60000;
-  const EXPLICIT_MUTE = /שתוק|תשתוק|תשתקי|תשתיק את עצמך|תשתיקי את עצמך|תהיה בשקט|תהיי בשקט|אל תדבר|אל תדברי|תפסיק לדבר|תפסיקי לדבר|תשתיק את הפה|mute yourself|be quiet|shut up|stop talking|stay quiet|quiet please|go mute/i;
+  // Extended 2026-08-31 22:27:30 (call 11295 final minute): his ACTUAL close vocabulary —
+  // "אתה פשוט תפסיק את הפה לגמרי, תסגור הכל... סגור את הפה" — was REFUSED by this list (it had
+  // תפסיק לדבר but not תפסיק את הפה, תשתיק את הפה but not סגור את הפה), and the mouth stayed
+  // open 13 more seconds. If that sentence is not a mute request, nothing is (MIND ruling).
+  // Kinship note: E826's NEVERMIND_RE (cancel-jessica, ~line 1323) is a DIFFERENT gate with
+  // different semantics — hands/tests/self-mute-guard.test.mjs drives BOTH regexes from source
+  // over his real sentences so the two lists cannot silently drift apart.
+  const EXPLICIT_MUTE = /שתוק|תשתוק|תשתקי|תשתיק את עצמך|תשתיקי את עצמך|תהיה בשקט|תהיי בשקט|אל תדבר|אל תדברי|תפסיק לדבר|תפסיקי לדבר|תשתיק את הפה|תפסיק את הפה|תפסיקי את הפה|סגור את הפה|סגרי את הפה|תסגור את הפה|תסגרי את הפה|תסגור הכל|תסגרי הכל|השתק|mute yourself|be quiet|shut up|stop talking|stay quiet|quiet please|go mute/i;
   const explicitMuteAsk = (t: string): boolean => EXPLICIT_MUTE.test(t);
   // LANE S (never-lose — EVA's turn-134 of call 48629: 152 s voiced, NO transcript; the relaunch killed the engine while the
   // server still owed the transcript of the flushed buffer). A deliberate shutdown WAITS for it, bounded.
