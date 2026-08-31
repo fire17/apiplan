@@ -4008,6 +4008,28 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     const RETRANSCRIBE_CMD = (process.env.APIPLAN_RETRANSCRIBE_CMD || "").trim();
     const RETRANSCRIBE_MS = envBar("APIPLAN_RETRANSCRIBE_MS", 15000);   // warm run 2.0 s, cold model load ~14 s (measured 2026-08-27)
     let praiseFiredAt = 0; let praiseHearts = 0;
+    /** JESSICA NEVER-MIND (his voice 2026-08-31 19:4x — spec in the neverMindDue block): a
+     *  whole-utterance cancel inside the post-flip window → caps OFF via the real actuator and
+     *  TOTAL silence — kill any reply born for the turn, hold a late-born one (the proven
+     *  echoHold belt), exclude the answer watch. Stamp consumed: one cancel per flip. */
+    const neverMindGate = (text: string, turnStartedAt: number): boolean => {
+      let flip = 0;
+      try { flip = Number(JSON.parse(fs.readFileSync(JESSICA_FLIP_FILE, "utf8")).t) || 0; } catch { return false; }
+      if (!neverMindDue(text, Date.now(), flip)) return false;
+      try { fs.unlinkSync(JESSICA_FLIP_FILE); } catch {}
+      neverMindAt = Date.now();
+      try {
+        Bun.spawn([CAPS_BIN, "off"], { stdout: "ignore", stderr: "ignore" }).exited.then((code) =>
+          say("info", `jessica never-mind — caps closed (rc ${code}${code === 5 ? ", lamp may lag" : ""}), mouth stays SILENT (his 19:4x order)`,
+            { never_mind: true, caps_rc: code }));
+      } catch (e) {
+        say("info", `jessica never-mind — caps actuator unavailable (${String(e).slice(0, 60)}); mouth stays SILENT, lm-ptt's re-assert owns the gate`,
+          { never_mind: true });
+      }
+      if (responseActive && !mindResponse && curResponseBornAt >= turnStartedAt) silenceMouth();
+      echoHoldUntil = Date.now() + 4000; echoHoldSetAt = Date.now(); pendingMouthReply = false;   // a late-born reply dies at creation
+      return true;
+    };
     const praiseGate = (text: string, turnStartedAt: number, via: "realtime" | "retranscript") => {
       const m = praiseMatch(text); if (!m) return false;
       if (praiseFiredAt && turnStartedAt && praiseFiredAt >= turnStartedAt) return true;   // once per turn
@@ -5071,6 +5093,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // DELIBERATE silences, not outages: the MIND holding the mouth shut ({"autospeak":false}),
         // or mouthpiece mode, where the MIND is the voice for the whole call by configuration.
         if (suppressAuto) return skip("suppress_auto");
+        if (neverMindAt >= turnStart) return skip("never_mind");   // his 19:4x order: that turn is DELIBERATELY unanswered
         if (process.env.APIPLAN_VAD_CREATE_RESPONSE === "0") return skip("vad_cr_0");
         if (lastMindSpokeAt > turnAt) return skip("mind_answered");        // the MIND's voice answered him
         // Something IS already on its way to him: a reply in flight, a MIND line playing or queued,
@@ -6482,9 +6505,10 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               if (cutWhy.length) { ann.incomplete = strongCut ? "strong" : "weak"; ann.incomplete_why = cutWhy; }
               lastYouText = tScript;   // lane M-A: the self-mute allow-list judges HIS words
               say("you", tScript, (suspect || externalMarked || cutWhy.length) ? ann : undefined);
-              // ── PRAISE GATE + GARBLE RETRANSCRIPT (heart by code; canon 175) ──
+              // ── NEVER-MIND + PRAISE GATE + GARBLE RETRANSCRIPT (heart by code; canon 175) ──
               if (!suspect && !externalMarked) {
-                if (!praiseGate(tScript, turnStartedAt, "realtime") && garbleTurn(tScript)) void retranscribeTurn(tScript, turnStartedAt, turn?.stopAt ?? 0);
+                if (!neverMindGate(tScript, turnStartedAt)
+                    && !praiseGate(tScript, turnStartedAt, "realtime") && garbleTurn(tScript)) void retranscribeTurn(tScript, turnStartedAt, turn?.stopAt ?? 0);
               }
               if (strongCut)
                 say("info", `turn INCOMPLETE (${cutWhy.join("; ")}) — recover before acting`,
