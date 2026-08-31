@@ -907,6 +907,29 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
    *  drive it: same length as the live frame so the server's clock advances at the real rate. */
   const releaseFlushFrame = (value: Buffer | Uint8Array, now: number): Buffer | null =>
     now < releaseFlushUntil ? Buffer.alloc(value.length) : null;
+  // RELEASE COMMIT BELT (his voice 2026-08-31 15:19, call 94307: "אם אני מדבר אליך וסוגר את הקפסלוק, אז
+  // הפה לא מגיב"; his 15:21 principle: "אם הקפסלוק כבוי, אז הוא יכול לענות לי, אבל שלא יקליט אותי").
+  // Measured on that call: 3 of 5 caps releases left the server segment OPEN 15-193 s after the flush
+  // (his ~30 s at 15:13 sat untranscribed until his next caps press) — once the flush ends the muted
+  // mic sends NOTHING, so a segment the zeros did not close can never close. Probe (hands/tests/
+  // release-flush-probe.mjs, live gpt-realtime, his own turn-075 WAV): 900 ms of zeros DO close a
+  // segment 3/3 when they arrive, and a manual input_audio_buffer.commit on an open segment is clean
+  // 3/3 — committed + transcript land, NO speech_stopped and NO auto-response follow. So the belt:
+  // RELEASE_COMMIT_BELT_MS after the flush ended, segment still open, mic still muted → commit ONCE,
+  // synthesize the stop bookkeeping on `committed`, and let the answer watch resurrect the reply.
+  // Canon 119/047 holds by construction: the server buffer only ever holds frames that passed the
+  // mute gate (caps-ON audio + the flush zeros); a muted frame outside the flush is dropped before
+  // append, so the commit can carry no caps-off speech. The counters record how many zeros were made
+  // vs actually sent, so the next hang names its own cause (drop between the gate and the socket).
+  const RELEASE_COMMIT_BELT_MS = 1200;
+  let releaseCommitAt = 0;                     // the belt's one commit per released segment
+  let releaseCommitPending = false;            // a `committed` is owed to the belt → run the stop bookkeeping there
+  let releaseZeroMade = 0, releaseZeroSent = 0;   // flush zeros produced at the mute gate vs handed to the socket
+  /** Pure, replayable: fire once per segment, only while muted, only for a segment the server still
+   *  holds open RELEASE_COMMIT_BELT_MS after the flush ended. */
+  const releaseCommitDue = (now: number, flushAt: number, flushMs: number, beltMs: number,
+                            muted: boolean, segmentOpen: boolean, committedAt: number): boolean =>
+    flushAt > 0 && muted && segmentOpen && committedAt < flushAt && now - flushAt >= flushMs + beltMs;
   // suppressAuto: when true, the mouth may NOT answer on its own — any VAD auto-response is
   // cancelled the instant it starts, so the mouth speaks ONLY injected (MIND) lines. The MIND
   // flips this LIVE via an inject {"autospeak":true|false} — instant open/close of the mouth.
@@ -2783,7 +2806,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
               // lets THIS frame through — the mute is gone, so the gate is gone with it)
               const z = releaseFlushFrame(value, Date.now());
               if (!z) continue;
-              value = z;
+              value = z; releaseZeroMade++;
             }
           }
           // MIND narrator playing: frames NEVER flow in ANY mode (o.barge only trades off
@@ -3285,6 +3308,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           // (archWrite runs before every drop), and breaking here kills the mic child.
           if (ws.readyState !== WebSocket.OPEN) { if (rotHold()) continue; break; }
           if ((ws as any).bufferedAmount > 512 * 1024) continue;   // backpressure: drop rather than pile in memory
+          if (micMuted && Date.now() < releaseFlushUntil) releaseZeroSent++;   // a muted frame inside the flush IS a zero (gate above)
           ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: Buffer.from(value).toString("base64") }));
         }
       } catch { /* the socket or the mic went away; the loop above handles it */ }
@@ -4470,6 +4494,17 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           if (Date.now() >= selfMuteUntil) { suppressAuto = false; suppressBy = ""; selfMuteUntil = 0; say("info", `mouth OPEN (self-mute expired after ${Math.round(SELF_MUTE_MS / 1000)}s — he must ask again to keep it quiet)`, { mouth_self: "expired" }); }
           else if (Date.now() - selfMuteEchoAt >= 20000) { selfMuteEchoAt = Date.now(); say("info", `mouth self-muted — reopens in ${Math.round((selfMuteUntil - Date.now()) / 1000)}s`, { mouth_self: "countdown" }); }
         }
+        // RELEASE COMMIT BELT: the flush ended, the mic is still muted, the server still holds the segment.
+        if (releaseCommitDue(Date.now(), releaseFlushAt, RELEASE_FLUSH_MS, RELEASE_COMMIT_BELT_MS, micMuted,
+                             speechStartedAt > serverStoppedAt, releaseCommitAt) && ws.readyState === WebSocket.OPEN) {
+          releaseCommitAt = Date.now(); releaseCommitPending = true;
+          const openMs = Date.now() - releaseFlushAt;
+          try {
+            ws.send(JSON.stringify({ type: "input_audio_buffer.commit", event_id: `relcommit_${releaseCommitAt}` }));
+            say("info", `release commit belt — segment still open ${openMs}ms after the flush (${releaseZeroSent}/${releaseZeroMade} flush zeros reached the socket, ${Math.round(releaseZeroSent * (RELEASE_FLUSH_MS / Math.max(1, releaseZeroMade)))}ms); committed the buffer so his turn transcribes and answers`,
+              { release_commit: true, open_ms: openMs, zeros_made: releaseZeroMade, zeros_sent: releaseZeroSent, segment_open_ms: Date.now() - speechStartedAt });
+          } catch { releaseCommitPending = false; }
+        }
         // p16 LATCH WATCH: while the server's VAD segment is open past 20s, echo the three clocks every 10s.
         if (latchWatchDue(speechStartedAt, serverStoppedAt, latchWatchAt, Date.now())) {
           latchWatchAt = Date.now();
@@ -4530,6 +4565,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
                         // (VAD_SILENCE_MS + 400) and mark the audible end of the turn for the noise gates.
                         if (micMuted && (userSpeaking || speechStartedAt > lastSpeechStopAt)) {
                           releaseFlushAt = Date.now(); releaseFlushUntil = releaseFlushAt + RELEASE_FLUSH_MS; lastReleaseFlushAt = releaseFlushAt;
+                          releaseZeroMade = 0; releaseZeroSent = 0;   // the belt's counters are per release
                           say("info", `turn closed on caps release — flushing ${RELEASE_FLUSH_MS}ms of silence so the server ends the segment`,
                             { release_close: true, flush_ms: RELEASE_FLUSH_MS, speech_ms: speechStartedAt ? releaseFlushAt - speechStartedAt : 0 });
                         }
@@ -5862,6 +5898,28 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             recoveredItemId = ev.item_id;
             rec({ ev: "info", text: `recovered audio committed as ${ev.item_id}` });
           }
+          // RELEASE COMMIT BELT: the server committed OUR commit — no speech_stopped will follow (probe-
+          // measured), so the stop bookkeeping the speech_stopped case does is synthesized HERE, line for
+          // line, so the transcript pairs with its turn (speechTurns FIFO), the noise-blip bar reads the
+          // audible length (release-bounded, canon 124), and the answer watch can resurrect the reply.
+          if (releaseCommitPending) {
+            releaseCommitPending = false;
+            serverStoppedAt = Date.now();
+            if (speechStartedAt) lastSpeechMs = Date.now() - speechStartedAt;
+            if (releaseFlushAt > speechStartedAt && speechStartedAt) { lastSpeechMs = releaseFlushAt - speechStartedAt; releaseFlushAt = 0; }
+            transcriptPending = Date.now();
+            userSpeaking = false;
+            prevSpeechStopAt = lastSpeechStopAt;
+            lastSpeechStopAt = Date.now();
+            latchTimedOut = false; latchVoiceMs = 0; latchHadVoice = false;
+            speechTurns.push({ startedAt: speechStartedAt, ms: lastSpeechMs, stopAt: lastSpeechStopAt, prevStopAt: prevSpeechStopAt });
+            if (speechTurns.length > 4) speechTurns.shift();
+            stopHistory.push({ stopAt: lastSpeechStopAt, echo: false });
+            if (stopHistory.length > 8) stopHistory.shift();
+            if (injectQueue.length) setTimeout(flushInjectQueue, 2600);
+            rec({ ev: "info", text: `release commit belt — server committed ${ev.item_id ?? "?"} (${Date.now() - releaseCommitAt}ms; stop bookkeeping synthesized, transcript owed)`,
+              release_committed: true, item_id: ev.item_id, ms: Date.now() - releaseCommitAt });
+          }
           break;
         case "input_audio_buffer.speech_started":
           // canon 194: his VOICE outranks a lingering typed window — a spoken turn's reply must
@@ -6825,6 +6883,14 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
           {
             // The image verb's LOUD refusal: the server error names our event_id. Never silent.
             const ieid = String((ev as any).error?.event_id ?? (ev as any).event_id ?? "");
+            // RELEASE COMMIT BELT refused (e.g. input_audio_buffer_commit_empty): the segment stays as the
+            // server left it; say so loudly — a silent miss here is the hang we are closing.
+            if (ieid.startsWith("relcommit_")) {
+              releaseCommitPending = false;
+              say("info", `release commit belt REFUSED by the server (${ev.error?.code ?? "?"}: ${String(ev.error?.message ?? "").slice(0, 140)}) — segment left as the server holds it`,
+                { release_commit_refused: true, code: ev.error?.code });
+              break;
+            }
             if (ieid && pendingImages.has(ieid)) {
               const p = pendingImages.get(ieid)!; pendingImages.delete(ieid);
               say("info", `image REFUSED by model (${ev.error?.code ?? "?"}: ${String(ev.error?.message ?? "").slice(0, 140)}) — ${basename(p.path)} was NOT seen`,
