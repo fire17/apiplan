@@ -1300,6 +1300,20 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     }
     return capsJson;
   };
+  // ── JESSICA NEVER-MIND (his voice 2026-08-31 19:4x, call 4237: "If I say Jessica and then right
+  // afterwards I say never mind, then just stay silent, the mouth should not respond, but it
+  // should automatically trigger calling off the caps lock"). SCOPED: only a turn inside
+  // NEVERMIND_MS of a jessica FLIP (the daemon stamps ~/.livemind/jessica-flip.json; a physical
+  // caps press stamps nothing) and only a WHOLE-utterance cancel phrase — anchored, so
+  // "לא משנה מה השעה" mid-sentence stays ordinary speech. One cancel per flip (stamp consumed).
+  const JESSICA_FLIP_FILE = `${LM_HOME}/jessica-flip.json`;
+  const NEVERMIND_MS = Number(process.env.APIPLAN_NEVERMIND_MS) || 15000;
+  const NEVERMIND_RE = /^(never ?mind|עזוב(י| את זה)?|לא משנה|לא חשוב|בעצם לא)[.!?,\s]*$/i;
+  /** pure (hands/tests/jessica-nevermind.test.mjs drives THIS const) */
+  const neverMindDue = (text: string, nowMs: number, flipMs: number): boolean =>
+    flipMs > 0 && nowMs - flipMs <= NEVERMIND_MS && NEVERMIND_RE.test(text.trim());
+  let neverMindAt = 0;   // the answer watch reads this: the turn is DELIBERATELY unanswered
+  const CAPS_BIN = process.env.APIPLAN_CAPS_BIN || `${process.env.HOME}/Creations/LiveMind/tools/lm-caps.bin`;
   // E824 BOOT MIC STATE (his voice 2026-08-31 18:41 + the MIND's liveness ruling): the initial
   // mic state is READ, never assumed — and only through the liveness check (writer pid alive AND
   // ts fresh). Stale or unreadable = boot MUTED: never boot the mic open from a corpse's file
@@ -2100,8 +2114,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // over ≥ 90% of its length is our own playback by construction — his voice over the mouth never fills a
     // window wall to wall — so a short resend of that shape is echo regardless of what the transcriber wrote.
     // Bounded to resends ≤ 3 s: a long window can hold him AND leak, and there the residual test rules.
-    const resendLeakShaped = (wasRecovered: boolean, loudShare: number, resentMs: number): boolean =>
-      wasRecovered && loudShare >= 0.9 && resentMs > 0 && resentMs <= 3000;
+    // DURATION BELT (added with the one-claim fix, same incident): "identity" means the turn IS
+    // the resent audio — a turn much longer than the resend cannot be it, whatever the loudShare
+    // says (the eaten never-mind order: turn 14020ms vs resend 900ms). 88140's genuine case
+    // (resend 1500ms, turn ~1500ms) passes untouched.
+    const resendLeakShaped = (wasRecovered: boolean, loudShare: number, resentMs: number, turnMs: number): boolean =>
+      wasRecovered && loudShare >= 0.9 && resentMs > 0 && resentMs <= 3000 && turnMs <= resentMs * 2 + 800;
     let lastResendLoudShare = 0;   // loud ms / window ms of the last resend (set where the slice is cut)
     // USER BARGES MIND (fire17's law: his voice outranks everything, including the MIND's
     // own audio). While the MIND narrator plays, mic frames are gated (echo-safe) but still
@@ -6015,6 +6033,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         case "input_audio_buffer.committed":
           if (recoverSentAt && !recoveredItemId && ev.item_id) {
             recoveredItemId = ev.item_id;
+            // ONE RESEND CLAIMS ONE ITEM (2026-08-31 19:36-19:40, seven of his genuine turns eaten):
+            // consuming the recovered item nulls recoveredItemId, which made THIS condition true
+            // again for the next committed item — every later turn of his was claimed as "recovered",
+            // wasRecovered stuck true, and the identity door judged a 14s turn identical to a 900ms
+            // resend. recoverSentAt dies with the claim; a new resend re-arms it explicitly.
+            recoverSentAt = 0;
             rec({ ev: "info", text: `recovered audio committed as ${ev.item_id}` });
           }
           // RELEASE COMMIT BELT: the server committed OUR commit — no speech_stopped will follow (probe-
@@ -6239,7 +6263,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
             // n=31). The 1500ms FLOOR keeps a LONG resend from making a merged turn — his voice
             // inside a 19.6s window — look bulk-appended on a bare `<`.
             const bulkAppended = resendBulk(turnStartedAt, lastResendAt, turnMs, lastResendMs);
-            const leakShaped = resendLeakShaped(wasRecovered, lastResendLoudShare, lastResendMs);
+            const leakShaped = resendLeakShaped(wasRecovered, lastResendLoudShare, lastResendMs, turnMs);
             // RESIDUAL TEST — the sacred rule made structural (fire17: the human is NEVER
             // censored). `conversation.item.delete` removes a WHOLE item, and a recovered item can
             // carry leak AND his live speech together: 44292@15:05:38 was a verbatim MIND tail
