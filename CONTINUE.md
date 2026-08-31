@@ -7,61 +7,54 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.6.0, honest)
+## Current state (v0.7.0, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
-- Both providers answer through one engine: Anthropic `/v1/messages` (subscription OAuth
-  from the Keychain) and OpenAI's Codex Responses endpoint (`~/.codex/auth.json`).
-- Alias contract holds at the wire level, confirmed by the API's own served-model field:
-  `opus → claude-opus-5`, `opus48 → claude-opus-4-8`, `sonnet → claude-sonnet-5`,
-  `haiku → claude-haiku-4-5-20251001`, `sol → gpt-5.6-sol`, `gpt55 → gpt-5.5`.
-- Pipes both ways, `--chat` multi-turn (remembers across turns), images from file/URL/
-  data:/stdin/clipboard, `--loop`, `--dry-run`, effort per provider-advertised levels.
-- 13 global commands installed in `~/.bun/bin`; `apiplan doctor` reports **all clear**.
-- 134 tests green; 7 of 7 budgets met (`bun test`, `bun bench/perf.ts`).
-- **Making things, all on the subscription, no API key** (added 2026-08-02):
-  `imagine` draws (image_generation tool on the same codex endpoint; `--raw` sends your
-  prompt character-for-character, default `--enhance` lets the model rewrite it, which is
-  what `prompt used:` reports); `tts` speaks any text over the realtime WebSocket
-  (`gpt-realtime`, 10 voices, PCM16 → wav, any language — Hebrew verified) and takes a
-  performance direction as a separate input (`--as "excited, laughing"` — measured: 2.7×
-  loudness range, 2.5× duration range, laughter 3/3); `tts --aloud`
-  re-reads a ChatGPT message via `/backend-api/synthesize` in the 9 product voices.
-- Warm call ≈ 1.0 s first token, of which **4 ms is ours** (measured directly, not
-  inferred). 25 parallel calls all succeed, p50 1.06 s.
+- Four provider families answer through one engine: Anthropic (Claude Code OAuth), OpenAI
+  (Codex/ChatGPT), Google (Antigravity/Gemini Code Assist) and Ollama (loopback/local).
+- The localhost API preserves native cache identity: Anthropic `cache_control` blocks and
+  metadata; OpenAI `prompt_cache_key` and session routing. Repeat live calls measured
+  **16,226 Anthropic cache-read tokens** and **4,864 OpenAI cached tokens**.
+- `apiplan hotswap upgrade` drained and replaced the live server on port 8787; the cached
+  policy is now the only production path. A 40-way post-switch continuity burst was 40/40.
+- Alias contract holds at wire level: `opus → claude-opus-5`, `sol → gpt-5.6-sol`,
+  `gemini → gemini-3.7-flash`, `heretic → heretic:latest`. The live API lists 32 models:
+  10 Anthropic, 8 OpenAI, 4 Google, 9 Ollama and jimmy.
+- 37 global commands are installed in `~/.bun/bin`; `apiplan doctor` reports all clear.
+- **271 tests green; 7 of 7 performance budgets met.** Release measurements: 24 ms
+  client overhead, 3 ms dispatch+drain, 55 MB idle daemon.
+- Text, images, speech, dictation, Gemini multimodal files/media, bounded video vision,
+  tool-call round trips, credential rotation recovery, honest health verdicts and
+  truncated-stream detection are all folded into this release.
+- Making things stays explicit about billing: Codex image generation and OpenAI realtime
+  TTS use the logged-in subscription; Gemini public vision/Veo/Lyria/TTS require the
+  operator's Gemini API key and say so.
 
-**Also live-verified on Linux** (rounds 6–7): the *published* repo run in a container on
-Linux aarch64 — 80/80 tests, correct platform detection, unix-socket IPC, the
-`~/.claude/.credentials.json` credential fallback that only executes off-macOS, and the
-one-line `curl … | sh` install working on a bare box with only git + curl.
+**Cross-platform state:** macOS is live-verified in this release. Linux, WSL and Windows
+remain covered by the existing real-execution history and the GitHub Actions OS matrix;
+the release must not be called published until the pushed v0.7.0 CI run is green and a
+fresh installation from the published channel passes.
 
-**NOT yet live-verified: WSL and Windows.** `detectWsl()` is tested against real WSL1/WSL2
-kernel strings and the interop env vars, and the Windows `.cmd`/`.ps1` shims plus the
-loopback-TCP daemon (including its 403 without a token) are tested — but no process has
-executed on either OS. **This is the single biggest open item.** The WSL box (`magic-wsl`)
-was reachable in Tailscale but SSH did not answer.
-
-- **`apiplan serve`** (added 2026-08-07): a local server speaking OpenAI's *and*
-  Anthropic's wire shapes, so any SDK/app can swap its base URL to localhost. Path picks
-  the response shape, `model` picks the backend — Claude via `/v1/chat/completions` works,
-  which is the point. Verified against the official `openai` and `@anthropic-ai/sdk`
-  packages, both directions, streaming included. Loopback-only by default.
+**Local API:** `apiplan serve` speaks OpenAI and Anthropic shapes on 127.0.0.1:8787.
+`GET /health` is an evidence-based provider verdict rather than an always-green liveness
+bit; after one real call on each credential it reports `ok: true` for all four families.
+The current server PID owns the cached policy and has no stable/candidate switch.
 
 ## Layout
 
-```
-bin/ask.ts        the CLI every model command execs (shims pass --model)
-bin/apiplan.ts    status · models · commands · install/add/rename/rm/sync/prune ·
-                  doctor · daemon · path · shell-init · interactive TUI
-src/registry.ts   aliases → model ids, from each provider's own list (family = newest)
-src/providers.ts  per-vendor credential/endpoint/request/stream behind one interface
-src/engine.ts     argv · images · SSE · warm daemon · self-timing
-src/platform.ts   every macOS/Linux/WSL/Windows difference, in one file
-src/commands.ts   ~/.apiplan/commands.json ⇄ the shims on PATH
-src/api.ts        the local OpenAI/Anthropic-shaped server (`apiplan serve`)
-test/ bench/      80 tests · the budget harness with regression detection
-```
+bin/ask.ts          CLI every model command executes
+bin/apiplan.ts      status · models · commands · doctor · hotswap · serve · TUI
+bin/vision.ts       ordered bounded-concurrency video frame analysis
+src/registry.ts     aliases → live provider model ids
+src/providers.ts    Anthropic/OpenAI/Google credentials, requests, deltas and media
+src/providers-ollama.ts local model discovery and transport
+src/engine.ts       argv · media · stream consumption · warm daemon
+src/stream-shape.ts shared SSE/NDJSON framing and truncation detection
+src/api.ts          OpenAI/Anthropic-shaped local server and evidence health
+src/platform.ts     macOS · Linux · WSL · Windows differences
+freeauth/           experimental ChatGPT OAuth bridge, included and tested
+test/ bench/        271 tests and the seven-budget performance harness
 
 State lives in `~/.apiplan/`: `commands.json` (your commands — plain JSON, editable),
 `models.*.json` (cached model lists), `daemon.sock` / `daemon.json`.
@@ -78,17 +71,11 @@ Read in this order: `VISION.md` (what was asked) → `BUDGETS.md` (what "fast" m
 numbers) → `DARWIN.md` (five rounds of findings, including the fixes that mattered) →
 `LADDER.md` (why the TUI has the three views it has).
 
-## Next steps
-
-1. ~~Run it on WSL and Windows~~ — done (round 13): all four target OSes verified by
-   execution; the CI matrix keeps ubuntu/macos/windows honest on every push.
-2. ~~Publish~~ — done: github.com/fire17/apiplan, releases through v0.4.0.
-3. **Grok and Gemini.** The provider interface is the extension point: add one adapter
-   with `probe/creds/build/delta` plus its model list, and every command, image, pipe and
-   daemon behaviour comes for free. Grok is OpenAI-shaped (`api.x.ai`); Gemini needs its
-   own `inline_data` mapping.
-4. **Optional:** completions (`apiplan completions zsh`), and a real usage log — which
-   would finally justify the "spend" rung deliberately left in `LADDER.md`'s graveyard.
+1. Publish v0.7.0 only after version/docs tests, complete suite, perf gate and doctor pass.
+2. Wait for ubuntu/macos/windows GitHub Actions to finish green on the release commit.
+3. Install from `https://raw.githubusercontent.com/fire17/apiplan/main/install.sh` into a
+   clean temporary HOME/PATH and exercise `apiplan`, `opus --dry-run`, models and doctor.
+4. Stop the obsolete 8788 cache candidate after release cleanup; 8787 is the sole server.
 
 ## Traps worth knowing (learned the hard way)
 

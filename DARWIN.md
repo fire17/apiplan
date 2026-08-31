@@ -1,9 +1,9 @@
 # DARWIN — autoresearch self-improvement rounds
 
-Thirteen measure → find gap → fix → re-verify rounds against `BUDGETS.md`, each ending
-with the full degradation gate (`bun test` + `bun bench/perf.ts` + `apiplan doctor`). Every
-number here was measured — on this machine (darwin arm64, bun 1.3.14), on a Linux
-container, on a real WSL2 box, or on GitHub's Windows runners — never estimated.
+This journal records the measure → find gap → fix → re-verify trail against
+`BUDGETS.md`. Release gates always end with `bun test`, `bun bench/perf.ts` and
+`apiplan doctor`; evidence below came from this machine, containers, a real WSL2 box,
+or GitHub's Windows runners — never estimates.
 
 Rounds 1–5 hardened the engine. Rounds 6–10 made setup one line and verified Linux.
 Rounds 11–13 finished the job: WSL and Windows executed for real, which immediately
@@ -574,3 +574,43 @@ auth headers — it hands out a subscription to anything that can reach it.
 
 **Degradation check:** 134 tests pass, up from 122; 12 new ones cover the dialect
 routing, both error envelopes, auth and the loopback default.
+
+## Round 22 — caching became a wire contract, not a deployment toggle
+
+The API already forwarded requests, but two details were being flattened away: native
+Anthropic content/system blocks lost their `cache_control`, and OpenAI callers had no
+stable `prompt_cache_key`/session route. The server also had a stable-versus-candidate
+policy split that could silently return a future deployment to the uncached path.
+
+**Fix:** preserve caller-native Anthropic blocks and metadata; forward OpenAI cache identity
+to both `prompt_cache_key` and the Codex `session_id` header; translate upstream cache-read
+and cache-write counters into both API dialects. Cached is now the sole serve policy — no
+canary flag and no `APIPLAN_CACHE_POLICY` escape hatch.
+
+**Measured live:** two identical large-prefix Anthropic messages made the second response
+report **16,226 `cache_read_input_tokens`**. The OpenAI equivalent reported **4,864
+`cached_tokens`**. These are provider receipts, not elapsed-time inference.
+
+## Round 23 — upgrade the listener without breaking existing clients
+
+A new policy is not standard while the old process still owns port 8787. `apiplan hotswap
+upgrade` now asks the current server to drain, waits for active requests, replaces it on
+the same address, then verifies the new control state. The actual cutover replaced PID
+60491 (`stable`) with PID 58211 (`cached`); a 40-way continuity burst returned **40/40 200**.
+
+## Round 24 — every provider upgrade folded, with honest boundaries
+
+The release integrates Google/Antigravity, Ollama, media generation/input, bounded video
+vision, credential single-flight/rotation recovery, tool round-trips, truncation detection
+and evidence-based health. The cache capability matrix is explicit: Anthropic and OpenAI
+receive remote prefix-cache controls; Google follows its provider-native request contract;
+Ollama is local and gains nothing from a remote prefix-cache hint.
+
+The live model matrix answered exactly `MATRIX_OK` from `claude-opus-5`, `gpt-5.6-sol`,
+`gemini-3.7-flash` and `heretic:latest`. The OpenAI catalog now includes API-capable named
+products `gpt-reserve` and `codex-auto-review`, while excluding `gpt-5.3-codex-spark`
+because the live catalog marks `supported_in_api=false`.
+
+**Degradation check:** **271 tests pass, 800 assertions**. All seven performance budgets
+pass: 24 ms client overhead (≤25), 3 ms owned dispatch+drain (≤60), 55 MB idle daemon
+(≤80), two remote providers live. Network and credential timing remain observational.

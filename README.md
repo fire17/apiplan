@@ -6,7 +6,7 @@
 
 [![ci](https://github.com/fire17/apiplan/actions/workflows/ci.yml/badge.svg)](https://github.com/fire17/apiplan/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/fire17/apiplan?color=e8b84a)](https://github.com/fire17/apiplan/releases)
-[![tests](https://img.shields.io/badge/tests-156%20passing-e8b84a)](test/)
+[![tests](https://img.shields.io/badge/tests-271%20passing-e8b84a)](test/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-e8b84a)](package.json)
 [![platforms](https://img.shields.io/badge/verified%20on-macOS%20·%20Linux%20·%20WSL%20·%20Windows-7aa2f7)](#cross-platform)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -34,11 +34,11 @@ Gemini `--public` vision, Veo video, or Lyria music. Those calls may be billed b
 - **Speech** — `tts <anything>` speaks in ten voices over OpenAI's realtime socket
   (`gpt-realtime`), which accepts the ChatGPT login and returns PCM16 that needs a
   44-byte wav header and **no codec**. Any language; Hebrew verified.
-- **Zero dependencies.** 2,254 lines of TypeScript, `dependencies: {}`, `devDependencies: {}`.
-  Speech needed no WebRTC stack in the end — just a WebSocket without a retired header.
-- **Every claim is receipted.** `DARWIN.md` logs 18 rounds including the failures: the
-  routes that 404'd, the budget that measured the operating system by mistake, and the
-  CAPTCHA that closed one path for good.
+- **Zero dependencies.** 7,202 lines across the text/model CLI and provider core,
+  `dependencies: {}`, `devDependencies: {}`. Speech needed no WebRTC stack in the end —
+  just a WebSocket without a retired header.
+- **Every claim is receipted.** `DARWIN.md` logs the measure-fix-verify trail including
+  failed routes, a budget that measured the operating system, and the cache cutover below.
 
 > [!IMPORTANT]
 > If you pay for Claude Code or ChatGPT, you already own everything this ships. It just
@@ -115,17 +115,16 @@ Then `apiplan` shows you everything:
 
 ```console
 $ apiplan status
-apiplan v0.2.1  ·  macOS  ·  daemon warm
+apiplan v0.7.0  ·  macOS  ·  daemon warm
 
 PROVIDERS
-  ● anthropic    Keychain (Claude Code-credentials) · expires 2026-07-28 20:14 · team
-    Anthropic (Claude Code subscription) · 11 models, just now
-  ● openai       ~/.codex/auth.json · chatgpt · expires 2026-07-28 21:07
-    OpenAI (Codex / ChatGPT subscription) · 6 models, just now
+  ● anthropic    Claude Code subscription · 10 models
+  ● openai       Codex / ChatGPT subscription · 8 models
+  ● google       Antigravity / Gemini Code Assist subscription · 4 models
+  ● ollama       local · 9 models
 
-COMMANDS 13 configured in ~/.bun/bin
-  opus  opus-fast  sonnet  sonnet-fast  fable  fable-fast  haiku  haiku-fast
-  gpt-fast  sol  luna  terra
+COMMANDS 37 configured in ~/.bun/bin
+  opus  opus-fast  sonnet  sonnet-fast  sol  gemini  heretic  imagine  tts  …
 ```
 
 ## A family name always means the newest model
@@ -359,7 +358,7 @@ of it. That part is physics, not code.
 account. `JIMMY_API` / `JIMMY_MODEL` point it elsewhere; `JIMMY_DAEMON=off` disables the
 warm holder.
 
-## Point any SDK at localhost
+## Point any SDK at localhost — with caching intact
 
 `apiplan serve` runs a local server that speaks **OpenAI's and Anthropic's wire shapes
 exactly**. Swap the base URL and existing code answers from your subscription — no key,
@@ -372,7 +371,7 @@ apiplan serve                    # http://127.0.0.1:8787
 ```python
 from openai import OpenAI
 client = OpenAI(api_key="not-needed", base_url="http://127.0.0.1:8787/v1")
-client.chat.completions.create(model="opus", messages=[...])   # Claude, in OpenAI's shape
+client.chat.completions.create(model="opus", messages=[...])
 ```
 
 ```sh
@@ -380,10 +379,16 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 ```
 
-**The dialect and the backend are independent.** The path decides the response *shape*;
-the `model` field decides *who answers*. So `/v1/chat/completions` with `model: "opus"`
-gives you Claude in OpenAI's format — which matters because most tooling only speaks one
-dialect, and now every model reaches all of it.
+**The dialect and backend are independent.** The path decides response shape; `model`
+decides who answers. The server preserves native Anthropic `cache_control` blocks and
+OpenAI `prompt_cache_key`, reports cache-read/write usage in both dialects, and keeps the
+cached route as the only production policy. There is no legacy non-cached mode to drift
+back into.
+
+`apiplan hotswap upgrade` drains the server already owning port 8787, hands the listener
+to the current build, and keeps clients on the same URL. The cache rollout used that exact
+path: 40/40 parallel continuity probes returned 200 after the swap; repeat live calls
+reported **16,226 Anthropic cache-read tokens** and **4,864 OpenAI cached tokens**.
 
 | endpoint | shape |
 |---|---|
@@ -391,14 +396,11 @@ dialect, and now every model reaches all of it.
 | `POST /v1/messages` | Anthropic messages, streaming and not |
 | `POST /v1/audio/speech` | OpenAI speech — `instructions` steers delivery, like `--as` |
 | `POST /v1/images/generations` | OpenAI images, `b64_json` |
-| `GET /v1/models` | both shapes; the caller's auth header picks which |
+| `GET /v1/models` | 32 live models across Anthropic, OpenAI, Google, Ollama and jimmy |
 
-Every model is reachable from either shape, **including jimmy** — `model: "jimmy"` or
-`model: "llama3.1-8B"` on `/v1/chat/completions` or `/v1/messages`. It needs no
-credential, so it keeps answering through the API even when nothing is logged in.
-
-Verified against the **official `openai` and `@anthropic-ai/sdk` packages**, both
-directions, streaming included — not just curl.
+Verified live across all four provider families: `opus → claude-opus-5`,
+`sol → gpt-5.6-sol`, `gemini → gemini-3.7-flash`, and `heretic → heretic:latest`.
+Official OpenAI and Anthropic SDK contracts remain covered in the test suite.
 
 It binds `127.0.0.1` only, because it hands out your subscription to anything that can
 reach it. Set `APIPLAN_API_KEY` to require a key (enforced on `Authorization` *and*
@@ -434,16 +436,15 @@ Measured on this machine (bun 1.3.14, darwin arm64); reproduce with `bun bench/p
 
 | | |
 |---|---|
-| client overhead, no network | **18 ms** (bun's own floor is 11 ms) |
-| overhead we add to a warm call | **~4 ms** — measured inside the client (dispatch + drain), not inferred from noisy end-to-end timings |
-| first token, warm | **~0.96 s** (text) · ~1.7 s (with an image) |
-| 25 calls in parallel | **25/25**, 2.4 s wall clock, per-call p50 1.06 s |
-| idle daemon | **40–51 MB**, ~0 % CPU, exits itself after 30 min |
+| client overhead, no network | **24 ms** against a ≤25 ms budget |
+| overhead we add to a warm call | **3 ms** — dispatch + drain inside the client |
+| warm call vs raw fetch | **748 ms vs 769 ms** in the release run *(observational; provider jitter is not gated)* |
+| credential read the daemon skips | **17 ms** *(observational OS cost)* |
+| idle daemon | **55 MB**, under the 80 MB budget; ~0 % CPU, exits after 30 min |
 
-The daemon starts on your first call, caches the credential (a Keychain read costs 13 ms
-every time otherwise) and holds the connection to each provider open. It never delays a
-cold call: if it isn't up yet, that call goes direct and the daemon warms up for the next
-one. `--no-daemon` opts out; `APIPLAN_DAEMON=off` disables it globally.
+The daemon starts on your first call, caches the credential and holds provider connections
+open. It never delays a cold call: if it is not up yet, that call goes direct while the
+daemon warms for the next one. `--no-daemon` opts out; `APIPLAN_DAEMON=off` disables it.
 
 What it can't fix: network round-trip and the provider's own first-token time. Those are
 most of the ~1 s, and no client can remove them.
@@ -460,11 +461,11 @@ opus / sonnet / sol / …        thin shims, generated from commands.json
 bin/apiplan.ts                 status · models · commands · doctor · TUI
 ```
 
-Anthropic calls go to `/v1/messages` with the subscription's OAuth token and the Claude
-Code identity block; OpenAI calls go to the Codex Responses endpoint with the
-`chatgpt-account-id` header. Both contracts were read out of the official binaries rather
-than guessed, and every fragile constant is overridable by environment variable
-(`apiplan --help` lists them) so a server-side change is a config tweak, not a rebuild.
+Anthropic calls go to `/v1/messages`; OpenAI uses Codex Responses; Google uses the
+Antigravity Code Assist subscription; Ollama stays on loopback. The API surface preserves
+cache identities and usage receipts rather than flattening them away. Fragile endpoints
+remain environment-overridable (`apiplan --help`) so a server-side move is configuration,
+not a rebuild.
 
 ## Cross-platform
 
@@ -513,24 +514,23 @@ apiplan doctor      # PATH, logins, daemon, shadowed names — with the fix for 
 ## Development
 
 ```sh
-bun test                  # 134 tests: aliases, wire contracts, CLI, installer, platform layer
-bun bench/perf.ts         # the budgets in BUDGETS.md, with regression detection
+bun test                  # 271 tests: cache, aliases, wire contracts, media, health, rotation, truncation
+bun bench/perf.ts         # all 7 performance budgets + observational network rows
 ```
 
 `VISION.md` is the founding brief, `BUDGETS.md` turns its adjectives into enforced
-numbers, `LADDER.md` is the information architecture, and `DARWIN.md` logs eighteen rounds of
-measure-fix-verify — including the round where the daemon turned out to be making calls
-1.6 s *slower*, and the optimisation that was measured, rejected and recorded.
+numbers, `LADDER.md` is the information architecture, and `DARWIN.md` records the
+measure-fix-verify trail — including failures and rejected optimizations, not only wins.
 
 ## What it touches, and how to undo it
 
 | | |
 |---|---|
-| **Reads** | your existing logins — macOS Keychain / `~/.claude/.credentials.json`, and `~/.codex/auth.json` |
-| **Writes** | `~/.apiplan/` (your commands + cached model lists) and one shim per command in your bin dir |
-| **Never touches** | your credentials (never copied, never sent anywhere but the provider they came from), your Codex history (`store: false`), or a name a real system tool owns — the installer refuses `gpt` on macOS rather than shadow `/usr/sbin/gpt` |
-| **Uninstall** | `apiplan prune && rm -rf ~/.apiplan` — the shims are plain files, delete them any time |
-| **Escape hatch** | `APIPLAN_DAEMON=off` disables the daemon; `--no-daemon` for one call; `~/.apiplan/commands.json` is editable JSON |
+| **Reads** | existing Claude Code, Codex and Antigravity logins; Ollama on loopback |
+| **Writes** | `~/.apiplan/` (commands, model catalogs, health/cache state) and generated shims in your bin dir |
+| **Never touches** | credential contents or Codex history (`store: false`); it refuses to shadow a real system tool |
+| **Uninstall** | `apiplan prune && rm -rf ~/.apiplan` — generated shims are plain files |
+| **Escape hatch** | `APIPLAN_DAEMON=off`, `--no-daemon`, editable `~/.apiplan/commands.json` |
 
 ## How the claims are enforced
 

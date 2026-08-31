@@ -1,3 +1,12 @@
+import pkg from "../package.json";
+import { VERSION } from "../src/engine.ts";
+
+describe("release identity", () => {
+  test("runtime and package versions cannot drift", () => {
+    expect(VERSION).toBe(pkg.version);
+  });
+});
+
 // The wire contract. These run with no network and no credentials, so they are the
 // guard against silently degrading a request shape (the class of bug that made
 // `-e high` a 400 on Opus 4.8 before it was caught).
