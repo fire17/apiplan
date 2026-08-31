@@ -4867,7 +4867,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
         // "the mouth went quiet" is always answerable from the log instead of guessed at.
         if (suppressAuto) {
           if (!mutedSinceAt) mutedSinceAt = Date.now();
-          if (Date.now() - lastMutedNoteAt > 60000) {
+          // BOTH gates (MIND catch 2026-08-31 19:36, the false-green class inverted): the note
+          // interval AND the episode length. Without the second, a one-tick transient suppress
+          // (overlap recovery flips suppressAuto around every resend) printed "CLOSED for 0s"
+          // about a mouth that answered 13s later — the flag is right (the reply path gates on
+          // suppressAuto), the TIMER claimed a minute-scale state from a 0-second episode.
+          if (Date.now() - mutedSinceAt > 60000 && Date.now() - lastMutedNoteAt > 60000) {
             lastMutedNoteAt = Date.now();
             // NOT "mouth ..." — PRE-RELAUNCH AUDIT 2026-08-22 (P0). lm-calls reads ACTIVE/PARKED
             // from the LAST `"text":"mouth [A-Z]*` in the log; a line starting `mouth still`
