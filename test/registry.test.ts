@@ -25,7 +25,6 @@ describe("explicit versions stay reachable", () => {
     ["opus47", "claude-opus-4-7"],
     ["opus46", "claude-opus-4-6"],
     ["opus45", "claude-opus-4-5-20251101"],
-    ["opus41", "claude-opus-4-1-20250805"],
     ["sonnet5", "claude-sonnet-5"],
     ["sonnet46", "claude-sonnet-4-6"],
     ["sonnet45", "claude-sonnet-4-5-20250929"],
@@ -57,6 +56,19 @@ describe("variants", () => {
   });
   test("codex means the OpenAI coding model", () => {
     expect(resolve("codex")?.provider).toBe("openai");
+  });
+});
+
+describe("every subscription model marked API-capable is addressable", () => {
+  test("named hidden Codex products are models, not parser casualties", () => {
+    expect(id("gpt-reserve")).toBe("gpt-reserve");
+    expect(id("codex-auto-review")).toBe("codex-auto-review");
+    expect(id("reserve")).toBe("gpt-reserve");
+    expect(id("auto-review")).toBe("codex-auto-review");
+    expect(id("codex")).toBe("gpt-5.6-sol");
+  });
+  test("models explicitly unsupported in the API are not advertised", () => {
+    expect(id("gpt-5.3-codex-spark")).toBeNull();
   });
 });
 

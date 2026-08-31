@@ -5,10 +5,11 @@
 // Every capability is a headless subcommand first; the TUI is a view over those
 // same functions, so anything you can click you can also script.
 import { join, basename as basenameOf } from "node:path";
-import { PROVIDERS, providerFor } from "../src/providers.ts";
+import { PROVIDERS, providerFor, refreshGoogleCatalog } from "../src/providers.ts";
 import { models, aliasesFor, cacheAge, cacheStale, saveModels, resolve, unparseable, type Model, type ProviderId } from "../src/registry.ts";
 import * as C from "../src/commands.ts";
-import { osLabel, onPath, defaultBinDir, whichSync, IS_WIN, STATE_DIR, HOME } from "../src/platform.ts";
+import { osLabel, onPath, defaultBinDir, whichSync, IS_WIN, STATE_DIR, HOME, readJson, writeJson } from "../src/platform.ts";
+import { OLLAMA_BASE, OLLAMA_META_FILE, refreshOllama } from "../src/providers-ollama.ts";
 import { VERSION, daemonAlive, daemonStop, runDaemon, die } from "../src/engine.ts";
 
 // ── presentation ──────────────────────────────────────────────────────────────
@@ -56,11 +57,20 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
         const list = j.data.map((m: any) => ({ id: m.id, label: m.display_name ?? m.id }));
         saveModels(id, list);
         notes.push(`${id}: ${list.length} models from /v1/models${dropNote(id, list)}`);
+      } else if (id === "google") {
+        const r = await refreshGoogleCatalog();
+        notes.push(`${id}: ${r.count} chat models from Antigravity's live catalog${r.imageModels.length ? ` · image generation: ${r.imageModels.join(", ")}` : " · no media generator advertised"}`);
+      } else if (id === "ollama") {
+        // The library is local, so this is the one refresh that needs no login and no
+        // network: a loopback GET. It lives in the provider (refreshOllama) because the API
+        // server calls the SAME code to register itself at startup — see ensureOllama().
+        const r = await refreshOllama();
+        notes.push(`${id}: ${r.count} local models from ${r.base}/api/tags · ${r.withTools} with tool support${dropNote(id, models(id).map((m) => ({ id: m.id })))}`);
       } else {
         // Codex maintains its own authoritative cache; read it rather than re-fetch.
         const f = join(HOME, ".codex", "models_cache.json");
         const raw = JSON.parse(require("node:fs").readFileSync(f, "utf8"));
-        const list = (raw.models ?? []).map((m: any) => ({
+        const list = (raw.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
           id: m.slug ?? m.id, label: m.display_name ?? m.slug,
           efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter(Boolean),
         })).filter((m: any) => m.id);
@@ -337,6 +347,8 @@ USAGE
   apiplan                        interactive dashboard (providers · models · commands)
   apiplan status                 which providers am I connected to?
   apiplan models [provider]      every model + the aliases that reach it   ${dim("--refresh")}
+  apiplan media                  image/video/music/speech models on your Gemini key
+  apiplan vision <video>         ordered concurrent Gemini frame understanding
   apiplan commands               every global command, and whether PATH finds it
   apiplan voices                 every speech voice available to you, and from where
   apiplan install                create the default command set and put it on PATH
@@ -349,6 +361,8 @@ USAGE
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
+  apiplan hotswap <status|upgrade> [--wait-seconds N]
+                                 drain + replace the live 8787 server without breaking clients
   apiplan talk [--voice v]       speak with the model out loud, both ways
                                  ${dim("uses the warm daemon when one is up (~half the latency);")}
                                  ${dim("--direct forces the in-process path · --park pre-warms it")}
@@ -403,6 +417,26 @@ switch (sub) {
   case "models": {
     if (has("--refresh") || has("-r")) for (const n of await refreshModels(valOf("--provider") as ProviderId | undefined)) process.stdout.write(dim(`  ${n}\n`));
     cmdModels(argv[1] && !argv[1].startsWith("-") ? argv[1] : undefined);
+    break;
+  }
+  case "media": {
+    try {
+      const { discoverGeminiMedia } = await import("../src/gemini-media.ts");
+      const rows = await discoverGeminiMedia();
+      process.stdout.write(`\n${head("GEMINI GENERATIVE MEDIA")} ${dim("public API key · ~/.config/gemini/api_key")}\n`);
+      for (const kind of ["image", "video", "music", "speech"]) {
+        const ms = rows.filter((r) => r.kind === kind);
+        process.stdout.write(`\n  ${bold(kind.toUpperCase())}\n`);
+        for (const m of ms) process.stdout.write(`    ${key(m.model)}${m.description ? dim(` · ${m.description}`) : ""}\n`);
+      }
+      process.stdout.write(`\n${dim("global CLI: gemini --draw … · gemini --video … · gemini --song …")}\n`);
+      process.stdout.write(dim("AGY subscription generation: image only; Veo/Lyria/TTS use the separate Gemini API key.\n"));
+    } catch (e: any) { die(e?.message ?? String(e)); }
+    break;
+  }
+  case "vision": {
+    const { runVisionCLI } = await import("./vision.ts");
+    await runVisionCLI(argv.slice(1));
     break;
   }
   case "commands": case "ls": cmdCommands(); break;
@@ -555,10 +589,67 @@ switch (sub) {
     } catch (e: any) { die(e?.message ?? String(e)); }
     break;
   }
+  case "hotswap": {
+    const action = argv[1] ?? "status";
+    const waitSeconds = Number(valOf("--wait-seconds") ?? "300");
+    const port = Number(valOf("--port") ?? process.env.APIPLAN_HOTSWAP_PORT ?? "8787");
+    const base = `http://127.0.0.1:${port}`;
+    const stateFile = `${process.env.HOME}/.apiplan/hotswap-${port}.json`;
+    const control = async () => {
+      try {
+        const response = await fetch(`${base}/_apiplan/control`);
+        if (!response.ok) return null;
+        const value = await response.json() as any;
+        return typeof value?.pid === "number" && typeof value?.cachePolicy === "string" ? value : null;
+      } catch { return null; }
+    };
+    if (action === "status") {
+      const live = await control();
+      process.stdout.write(JSON.stringify({ live, state: readJson(stateFile, null) }, null, 2) + "\n");
+      break;
+    }
+    if (action === "upgrade") {
+      const live = await control();
+      if (!live) die("no live APIPlan control endpoint on this port");
+      const priorPid = live.pid;
+      const drained = await (await fetch(`${base}/_apiplan/drain`, { method: "POST" })).json() as Record<string, unknown>;
+      const deadline = Date.now() + waitSeconds * 1000;
+      let last = drained;
+      while (Number(last.activeRequests ?? 0) > 0 && Date.now() < deadline) {
+        await Bun.sleep(250);
+        last = await control() ?? last;
+      }
+      if (Number(last.activeRequests ?? 0) > 0) die(`drain timed out with ${last.activeRequests} active request(s); the old server remains alive`);
+      try { process.kill(priorPid, "SIGTERM"); } catch {}
+      for (let i = 0; i < 40; i++) { try { process.kill(priorPid, 0); await Bun.sleep(100); } catch { break; } }
+      const child = Bun.spawn([process.execPath, import.meta.path, "serve", "--port", String(port)], {
+        env: { ...process.env }, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+      });
+      child.unref();
+      let upgraded: Record<string, unknown> | null = null;
+      for (let i = 0; i < 100; i++) {
+        await Bun.sleep(100);
+        upgraded = await control();
+        if (upgraded?.cachePolicy === "cached" && upgraded.accepting) break;
+      }
+      if (!upgraded || upgraded.cachePolicy !== "cached" || !upgraded.accepting) die(`upgraded server failed to claim ${port}`);
+      writeJson(stateFile, { version: 2, phase: "upgraded", priorPid, upgradedPid: upgraded.pid, upgradedAt: Date.now() });
+      process.stdout.write(`upgraded: cached server pid ${upgraded.pid} owns ${port}; existing clients reconnect automatically\n`);
+      break;
+    }
+    die(`unknown hotswap action '${action}' (use status or upgrade)`);
+    break;
+  }
   case "serve": {
     const { serve } = await import("../src/api.ts");
-    const s = serve({ port: valOf("--port") ? Number(valOf("--port")) : undefined, host: valOf("--host") ?? undefined });
-    process.stdout.write(`${bold("apiplan api")} ${dim("v" + VERSION)} listening on ${key(s.url)}\n\n`);
+    const explicitPort = valOf("--port");
+    const port = explicitPort ? Number(explicitPort) : undefined;
+    const s = serve({
+      port,
+      host: valOf("--host") ?? undefined,
+      reusePort: has("--reuse-port") || process.env.APIPLAN_REUSE_PORT === "1",
+    });
+    process.stdout.write(`${bold("apiplan api")} ${dim("v" + VERSION)} listening on ${key(s.url)} · cached tokens default\n\n`);
     process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
     process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
     process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));

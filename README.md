@@ -22,8 +22,9 @@
 
 ## The part that should stop you
 
-**Every capability below runs on a subscription you already have. No API key is ever
-read, and nothing is billed per token.**
+**The core chat, image, and speech paths below run on subscriptions you already have.**
+APIPlan only reads an API key when you explicitly select a public-provider feature:
+Gemini `--public` vision, Veo video, or Lyria music. Those calls may be billed by Google.
 
 - **Text** — `opus`, `sonnet`, `haiku`, `fable`, `sol`, `luna`, `terra`. The alias is
   checked against the API's own served-model field, so `opus → claude-opus-5` is
@@ -106,6 +107,10 @@ You must already be logged into `claude` and/or `codex`. **apiplan never asks fo
 credential, never stores one, and never sends one anywhere except the provider it came
 from.**
 
+The global `gemini` command can also use an existing Gemini API key from
+`APIPLAN_GEMINI_API_KEY`, `GEMINI_API_KEY`, or `~/.config/gemini/api_key`. That key is
+only sent to Google's Gemini API and is required for `--public`, `--video`, and `--song`.
+
 Then `apiplan` shows you everything:
 
 ```console
@@ -165,6 +170,33 @@ echo '[{"role":"user","content":"hi"}]' | opus --chat    # multi-turn
 opus --dry-run hello                 # show the exact request, send nothing
 opus --help                          # every flag, one screen
 ```
+
+Gemini adds low/medium/high reasoning, broad file understanding, and separate media
+generators:
+
+```sh
+gemini -e low -i frame.png 'what changed?'              # AGY vision route
+gemini --public -e low -i frame.png 'what changed?'     # public API-key route
+gemini -f clip.mp4 'describe the actions in order'      # audio/video/PDF/text also work
+gemini --draw -o image.jpg 'a blue glass bird'          # AGY image generator
+gemini --video --duration 4 -o clip.mp4 'a paper boat'   # Veo; Gemini API key
+gemini --song -o song.mp3 'warm synth-pop instrumental' # Lyria; Gemini API key
+gemini --speak -o voice.wav 'hello from Gemini'          # Gemini TTS; API key
+apiplan media                                           # live-discovered media models
+apiplan vision clip.mp4 --fps 2 --concurrency 8          # ordered frame understanding
+```
+
+`--file` is repeatable and accepts images, audio, video, PDFs, JSON, notebooks, rich
+text, and source/text files. AGY currently advertises image generation only; APIPlan
+does not pretend that AGY OAuth unlocks Veo or Lyria. Video and music use the public
+Gemini endpoints and the key above.
+
+`apiplan vision` samples a video with ffmpeg, analyzes frames through bounded concurrent
+public-Gemini calls, and prints ordered JSONL for a monitoring/aggregation agent. Each
+record carries `seq` and `timestampMs`; failures are emitted in place instead of being
+silently dropped. The final stderr receipt proves `sampled = completed = emitted`. Its
+reported FPS is pipeline throughput, not a claim that any individual action arrived in
+under a second.
 
 `*-fast` twins (`opus-fast`, `sol-fast`, …) bake in the least reasoning the provider
 allows plus streaming, for the quickest possible first token.

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "freeauth — Sign in with ChatGPT",
+  "version": "0.1.0",
+  "description": "Lets any website finish a Sign in with ChatGPT. Catches the http://localhost:1455/auth/callback hop that OpenAI's OAuth flow makes and hands the one-time code back to the page that asked. Nothing leaves your browser.",
+  "permissions": ["declarativeNetRequest"],
+  "host_permissions": ["http://localhost:1455/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["<all_urls>"], "js": ["relay.js"], "run_at": "document_start" }],
+  "web_accessible_resources": [{ "resources": ["callback.html"], "matches": ["<all_urls>"] }],
+  "icons": { "128": "icon.png" }
+}

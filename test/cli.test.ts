@@ -27,7 +27,7 @@ describe("help is real documentation (B9)", () => {
     expect(out).toContain("claude-opus-5");
   });
   test("documents every flag a user can pass", () => {
-    for (const flag of ["--model", "--effort", "--thinking", "--loop", "--max-tokens", "--image",
+    for (const flag of ["--model", "--effort", "--thinking", "--loop", "--max-tokens", "--image", "--file",
       "--system", "--system-file", "--chat", "--stream", "--show-thinking", "--json", "--dry-run",
       "--no-daemon", "--verbose", "--help", "--version", "--fast", "--1m", "--"]) {
       expect(out).toContain(flag);

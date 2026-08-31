@@ -3,7 +3,7 @@
 // checks a shape the translation layer owns. That keeps them credential-free and fast,
 // which is what lets them run in CI on three operating systems.
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { serve } from "../src/api.ts";
+import { serve, optsFrom, fromAnthropic } from "../src/api.ts";
 
 const readSrc = (name: string) =>
   require("node:fs").readFileSync(new URL(`../src/${name}`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
@@ -22,10 +22,20 @@ afterAll(() => stop());
 const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
   fetch(base + path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
 
+
 describe("it answers on both vendors' paths", () => {
   test("health reports what it is", async () => {
     const j: any = await (await fetch(base + "/health")).json();
-    expect(j.ok).toBe(true);
+    // NOT `ok === true`: /health is a verdict about the world it runs in, and this suite
+    // runs in whatever world CI or a laptop has — a cold state dir, no credentials, an
+    // unexercised provider. Demanding green here would either fail honestly-red machines
+    // or push the server back toward answering ok on nothing (the false green the outcome
+    // mechanism exists to prevent). What the CONTRACT owes is the shape and the vocabulary,
+    // plus the one invariant that must hold in every world: green costs proof.
+    expect(typeof j.ok).toBe("boolean");
+    expect(["ok", "degraded", "down", "unproven", "unverified"]).toContain(j.status);
+    expect(Array.isArray(j.providers)).toBe(true);
+    if (j.ok) for (const p of j.providers) { expect(p.connected).toBe(true); expect(p.verified).toBe("ok"); }
     expect(j.dialects).toEqual(["openai", "anthropic"]);
     expect(j.models).toBeGreaterThan(0);
   });
@@ -44,6 +54,69 @@ describe("it answers on both vendors' paths", () => {
   });
   test("a trailing slash is the same route", async () => {
     expect((await fetch(base + "/v1/models/")).status).toBe(200);
+  });
+});
+
+describe("server control telemetry", () => {
+  test("reports request counters and enters an explicit drain state", async () => {
+    const s = serve({ port: 0, host: "127.0.0.1" });
+    try {
+      const before: any = await (await fetch(s.url + "/_apiplan/control")).json();
+      expect(before.pid).toBe(process.pid);
+      expect(before.accepting).toBe(true);
+      expect(before.activeRequests).toBe(0);
+      expect(before.completedRequests).toBe(0);
+      expect(before.cachePolicy).toBe("cached");
+
+      expect((await fetch(s.url + "/v1/models")).status).toBe(200);
+      const after: any = await (await fetch(s.url + "/_apiplan/control")).json();
+      expect(after.completedRequests).toBe(1);
+      const draining: any = await (await fetch(s.url + "/_apiplan/drain", { method: "POST" })).json();
+      expect(draining.accepting).toBe(false);
+      expect(draining.draining).toBe(true);
+      expect(draining.activeRequests).toBe(0);
+      expect((await fetch(s.url + "/v1/models")).status).toBe(503);
+    } finally { s.stop(); }
+  });
+});
+
+describe("cache identity normalization", () => {
+  test("keeps OpenAI prompt_cache_key unchanged", () => {
+    expect(optsFrom({ prompt_cache_key: "pc_session_stable" }).promptCacheKey).toBe("pc_session_stable");
+  });
+  test("keeps OM's structured Anthropic metadata envelope unchanged", () => {
+    const wrapped = JSON.stringify({ device_id: "stable-device", session_id: "stable-session" });
+    expect(optsFrom({ metadata: { user_id: wrapped } }).promptCacheKey).toBe(wrapped);
+  });
+  test("keeps opaque Anthropic metadata compatible", () => {
+    expect(optsFrom({ metadata: { user_id: "opaque-affinity" } }).promptCacheKey).toBe("opaque-affinity");
+    const unrelated = JSON.stringify({ tenant: "stable-tenant" });
+    expect(optsFrom({ metadata: { user_id: unrelated } }).promptCacheKey).toBe(unrelated);
+  });
+  test("removes request-bound billing attestations only at the Anthropic proxy boundary", () => {
+    const stale = { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.246; cch=abcde;" };
+    const stable = { type: "text", text: "stable system", cache_control: { type: "ephemeral" } };
+    const misleading = { type: "text", text: "prefix x-anthropic-billing-header: keep this" };
+    const parsed = fromAnthropic({
+      system: [stale, stable, stale, misleading],
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(parsed.systemBlocks).toEqual([stable, misleading]);
+  });
+  test("different per-turn attestations rebuild to the same cacheable system prefix", () => {
+    const body = (cch: string) => ({
+      system: [
+        { type: "text", text: `x-anthropic-billing-header: cc_version=2.1.246; cch=${cch};` },
+        { type: "text", text: "stable system", cache_control: { type: "ephemeral" } },
+      ],
+      messages: [{ role: "user", content: "stable prefix" }],
+    });
+    const first = fromAnthropic(body("11111"));
+    const second = fromAnthropic(body("22222"));
+    expect(first.systemBlocks).toEqual(second.systemBlocks);
+    expect(first.systemBlocks).toEqual([
+      { type: "text", text: "stable system", cache_control: { type: "ephemeral" } },
+    ]);
   });
 });
 

@@ -6,10 +6,19 @@
 //   · the daemon holds the token AND a kept-alive TLS connection, so repeat calls
 //     skip both the credential read and the handshake
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, extname } from "node:path";
 import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, speakLocally, playAudio, openFile, IS_WIN } from "./platform.ts";
 import { models, resolve, type Model } from "./registry.ts";
-import { PROVIDERS, providerFor, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
+import { PROVIDERS, providerFor, providerRuntime, warmCreds, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
+import { frameSep, framePayload, deltasOf, watchTerminal } from "./stream-shape.ts";
+
+// Does this vendor accept the engine's `stream: true` body flag? providers.ts declares it
+// (wantsStreamFlag, set false for Google's strict proto-JSON endpoint) and src/api.ts has
+// always honoured it -- this file did not, so the SAME vendor fact was consumed on the
+// serve path and ignored on the command path. Google answered
+// 400 `Unknown name "stream"` to every command. build() cannot fix it: the flag is spread
+// in AFTER build() returns, which is exactly why the fact lives on the provider.
+const wantsStream = (prov: Provider): boolean => prov.wantsStreamFlag !== false;
 
 export const START = performance.now();
 export const VERSION = "0.6.0";
@@ -36,13 +45,15 @@ export function die(msg: string, code = 1): never {
 
 // ───────────────────────────── argv ─────────────────────────────
 export type Opts = CallOpts & {
-  model?: string; images: string[]; prompt: string[];
+  model?: string; images: string[]; files: string[]; prompt: string[];
   loop: number; stream: boolean; chat: boolean; json: boolean;
   dryRun: boolean; verbose: boolean; help: boolean; version: boolean;
   daemon: boolean; daemonStop: boolean; noDaemon: boolean;
+  publicGemini: boolean;
   thinking?: number; systemFile?: string;
   /** non-text jobs */
   out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
+  genVideo: boolean; genSong: boolean; duration?: number;
   aloud: boolean; conversation?: string; message?: string; last: boolean; open: boolean;
   direction?: string; directionFile?: string;
   dictate: boolean; lang?: string; silenceStop?: number;
@@ -50,9 +61,9 @@ export type Opts = CallOpts & {
 
 /** Flags that consume the next argv item (so it is never mistaken for prompt text). */
 const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
-  "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image",
+  "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image", "-f", "--file", "--media",
   "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message",
-  "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop"]);
+  "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop", "--duration"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -61,10 +72,10 @@ const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--
  */
 export function parseArgs(argv: string[], model0?: string): Opts {
   const o: Opts = {
-    model: model0, images: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
+    model: model0, images: [], files: [], prompt: [], loop: 1, stream: false, chat: false, json: false,
     dryRun: false, verbose: false, help: false, version: false,
-    daemon: false, daemonStop: false, noDaemon: false,
-    speak: false, play: false, local: false, aloud: false, last: false, open: false, dictate: false,
+    daemon: false, daemonStop: false, noDaemon: false, publicGemini: false,
+    speak: false, genVideo: false, genSong: false, play: false, local: false, aloud: false, last: false, open: false, dictate: false,
   };
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -84,12 +95,16 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--thinking": { const v = val(); o.thinking = v === "off" ? 0 : +v; if (o.thinking <= 0) o.thinkOff = true; break; }
       case "--loop": o.loop = Math.max(1, +val() || 1); break;
       case "-i": case "--image": o.images.push(val()); break;
+      case "-f": case "--file": case "--media": o.files.push(val()); break;
       case "-o": case "--out": o.out = val(); break;
       case "--draw": case "--gen-image": case "--image-out": o.genImage = true; break;
       case "--raw": o.rawPrompt = true; o.genImage = true; break;
       case "--enhance": o.rawPrompt = false; o.genImage = true; break;
       case "--size": o.imageSize = val(); break;
       case "--quality": o.imageQuality = val(); break;
+      case "--video": case "--gen-video": o.genVideo = true; break;
+      case "--song": case "--music": case "--gen-song": o.genSong = true; break;
+      case "--duration": o.duration = Number(val()) || 0; break;
       case "--speak": case "--say": o.speak = true; break;
       case "--as": case "--style": case "--emotion": case "--direction": o.direction = val(); o.speak = true; break;
       case "--as-file": o.directionFile = val(); o.speak = true; break;
@@ -116,6 +131,7 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--daemon": o.daemon = true; break;
       case "--daemon-stop": o.daemonStop = true; break;
       case "--no-daemon": o.noDaemon = true; break;
+      case "--public": case "--api-key-route": o.publicGemini = true; break;
       case "-v": case "--verbose": o.verbose = true; break;
       default:
         if (a.startsWith("-") && a.length > 1 && VALUED.has(a)) break; // unreachable, keeps switch honest
@@ -164,6 +180,64 @@ export async function loadImage(src: string): Promise<ImageRef> {
   }
   return { mediaType, base64: Buffer.from(bytes).toString("base64") };
 }
+
+/** MIME types advertised by the live Antigravity Gemini catalog, plus GIF for the existing
+ * cross-provider --image path. This deliberately rejects unknown binaries: "any file" in
+ * the CLI means any format the backend says it understands, not silently mislabeled bytes. */
+const MEDIA_BY_EXT: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+  ".gif": "image/gif", ".heic": "image/heic", ".heif": "image/heif",
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mj2": "video/mj2",
+  ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+  ".flac": "audio/flac", ".opus": "audio/opus", ".ogg": "audio/ogg", ".oga": "audio/ogg", ".l16": "audio/l16",
+  ".pdf": "application/pdf", ".json": "application/json", ".rtf": "application/rtf", ".ipynb": "application/x-ipynb+json",
+  ".txt": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown", ".html": "text/html", ".htm": "text/html",
+  ".css": "text/css", ".csv": "text/csv", ".xml": "text/xml", ".js": "text/javascript", ".mjs": "text/javascript",
+  ".ts": "text/typescript", ".tsx": "text/typescript", ".py": "text/x-python",
+};
+
+function mediaTypeFor(src: string, bytes?: Uint8Array): string | null {
+  const byName = MEDIA_BY_EXT[extname(src.split(/[?#]/, 1)[0]).toLowerCase()];
+  if (bytes) {
+    const image = sniff(bytes);
+    if (image) return image;
+    const ascii = Buffer.from(bytes.subarray(0, 16)).toString("latin1");
+    if (ascii.startsWith("%PDF-")) return "application/pdf";
+    if (ascii.startsWith("fLaC")) return "audio/flac";
+    if (ascii.startsWith("OggS")) return byName?.startsWith("video/") ? byName : (byName ?? "audio/ogg");
+    if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return byName ?? "video/webm";
+    if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WAVE") return "audio/wav";
+    if (ascii.startsWith("ID3") || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) return "audio/mpeg";
+    if (ascii.slice(4, 8) === "ftyp") return byName ?? "video/mp4";
+  }
+  return byName ?? null;
+}
+
+/** File/URL/data URI loader for Gemini's full multimodal input surface. */
+export async function loadMedia(src: string): Promise<ImageRef> {
+  if (/^https?:\/\//i.test(src)) {
+    const mediaType = mediaTypeFor(src);
+    if (!mediaType) die(`cannot infer the media type of URL '${src}' — add a recognised extension or use a data: URI`);
+    return { url: src, mediaType };
+  }
+  if (src.startsWith("data:")) {
+    const m = src.match(/^data:([^;,]+);base64,(.*)$/s);
+    if (!m) die("bad data: URI for --file (base64 form required)");
+    return { mediaType: m[1], base64: m[2] };
+  }
+  let bytes: Uint8Array;
+  if (src === "-") bytes = new Uint8Array(await Bun.stdin.arrayBuffer());
+  else {
+    if (!existsSync(src)) die(`file not found: ${src}`);
+    bytes = new Uint8Array(readFileSync(src));
+  }
+  let mediaType = mediaTypeFor(src, bytes);
+  if (!mediaType && !bytes.includes(0)) {
+    try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); mediaType = "text/plain"; } catch {}
+  }
+  if (!mediaType) die(`unsupported binary format: ${src} — Gemini accepts common image, audio, video, PDF, notebook, JSON, RTF, and text/code formats`);
+  return { mediaType, base64: Buffer.from(bytes).toString("base64") };
+}
 /** Keep --dry-run readable: never print a full base64 payload. */
 export function redact(o: any): any {
   return JSON.parse(JSON.stringify(o), (k, v) => {
@@ -187,6 +261,13 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
     try { const j = JSON.parse(raw); msg = j?.error?.message || j?.detail || msg; } catch {}
     surface(status, msg, retryAfter);
   }
+  // ── TRUNCATED SUCCESS, on the CLI path ──
+  // The server learned this on 2026-08-27 and this reader did not, so `sol "…"`, `apiplan
+  // -p`, `apiplan chat` and every call served by the warm daemon still printed whatever
+  // arrived before the upstream stopped and exited 0 — a half answer indistinguishable
+  // from a short one, and a zero-event cut that printed nothing at all. Same watch, same
+  // message, same off-switch as the server: see stream-shape.ts.
+  const term = watchTerminal(p);
   const reader = body.getReader();
   const dec = new TextDecoder();
   let buf = "", text = "", ttft = 0, served = "", imageB64 = "", revised = "", lastProgress = "";
@@ -195,29 +276,45 @@ export async function consume(p: Provider, body: ReadableStream<Uint8Array> | nu
     if (done) break;
     if (TIMING) marks.lastByte = performance.now() - START;
     buf += dec.decode(value, { stream: true });
-    const parts = buf.split("\n\n");
+    // Split on "\n", exactly as the other two readers do (api.ts:268, streamReply below).
+    // Splitting on frameSep's "\n\n" assumes every SSE vendor separates frames with a BLANK
+    // line. Google's v1internal:streamGenerateContent?alt=sse does not, so no complete part
+    // ever formed, every event stayed in the buffer, and the turn ended with the truncation
+    // guard firing on "nothing was received" -- a live-looking failure with zero events.
+    // framePayload already carries the per-vendor fact (the "data:" prefix, or ndjson's
+    // bare "{"), so a line split is correct for SSE and NDJSON alike.
+    const parts = buf.split("\n");
     buf = parts.pop() ?? "";
     for (const part of parts) {
-      for (const line of part.split("\n")) {
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
+      for (const line of [part]) {
+        const payload = framePayload(p, line);
+        if (!payload) continue;
         let ev: any; try { ev = JSON.parse(payload); } catch { continue; }
-        const d = p.delta(ev);
-        if (d.error) die(`stream error: ${d.error}`);
-        if (d.served && !served) served = d.served;
-        if (d.imageB64) imageB64 = d.imageB64;
-        if (d.revisedPrompt) revised = d.revisedPrompt;
-        if (d.progress && d.progress !== lastProgress && process.stderr.isTTY) {
-          lastProgress = d.progress;                      // a drawing call is slow; show life
-          process.stderr.write(`\r\x1b[2m${d.progress}\x1b[0m\x1b[K`);
+        term.see(ev);
+        for (const d of deltasOf(p, ev)) {
+          if (d.error) die(`stream error: ${d.error}`);
+          if (d.served && !served) served = d.served;
+          if (d.imageB64) imageB64 = d.imageB64;
+          if (d.revisedPrompt) revised = d.revisedPrompt;
+          if (d.progress && d.progress !== lastProgress && process.stderr.isTTY) {
+            lastProgress = d.progress;                    // a drawing call is slow; show life
+            process.stderr.write(`\r\x1b[2m${d.progress}\x1b[0m\x1b[K`);
+          }
+          if (d.text) { if (!ttft) ttft = performance.now() - START; text += d.text; if (o.stream) process.stdout.write(d.text); }
+          if (d.reasoning && o.showThinking) process.stderr.write(d.reasoning);
         }
-        if (d.text) { if (!ttft) ttft = performance.now() - START; text += d.text; if (o.stream) process.stdout.write(d.text); }
-        if (d.reasoning && o.showThinking) process.stderr.write(d.reasoning);
       }
     }
   }
   if (lastProgress && process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+  // The body ended. Without the vendor's own end-of-turn event the answer is INCOMPLETE,
+  // and printing it as the reply is the whole "it went silent / half an answer" fault.
+  // Streamed text is already on stdout — close the line and say so; buffered text is NOT
+  // printed, because on stdout it would be indistinguishable from a finished reply.
+  if (term.missing()) {
+    if (o.stream && text) process.stdout.write("\n");
+    die(`${term.message()}${text ? ` (${text.length} chars received${o.stream ? " and shown above" : ", discarded"})` : " (nothing was received)"}`, 5);
+  }
   let imagePath: string | undefined;
   if (imageB64) imagePath = saveImage(imageB64, o.out, revised, o.open);
   if (o.stream) process.stdout.write("\n");
@@ -245,12 +342,13 @@ export async function streamReply(
 ): Promise<string> {
   const p = providerFor(m);
   const b = p.build(m, turns, o, p.creds());
-  const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }), signal });
+  const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body), signal });
   if (!res.ok || !res.body) {
     let detail = (await res.text()).slice(0, 300);
     try { const j = JSON.parse(detail); detail = j?.error?.message ?? detail; } catch {}
     throw new Error(`${m.label} answered ${res.status}: ${detail}`);
   }
+  const term = watchTerminal(p);
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "", all = "";
@@ -261,15 +359,20 @@ export async function streamReply(
     const lines = buf.split("\n");
     buf = lines.pop() ?? "";
     for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
+      const payload = framePayload(p, line);
+      if (!payload) continue;
       let ev: any; try { ev = JSON.parse(payload); } catch { continue }
-      const d = p.delta(ev);
-      if (d.error) throw new Error(d.error);
-      if (d.text) { all += d.text; onText(d.text); }
+      term.see(ev);
+      for (const d of deltasOf(p, ev)) {
+        if (d.error) throw new Error(d.error);
+        if (d.text) { all += d.text; onText(d.text); }
+      }
     }
   }
+  // Same rule as the CLI and the server: no end-of-turn event, no finished answer. The
+  // REPL catches this and shows it as an error rather than folding half a turn into the
+  // conversation, where every later turn would be built on it.
+  if (term.missing()) throw new Error(term.message());
   return all;
 }
 
@@ -286,7 +389,7 @@ export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void
     if (pass > 0) convo = [...convo, { role: "user", text: REFINE }];
     const b = p.build(m, convo, o, creds);
     markDispatch();
-    const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }) });
+    const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body) });
     const last = pass === o.loop - 1;
     const r = await consume(p, res.body, res.status, res.headers.get("retry-after"), { ...o, stream: o.stream && last, verbose: o.verbose && last });
     if (!last) convo = [...convo, { role: "assistant", text: r.text }];
@@ -311,6 +414,27 @@ export function saveImage(b64: string, out: string | undefined, revised: string,
     if (!tool) process.stderr.write(`\x1b[2mno opener found — open ${path} yourself\x1b[0m\n`);
   }
   return path;
+}
+
+export function saveMediaFile(bytes: Uint8Array, contentType: string, out: string | undefined, kind: "video" | "song" | "speech", open = false): string {
+  const ext = contentType.includes("mp4") ? "mp4" : contentType.includes("wav") ? "wav" : contentType.includes("ogg") ? "ogg" : contentType.includes("mpeg") ? "mp3" : kind === "video" ? "mp4" : "mp3";
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "").replace("T", "-");
+  const path = out ?? `apiplan-${kind}-${stamp}.${ext}`;
+  writeFileSync(path, bytes);
+  process.stderr.write(`\x1b[2m${kind} saved: ${path} (${Math.round(bytes.length / 1024)}KB)\x1b[0m\n`);
+  if (open) openFile(path);
+  return path;
+}
+
+/** Direct binary image job for providers whose image generator is not a chat-stream tool. */
+export async function runImage(m: Model, prompt: string, o: Opts): Promise<void> {
+  if (!prompt.trim()) die("nothing to draw — give me an image prompt, or pipe it in.");
+  const p = providerFor(m);
+  if (!p.generateImage) die(`${p.label} has no direct image-generation endpoint`);
+  await p.prepare?.();
+  const r = await p.generateImage(prompt, o, p.creds());
+  const path = saveImage(r.base64, o.out, r.revisedPrompt ?? "", o.open);
+  process.stdout.write(path + "\n");
 }
 
 /** The speech path: one request, binary back — no SSE, no daemon. */
@@ -453,11 +577,35 @@ export async function runDaemon(): Promise<void> {
   if (IPC.kind === "unix" && existsSync(IPC.path)) { try { unlinkSync(IPC.path); } catch {} }
   const token = crypto.randomUUID();
 
+  // ── S-1 (2026-08-28): THIS IS A RESIDENT SERVER TOO ──────────────────────────────
+  // A token mint that blocks is correct in a one-shot CLI, where nothing else is waiting,
+  // and wrong in anything with an event loop. R-1 took the sync mint off the request path
+  // of serve() and left this daemon — which is long-lived, shared by every warm `apiplan
+  // ask` on the machine, and single-threaded exactly like serve() — still calling the
+  // spawnSync(curl) mint from inside creds(). Measured on an isolated daemon with the OAuth
+  // endpoint hanging: ONE ask froze the whole daemon, and its own /health went from 0.0005 s
+  // to 5.8 s. The two lines that fix it are the same two serve() got: turn the sync path
+  // off, and do whatever the credential needs from the network in prepare(), awaited, where
+  // awaiting frees the loop for every other request instead of stalling it.
+  // The CLI is untouched: it never calls runDaemon() in its own process (`--daemon` is its
+  // own process, and spawnDaemonDetached spawns another), so a one-shot ask still mints
+  // synchronously, which is the right thing there.
+  providerRuntime.syncRefresh = false;
+  // F9-2: and the PLAIN reads are blocking too — `security` on this machine, ~15 ms each,
+  // several per health check. Filling every snapshot here, before the socket is listening,
+  // is what makes the one unavoidable blocking read of each well happen while nobody is
+  // queued behind it. Never throws.
+  warmCreds();
+
   // credential cache, refreshed a few minutes before expiry
   const cache = new Map<string, { c: any; exp: number }>();
-  const creds = (pid: keyof typeof PROVIDERS) => {
+  const creds = async (pid: keyof typeof PROVIDERS) => {
     const hit = cache.get(pid);
     if (hit && hit.exp - Date.now() > 300_000) return hit.c;
+    // Off the request path by construction: prepare() either returns at once (serving the
+    // token already in hand while a mint runs in the background) or awaits a bounded async
+    // mint. Never throws by contract; a provider with nothing to prepare has no hook.
+    try { await PROVIDERS[pid].prepare?.(); } catch {}
     const c = PROVIDERS[pid].creds();
     cache.set(pid, { c, exp: c.expiresAt ?? Date.now() + 3_300_000 });
     return c;
@@ -493,8 +641,8 @@ export async function runDaemon(): Promise<void> {
         const s: any = await req.json();
         const m: Model = s.model;
         const p = PROVIDERS[m.provider as keyof typeof PROVIDERS];
-        const b = p.build(m, s.turns, s.opts, creds(m.provider));
-        const up = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify({ ...b.body, stream: true }) });
+        const b = p.build(m, s.turns, s.opts, await creds(m.provider));
+        const up = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body) });
         return new Response(up.body, {
           status: up.status,
           headers: { "content-type": up.headers.get("content-type") || "text/event-stream", "x-retry-after": up.headers.get("retry-after") || "" },
@@ -626,10 +774,14 @@ export async function callViaDaemon(m: Model, turns: Turn[], o: Opts, entry: str
 // ───────────────────────────── shared entry ─────────────────────────────
 /** Turn parsed options + stdin into the turns array both routes take. */
 export async function buildTurns(o: Opts): Promise<Turn[]> {
-  // `-i -` claims stdin for the image, so it must not also be read as prompt text
-  const stdinIsImage = o.images.includes("-");
-  const piped = !stdinIsImage && !process.stdin.isTTY ? await Bun.stdin.text() : "";
-  const images = await Promise.all(o.images.map(loadImage));
+  // One attachment may claim stdin; it must not also be read as prompt text.
+  const stdinAttachments = [...o.images, ...o.files].filter((x) => x === "-").length;
+  if (stdinAttachments > 1) die("stdin can only be used by one --image/--file attachment");
+  const piped = !stdinAttachments && !process.stdin.isTTY ? await Bun.stdin.text() : "";
+  const media = [
+    ...(await Promise.all(o.images.map(loadImage))),
+    ...(await Promise.all(o.files.map(loadMedia))),
+  ];
   if (o.systemFile) o.system = (o.system ? o.system + "\n\n" : "") + readFileSync(o.systemFile, "utf8");
   if (o.directionFile) o.direction = (o.direction ? o.direction + "\n\n" : "") + readFileSync(o.directionFile, "utf8").trim();
 
@@ -644,16 +796,16 @@ export async function buildTurns(o: Opts): Promise<Turn[]> {
       role: m.role === "assistant" ? "assistant" : "user",
       text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
     }));
-    if (images.length) {
+    if (media.length) {
       const i = turns.map((t) => t.role).lastIndexOf("user");
-      if (i < 0) die("--chat with --image needs a user message to attach the image to.");
-      turns[i].images = images;
+      if (i < 0) die("--chat with --image/--file needs a user message to attach the media to.");
+      turns[i].images = media;
     }
     return turns;
   }
   const text = [o.prompt.join(" ").trim(), piped.trim()].filter(Boolean).join("\n\n");
-  if (!text && !images.length) return [];
-  return [{ role: "user", text: text || "What is in this image?", images: images.length ? images : undefined }];
+  if (!text && !media.length) return [];
+  return [{ role: "user", text: text || "What is in this file?", images: media.length ? media : undefined }];
 }
 
 export function resolveModelOrDie(name: string | undefined): Model {

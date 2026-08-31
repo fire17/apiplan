@@ -1,0 +1,12 @@
+{
+  "name": "freeauth",
+  "version": "0.1.0",
+  "description": "Sign in with ChatGPT — turn a ChatGPT account into an OpenAI-compatible API (CLI bridge, browser extension, web SDK). Reproduced from scratch after Evan Zhou's video, from Codex CLI's open-source login flow.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "freeauth": "cli.ts" },
+  "scripts": { "start": "bun cli.ts", "test": "bun test", "test:e2e": "bun test/extension.e2e.ts" },
+  "engines": { "bun": ">=1.1.0" },
+  "dependencies": {},
+  "devDependencies": {}
+}

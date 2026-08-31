@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>freeauth — Sign in with ChatGPT</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; font-weight: 600; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+  button { padding: 10px 16px; border-radius: 999px; border: 1px solid #8884; background: #fff; color: #111; font: 500 15px system-ui; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  textarea, select, input { font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #8884; box-sizing: border-box; }
+  textarea { width: 100%; }
+  pre { white-space: pre-wrap; background: #8881; padding: 1rem; border-radius: 8px; min-height: 3rem; }
+  small { opacity: .7; } code { background: #8882; padding: 1px 4px; border-radius: 4px; }
+  details { margin-top: 2rem; } summary { cursor: pointer; }
+</style>
+<h1>Sign in with ChatGPT</h1>
+<p id="lede">Your ChatGPT account becomes an OpenAI-compatible API.</p>
+<div class="row"><span id="who"></span><button id="signin" hidden>Sign in with ChatGPT</button><button id="signout" hidden>Sign out</button></div>
+<div class="row"><label>bridge <input id="bridge" size="26"></label><label>model <select id="model"></select></label></div>
+<textarea id="q" rows="3" placeholder="Ask anything…"></textarea>
+<div class="row"><button id="ask" disabled>Ask</button><small id="status"></small></div>
+<pre id="out"></pre>
+
+<details>
+  <summary>No local bridge? Use the browser SDK (needs the extension)</summary>
+  <p><small>The button above signs in <b>through the bridge running on this machine</b> — no extension. The in-browser SDK
+  (<code>web/freeauth.js</code>) is only for a website with <b>no local server</b>; that path needs the freeauth extension
+  because a plain web page can't catch OpenAI's <code>localhost:1455</code> callback.</small></p>
+</details>
+
+<script>
+const $ = (id) => document.getElementById(id);
+$("bridge").value = location.origin.startsWith("http") ? location.origin : "http://localhost:1456";
+const status = (s) => $("status").textContent = s;
+const B = () => $("bridge").value.replace(/\/$/, "");
+
+async function refresh() {
+  let s = { signedIn: false };
+  try { s = await (await fetch(`${B()}/session`)).json(); } catch { status("bridge not reachable — is `freeauth` running?"); }
+  $("who").textContent = s.signedIn ? `${s.email ?? ""} · ${s.plan ?? ""}` : "";
+  $("signin").hidden = s.signedIn; $("signout").hidden = !s.signedIn; $("ask").disabled = !s.signedIn;
+  $("lede").textContent = s.signedIn ? "Signed in on this machine — ask away." : "Sign in once; the bridge on this machine catches the callback. No extension.";
+  if (s.signedIn) loadModels();
+}
+async function loadModels() {
+  try {
+    const j = await (await fetch(`${B()}/v1/models`, { headers: { authorization: "Bearer freeauth" } })).json();
+    $("model").innerHTML = (j.data ?? []).map((m) => `<option value="${m.id}">${m.display_name ?? m.id}</option>`).join("") || "<option>(none)</option>";
+  } catch (e) { status(`models: ${e.message}`); }
+}
+$("signin").onclick = async () => {
+  status("opening your browser to OpenAI…"); $("signin").disabled = true;
+  try { await fetch(`${B()}/login`, { method: "POST" }); status(""); } catch (e) { status(e.message); }
+  finally { $("signin").disabled = false; refresh(); }
+};
+$("signout").onclick = async () => { await fetch(`${B()}/logout`, { method: "POST" }); refresh(); };
+$("ask").onclick = async () => {
+  $("out").textContent = ""; status("…"); $("ask").disabled = true;
+  try {
+    const r = await fetch(`${B()}/v1/chat/completions`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer freeauth" },
+      body: JSON.stringify({ model: $("model").value, stream: true, messages: [{ role: "user", content: $("q").value }] }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error?.message ?? r.status);
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { done, value } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const l of lines) {
+        if (!l.startsWith("data:") || l.includes("[DONE]")) continue;
+        const j = JSON.parse(l.slice(5)); if (j.error) throw new Error(j.error.message);
+        $("out").textContent += j.choices?.[0]?.delta?.content ?? "";
+      }
+    }
+    status("done");
+  } catch (e) { status(e.message); } finally { $("ask").disabled = false; }
+};
+refresh();
+</script>
+</html>
