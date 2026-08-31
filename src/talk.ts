@@ -1258,6 +1258,12 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   let capsPrev: boolean | null = null;
   const CAPS_TL = `${LM_HOME}/caps-timeline.jsonl`;
   let sensorLostMutedAt = 0;   // E823: nonzero while WE muted the mic for a dead sensor
+  /** E823 pure rule (testable — hands/tests/caps-sensor-lost.test.mjs drives THIS const):
+   *  fail the mic CLOSED only when a publisher was genuinely SEEN this call (prevSeen — an
+   *  LM_PTT=0/callback call with no sensor is never muted by absence), the sensor is stale,
+   *  the mic is open, and we have not already latched. */
+  const sensorLostDue = (prevSeen: boolean, stale: boolean, muted: boolean, latched: boolean): boolean =>
+    prevSeen && stale && !muted && !latched;
   const capsWitness = () => {
     const j = capsNow();
     // E823 FAIL-CLOSED (MIND direction ruling 2026-08-31, after the 18:32 leak): a publisher
@@ -1266,7 +1272,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
     // swallow his words) — but the MIC fails toward MUTED: a wrong OPEN is a privacy failure,
     // a wrong CLOSED is a recoverable annoyance. lm-ptt's boot/5s re-assert owns the reopen.
     const sensorStale = !j || Date.now() - (Number(j.ts) || 0) > 5000;
-    if (capsPrev !== null && sensorStale && !micMuted && !sensorLostMutedAt) {
+    if (sensorLostDue(capsPrev !== null, sensorStale, micMuted, sensorLostMutedAt !== 0)) {
       sensorLostMutedAt = Date.now();
       micMuted = true; archRoll("caps sensor lost");
       say("info", "caps sensor LOST (caps.json stale >5s after a live publisher this call) — mic failed CLOSED; privacy over convenience (E823)",
