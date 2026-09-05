@@ -21,7 +21,7 @@ import { frameSep, framePayload, deltasOf, watchTerminal } from "./stream-shape.
 const wantsStream = (prov: Provider): boolean => prov.wantsStreamFlag !== false;
 
 export const START = performance.now();
-export const VERSION = "0.7.1";
+export const VERSION = "0.8.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the
@@ -63,7 +63,8 @@ export type Opts = CallOpts & {
 const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--system-file",
   "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image", "-f", "--file", "--media",
   "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message",
-  "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop", "--duration"]);
+  "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop", "--duration",
+  "--session", "--cache-key"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -123,6 +124,10 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--stream": o.stream = true; break;
       case "--no-stream": o.stream = false; break;
       case "--chat": o.chat = true; break;
+      // A stable conversation identity for the provider's prompt cache: the same key on
+      // every turn of one `--chat` transcript is what turns a re-read of the whole history
+      // into a cache hit (Codex routes on it too — see providers.ts session_id).
+      case "--session": case "--cache-key": o.promptCacheKey = val(); break;
       case "--json": o.json = true; break;
       case "--show-thinking": o.showThinking = true; break;
       case "--fast": o.fast = true; break;

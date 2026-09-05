@@ -31,6 +31,7 @@ export const GOOGLE_EFFORTS = ["low", "medium", "high"];
 
 const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string[] }[]> = {
   anthropic: [
+    { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
     { id: "claude-opus-5", label: "Claude Opus 5" },
     { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
     { id: "claude-fable-5", label: "Claude Fable 5" },
@@ -60,12 +61,16 @@ const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string
   // the truth, and that refresh is a loopback GET needing no login.
   ollama: [],
   openai: [
-    { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh"] },
-    { id: "gpt-5.6-luna", label: "GPT-5.6-Luna", efforts: ["low", "medium", "high", "xhigh"] },
-    { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", efforts: ["low", "medium", "high", "xhigh"] },
+    // GPT-6 Astra (2026-09-05): read live from the Codex catalog, which lists it only for
+    // `client_version` ≥ 0.153.0 (its `minimal_client_version`) — see CODEX_CLIENT_VERSION
+    // in bin/apiplan.ts. Efforts are the catalog's own six.
+    { id: "gpt-6-astra", label: "GPT-6-Astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { id: "gpt-5.6-luna", label: "GPT-5.6-Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { id: "gpt-5.5", label: "GPT-5.5", efforts: ["low", "medium", "high", "xhigh"] },
-    { id: "gpt-5.4", label: "GPT-5.4", efforts: ["low", "medium", "high", "xhigh"] },
-    { id: "gpt-5.4-mini", label: "GPT-5.4-mini", efforts: ["low", "medium", "high"] },
+    // gpt-5.4 left the live catalog by 2026-09-05; only its -mini sibling is still served.
+    { id: "gpt-5.4-mini", label: "GPT-5.4-mini", efforts: ["low", "medium", "high", "xhigh"] },
     // API-capable named products from the live Codex catalog. Keep them in the offline
     // fallback too: a clean install has no models.openai.json yet, but exact model names
     // must remain addressable before the first authenticated refresh.

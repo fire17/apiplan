@@ -26,7 +26,7 @@
 APIPlan only reads an API key when you explicitly select a public-provider feature:
 Gemini `--public` vision, Veo video, or Lyria music. Those calls may be billed by Google.
 
-- **Text** — `opus`, `sonnet`, `haiku`, `fable`, `sol`, `luna`, `terra`. The alias is
+- **Text** — `opus`, `sonnet`, `haiku`, `fable`, `astra`, `sol`, `luna`, `terra`. The alias is
   checked against the API's own served-model field, so `opus → claude-opus-5` is
   observed, not assumed.
 - **Images** — `imagine a lighthouse at dusk` draws on the same Codex endpoint as chat,
@@ -132,13 +132,20 @@ COMMANDS 37 configured in ~/.bun/bin
 follows it, because the list comes from the provider's own model endpoint rather than a
 table someone has to remember to edit. Explicit versions never stop working:
 
+> GPT-6 Astra (2026-09-05) proved the rule the hard way. The Codex catalog is gated by
+> `client_version` — every model carries a `minimal_client_version`, and Astra's is 0.153.0
+> — so reading Codex's own cache file only ever showed what the *installed* Codex could see.
+> `apiplan models --refresh` now asks the catalog itself, as the newest Codex the machine
+> knows of (`APIPLAN_CODEX_CLIENT_VERSION` overrides), and falls back to the file offline.
+
 | you type | you get |
 |---|---|
 | `opus` | newest Opus (`claude-opus-5`) |
 | `opus5` · `opus48` · `opus47` · `opus45` | that exact version |
 | `opus4.8` · `Opus-4-8` · `OPUS_4_8` | same thing — separators and case are folded |
 | `sonnet` · `haiku` · `fable` | newest of each family |
-| `sol` · `luna` · `terra` | the current GPT-5.6 variants |
+| `astra` | GPT-6 Astra (`gpt-6-astra`) — the newest `gpt`, so `gpt`/`codex` follow it |
+| `sol` · `luna` · `terra` | the GPT-5.6 variants, still served and still commands |
 | `gpt55` · `gpt54mini` | that exact OpenAI model |
 | `claude-opus-4-8` | a full id passes straight through |
 
@@ -398,7 +405,7 @@ reported **16,226 Anthropic cache-read tokens** and **4,864 OpenAI cached tokens
 | `GET /v1/models` | 32 live models across Anthropic, OpenAI, Google, Ollama and jimmy |
 
 Verified live across all four provider families: `opus → claude-opus-5`,
-`sol → gpt-5.6-sol`, `gemini → gemini-3.7-flash`, and `heretic → heretic:latest`.
+`astra → gpt-6-astra`, `sol → gpt-5.6-sol`, `gemini → gemini-3.7-flash`, and `heretic → heretic:latest`.
 Official OpenAI and Anthropic SDK contracts remain covered in the test suite.
 
 It binds `127.0.0.1` only, because it hands out your subscription to anything that can

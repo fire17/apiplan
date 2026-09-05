@@ -40,6 +40,50 @@ function dropNote(id: ProviderId, list: { id: string }[]): string {
   return dropped.length ? dim(` · not addressable: ${dropped.join(", ")}`) : "";
 }
 
+/**
+ * The Codex catalog (`GET /backend-api/codex/models?client_version=…`) is GATED BY CLIENT
+ * VERSION: every model carries a `minimal_client_version`, and the endpoint hides anything
+ * newer than the client asking. GPT-6 Astra needs 0.153.0 (observed live 2026-09-05:
+ * absent at 0.152.0, listed from 0.153.0 up). Reading Codex's own `models_cache.json`
+ * therefore only ever showed what the INSTALLED Codex could see — a model that answers on
+ * this subscription today was "unknown" here until the user upgraded a different tool.
+ *
+ * So the catalog is fetched here, as the newest Codex the machine knows of: the highest of
+ * this floor (the newest Codex release when this was written), the installed Codex's own
+ * cache stamp, its update-check stamp, and APIPLAN_CODEX_CLIENT_VERSION. The floor only
+ * ever moves UP with the user's Codex, never down. The file stays as the offline fallback.
+ */
+const CODEX_CLIENT_VERSION = "0.153.4";
+const semverMax = (...vs: (string | undefined)[]) => vs.filter((v): v is string => !!v && /^\d+\.\d+\.\d+$/.test(v))
+  .sort((a, b) => { const x = a.split(".").map(Number), y = b.split(".").map(Number); return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]); }).at(-1) ?? CODEX_CLIENT_VERSION;
+type CatalogEntry = { id: string; label: string; efforts?: string[] };
+const fromCodexCatalog = (raw: any): CatalogEntry[] => (raw?.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
+  id: m.slug ?? m.id, label: m.display_name ?? m.slug,
+  efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter(Boolean),
+})).filter((m: any) => m.id);
+async function refreshOpenaiCatalog(p = PROVIDERS.openai): Promise<{ list: CatalogEntry[]; source: string }> {
+  const file = join(HOME, ".codex", "models_cache.json");
+  const cached = readJson<any>(file, {});
+  const version = semverMax(CODEX_CLIENT_VERSION, cached.client_version, readJson<any>(join(HOME, ".codex", "version.json"), {}).latest_version, process.env.APIPLAN_CODEX_CLIENT_VERSION);
+  try {
+    const c = p.creds();
+    const base = process.env.APIPLAN_OPENAI_BASE || "https://chatgpt.com";
+    const r = await fetch(`${base}/backend-api/codex/models?client_version=${encodeURIComponent(version)}`, {
+      headers: { authorization: `Bearer ${c.token}`, "chatgpt-account-id": c.account ?? "", originator: process.env.APIPLAN_ORIGINATOR || "codex_cli_rs" },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const list = fromCodexCatalog(await r.json());
+    if (!list.length) throw new Error("empty catalog");
+    return { list, source: `the live Codex catalog (as client ${version})` };
+  } catch (e: any) {
+    // Offline, or the endpoint moved: Codex's own file is still the truth as of its stamp.
+    const list = fromCodexCatalog(cached);
+    if (!list.length) throw new Error(`catalog fetch failed (${e?.message ?? e}) and no models in ${file.replace(HOME, "~")}`);
+    return { list, source: `codex cache (fetched ${cached.fetched_at ?? "?"}; live fetch failed: ${e?.message ?? e})` };
+  }
+}
+
 /** Ask each provider for its live model list. The one place that goes to the network. */
 async function refreshModels(only?: ProviderId): Promise<string[]> {
   const notes: string[] = [];
@@ -67,16 +111,9 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
         const r = await refreshOllama();
         notes.push(`${id}: ${r.count} local models from ${r.base}/api/tags · ${r.withTools} with tool support${dropNote(id, models(id).map((m) => ({ id: m.id })))}`);
       } else {
-        // Codex maintains its own authoritative cache; read it rather than re-fetch.
-        const f = join(HOME, ".codex", "models_cache.json");
-        const raw = JSON.parse(require("node:fs").readFileSync(f, "utf8"));
-        const list = (raw.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
-          id: m.slug ?? m.id, label: m.display_name ?? m.slug,
-          efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter(Boolean),
-        })).filter((m: any) => m.id);
-        if (!list.length) throw new Error("no models in codex cache");
-        saveModels(id, list);
-        notes.push(`${id}: ${list.length} models from codex cache (fetched ${raw.fetched_at ?? "?"})${dropNote(id, list)}`);
+        const r = await refreshOpenaiCatalog(p);
+        saveModels(id, r.list);
+        notes.push(`${id}: ${r.list.length} models from ${r.source}${dropNote(id, r.list)}`);
       }
     } catch (e: any) { notes.push(`${id}: refresh failed — ${e?.message ?? e} (kept previous list)`); }
   }

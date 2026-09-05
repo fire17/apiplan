@@ -7,10 +7,17 @@
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
 
-## Current state (v0.7.1, honest)
+## Current state (v0.8.0, honest)
 
 **Live-verified on macOS** (every claim below was observed, not assumed):
 
+- **GPT-6 Astra (`gpt-6-astra`, 2026-09-05) is served** — `astra`, `gpt6astra`, and now
+  `gpt`/`codex` resolve to it; `sol`/`luna`/`terra` keep their commands. The Codex catalog
+  is fetched live with a `client_version` floor (it hides models newer than the asking
+  client; Astra needs 0.153.0). Cached multi-turn verified on the wire: turn 2 on one
+  `prompt_cache_key` returned **1,024 `cached_tokens`** through both the CLI probe and the
+  OpenAI-shaped local API. `--session <key>` gives `--chat` transcripts that identity from
+  the shell; the interactive REPL mints one per session. DARWIN round 25 has the receipts.
 - Four provider families answer through one engine: Anthropic (Claude Code OAuth), OpenAI
   (Codex/ChatGPT), Google (Antigravity/Gemini Code Assist) and Ollama (loopback/local).
 - The localhost API preserves native cache identity: Anthropic `cache_control` blocks and
@@ -22,7 +29,10 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   `gemini → gemini-3.7-flash`, `heretic → heretic:latest`. The live API lists 32 models:
   10 Anthropic, 8 OpenAI, 4 Google, 9 Ollama and jimmy.
 - 37 global commands are installed in `~/.bun/bin`; `apiplan doctor` reports all clear.
-- **272 tests green; 7 of 7 performance budgets met.** Release measurements: 23 ms
+- **286 tests: 285 green locally; the 1 failure (GATE 4, outcome-anchor) pre-dates this
+  round and is environment-coupled — it posts this machine's freshly cached
+  `gemini-3.8-flash` at a probe upstream that 404s it. A fresh HOME (CI) resolves from the
+  baked fallback. 7 of 7 performance budgets met; `apiplan doctor` reports one pre-existing item (the `opus-fast` shim is not on disk).** Release measurements: 23 ms
   client overhead, 3 ms dispatch+drain, 66 MB idle daemon.
 - Text, images, speech, dictation, Gemini multimodal files/media, bounded video vision,
   tool-call round trips, credential rotation recovery, honest health verdicts and
@@ -63,7 +73,7 @@ State lives in `~/.apiplan/`: `commands.json` (your commands — plain JSON, edi
 ```sh
 cd ~/Creations/APIPlan
 bun test && bun bench/perf.ts && bun bin/apiplan.ts doctor   # the whole gate
-claude --resume 9d23ea6c-4fa0-4293-a3a7-34a7577c376f          # this session
+claude --resume 9d23ea6c-4fa0-4293-a3a7-34a7577c376f          # the v0.7.1 session
 ```
 
 Read in this order: `VISION.md` (what was asked) → `BUDGETS.md` (what "fast" means as
@@ -71,6 +81,8 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
 `LADDER.md` (why the TUI has the three views it has).
 
 1. v0.7.1 is published with green Ubuntu/macOS/Windows CI and an install-tested tarball.
+   v0.8.0 (Astra) is committed locally and NOT yet pushed/released — push, CI, tag, release
+   are the pending outward steps (ripple: README/registry entry already updated).
 2. Port 8788 is stopped; 8787 is the sole healthy production server.
 
 ## Traps worth knowing (learned the hard way)

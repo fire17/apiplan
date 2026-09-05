@@ -45,7 +45,7 @@ MAKE THINGS
 INPUT
   -i, --image <src>      image/URL/data/clipboard  ·  -f, --file <src> Gemini audio/video/PDF/text — repeatable
   -s, --system <text>    system prompt   ·   --system-file <f>  read it from a file
-      --chat             read a JSON messages array from stdin (multi-turn)
+      --chat             JSON messages array from stdin (multi-turn) · --session <key> keeps the prompt cache warm
       --                 everything after this is literal prompt text
 
 OUTPUT
@@ -157,9 +157,12 @@ if (!turns.length) {
   if (process.stdin.isTTY && process.stdout.isTTY) {
     const { chat } = await import("../src/chat.ts");
     const { streamReply } = await import("../src/engine.ts");
+    // One identity for the whole REPL session, so every turn's re-sent history is a
+    // prompt-cache hit upstream instead of a fresh read (Codex also routes on it).
+    const session = { ...o, promptCacheKey: o.promptCacheKey ?? `apiplan-chat-${crypto.randomUUID()}` };
     await chat({
       label: `${model.label}  (${model.id})`,
-      send: (t, onText, signal) => streamReply(model, t.map((x) => ({ role: x.role, text: x.content })), o, onText, signal),
+      send: (t, onText, signal) => streamReply(model, t.map((x) => ({ role: x.role, text: x.content })), session, onText, signal),
     }, { system: o.system });
     process.exit(0);
   }

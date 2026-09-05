@@ -614,3 +614,43 @@ because the live catalog marks `supported_in_api=false`.
 **Degradation check:** **271 tests pass, 800 assertions**. All seven performance budgets
 pass: 24 ms client overhead (≤25), 3 ms owned dispatch+drain (≤60), 55 MB idle daemon
 (≤80), two remote providers live. Network and credential timing remain observational.
+
+## Round 25 — GPT-6 Astra, and the catalog that hid it
+
+OpenAI shipped `gpt-6-astra` on 2026-09-03 (public rollout 2026-09-05). The subscription
+endpoint answered it on the first try — a two-turn probe through `openai.build()` came back
+`served=gpt-6-astra` — yet the CLI said `unknown model 'gpt-6-astra'`.
+
+**Found:** the OpenAI list was read from Codex's own `~/.codex/models_cache.json`, and the
+catalog behind that file (`GET /backend-api/codex/models?client_version=…`) is **gated by
+client version**: every entry carries a `minimal_client_version`, and the endpoint omits
+anything newer than the client asking. Bisected live: Astra absent at `client_version`
+0.152.0, present from 0.153.0 (its stamp) up. The installed Codex asked as 0.151.0, so a
+model this subscription served was invisible until an unrelated tool updated itself.
+
+**Fix:** `apiplan models --refresh` fetches the catalog itself, as the newest Codex the
+machine knows of — `max(0.153.4 floor, Codex's cache stamp, its update-check stamp,
+APIPLAN_CODEX_CLIENT_VERSION)` — and falls back to the file offline. `gpt-6-astra` is also
+baked into the offline fallback, and `gpt-5.4` (gone from the live catalog) is not.
+Default commands changed rule: a variant gets a command when it is the newest numbered
+model carrying that name, because "newest generation only" would have evicted `sol`,
+`luna`, `terra` the day a 6 outranked 5.6. `apiplan install` reported
+`new in this version: astra mini pro`.
+
+**Cached multi-turn, measured (provider receipts, same `prompt_cache_key` both turns):**
+
+| path | turn 1 | turn 2 |
+|---|---|---|
+| `openai.build()` probe, direct | input 1229 · cached 0 | input 1247 · **cached 1024** · "Your favorite color is teal." |
+| `POST /v1/chat/completions` model `astra` (fresh server, port 18789) | `cached_tokens: 0` | **`cached_tokens: 1024`** |
+| CLI `astra -v` | `served by gpt-6-astra · first token 2296ms` | — |
+
+Two identity gaps closed on the way: the interactive REPL sent no cache identity at all
+(every turn was a new conversation to Codex), so it now mints one key per session; and
+`--chat` transcripts from the shell gained `--session <key>` for the same reason.
+
+**Degradation check:** 286 tests, 285 green; the one failure (GATE 4) pre-dates this round
+and is environment-coupled — it posts this machine's freshly cached `gemini-3.8-flash` at a
+probe upstream that 404s it — and passes on a fresh HOME. All 7 performance budgets met
+(20 ms client overhead, 2 ms dispatch+drain, 57 MB idle daemon). Contract tests for Astra (`test/astra.test.ts`) run with no network: aliases,
+efforts, the Responses shape, the stable prefix across turns, the cache receipt, `--session`.

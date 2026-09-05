@@ -1,0 +1,84 @@
+// GPT-6 Astra (gpt-6-astra, OpenAI, 2026-09-05) — the wire contract this proxy holds for
+// it, with no network and no credentials. The live receipts behind these shapes are in
+// DARWIN.md round 25: turn 2 of a two-turn transcript on one prompt_cache_key came back
+// with 1,024 `cached_tokens` from the Codex subscription endpoint.
+import { expect, test, describe } from "bun:test";
+import { openai } from "../src/providers.ts";
+import { resolve, aliasesFor } from "../src/registry.ts";
+import { defaults } from "../src/commands.ts";
+import { parseArgs } from "../src/engine.ts";
+
+const CREDS = { token: "T", account: "ACC", source: "test" };
+const astra = () => resolve("astra")!;
+
+describe("gpt-6-astra is addressable", () => {
+  test.each(["astra", "gpt6astra", "gpt-6-astra", "GPT-6-Astra", "gpt6"])("%s → gpt-6-astra", (name) => {
+    expect(resolve(name)?.id).toBe("gpt-6-astra");
+  });
+  test("it is the newest gpt, so the family alias follows it and the older variants stay reachable", () => {
+    expect(resolve("gpt")?.id).toBe("gpt-6-astra");
+    expect(resolve("codex")?.id).toBe("gpt-6-astra");
+    expect(resolve("sol")?.id).toBe("gpt-5.6-sol");
+    expect(resolve("gpt56")?.id).toBe("gpt-5.6-sol");
+  });
+  test("aliases and efforts come from the catalog entry", () => {
+    expect(aliasesFor(astra())).toEqual(["gpt", "gpt6astra", "astra"]);
+    expect(openai.efforts(astra())).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+  });
+  test("astra gets a default command WITHOUT evicting sol / luna / terra", () => {
+    const names = defaults().map((c) => c.name);
+    for (const n of ["astra", "sol", "luna", "terra"]) expect(names).toContain(n);
+    expect(defaults().find((c) => c.name === "astra")?.model).toBe("astra");
+    // a named product is never a default command
+    expect(names).not.toContain("reserve");
+    expect(names).not.toContain("auto-review");
+  });
+});
+
+describe("cached multi-turn conversation on gpt-6-astra", () => {
+  const history = [
+    { role: "user", text: "My favorite color is teal. Say OK." },
+    { role: "assistant", text: "OK." },
+    { role: "user", text: "What is my favorite color?" },
+  ] as any;
+  test("the whole transcript rides one Responses request under one stable cache identity", () => {
+    const b = openai.build(astra(), history, { promptCacheKey: "apiplan-chat-42", system: "Answer briefly.", effort: "max" }, CREDS);
+    expect(b.url).toBe("https://chatgpt.com/backend-api/codex/responses");
+    expect(b.body.model).toBe("gpt-6-astra");
+    expect(b.body.store).toBe(false);
+    expect(b.body.stream).toBe(true);
+    expect(b.body.instructions).toBe("Answer briefly.");
+    expect(b.body.reasoning).toEqual({ effort: "max" });
+    // cache identity travels in the payload AND in Codex's routing header
+    expect(b.body.prompt_cache_key).toBe("apiplan-chat-42");
+    expect(b.headers.session_id).toBe("apiplan-chat-42");
+    // every prior turn is re-sent in order, in the Responses item shape
+    expect(b.body.input.map((i: any) => [i.role, i.content[0].type, i.content[0].text])).toEqual([
+      ["user", "input_text", "My favorite color is teal. Say OK."],
+      ["assistant", "output_text", "OK."],
+      ["user", "input_text", "What is my favorite color?"],
+    ]);
+    // never a length cap: the codex backend 400s on max_output_tokens
+    expect(b.body.max_output_tokens).toBeUndefined();
+  });
+  test("a second turn on the same key produces the identical prefix (what the cache keys on)", () => {
+    const o = { promptCacheKey: "apiplan-chat-42", system: "Answer briefly." };
+    const t1 = openai.build(astra(), history.slice(0, 1), o, CREDS);
+    const t2 = openai.build(astra(), history, o, CREDS);
+    expect(t2.body.instructions).toBe(t1.body.instructions);
+    expect(JSON.stringify(t2.body.input.slice(0, 1))).toBe(JSON.stringify(t1.body.input));
+    expect(t2.headers.session_id).toBe(t1.headers.session_id);
+  });
+  test("the cache receipt is read back from the completed response", () => {
+    const d = openai.delta({ type: "response.completed", response: { model: "gpt-6-astra",
+      usage: { input_tokens: 1247, output_tokens: 10, input_tokens_details: { cached_tokens: 1024, cache_write_tokens: 0 } } } } as any);
+    expect(d.usage).toEqual({ input: 1247, output: 10, cacheRead: 1024, cacheWrite: 0 });
+  });
+  test("--session <key> gives a --chat transcript that identity from the shell", () => {
+    const o = parseArgs(["-m", "astra", "--chat", "--session", "shell-thread-7"]);
+    expect(o.promptCacheKey).toBe("shell-thread-7");
+    expect(o.chat).toBe(true);
+    expect(o.prompt).toEqual([]);
+    expect(parseArgs(["--cache-key", "k1", "hi"]).promptCacheKey).toBe("k1");
+  });
+});

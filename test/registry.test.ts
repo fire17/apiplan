@@ -12,9 +12,9 @@ describe("family aliases follow the newest model", () => {
   });
   test("sonnet, fable, haiku, gpt resolve to their newest", () => {
     expect(id("sonnet")).toBe("claude-sonnet-5");
-    expect(id("fable")).toBe("claude-fable-5");
+    expect(id("fable")).toBe("claude-fable-5-1");
     expect(id("haiku")).toBe("claude-haiku-4-5-20251001");
-    expect(id("gpt")).toBe("gpt-5.6-sol");
+    expect(id("gpt")).toBe("gpt-6-astra");
   });
 });
 
@@ -30,8 +30,9 @@ describe("explicit versions stay reachable", () => {
     ["sonnet45", "claude-sonnet-4-5-20250929"],
     ["haiku45", "claude-haiku-4-5-20251001"],
     ["fable5", "claude-fable-5"],
+    ["fable51", "claude-fable-5-1"],
+    ["gpt6astra", "gpt-6-astra"],
     ["gpt55", "gpt-5.5"],
-    ["gpt54", "gpt-5.4"],
     ["gpt54mini", "gpt-5.4-mini"],
   ])("%s → %s", (alias, want) => {
     expect(id(alias)).toBe(want);
@@ -48,7 +49,7 @@ describe("humans type versions many ways", () => {
 });
 
 describe("variants", () => {
-  test.each([["sol", "gpt-5.6-sol"], ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"]])("%s → %s", (a, want) => {
+  test.each([["astra", "gpt-6-astra"], ["sol", "gpt-5.6-sol"], ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"]])("%s → %s", (a, want) => {
     expect(id(a)).toBe(want);
   });
   test("a bare generation picks that generation's flagship", () => {
@@ -65,7 +66,7 @@ describe("every subscription model marked API-capable is addressable", () => {
     expect(id("codex-auto-review")).toBe("codex-auto-review");
     expect(id("reserve")).toBe("gpt-reserve");
     expect(id("auto-review")).toBe("codex-auto-review");
-    expect(id("codex")).toBe("gpt-5.6-sol");
+    expect(id("codex")).toBe("gpt-6-astra"); // the newest gpt — Astra since 2026-09-05
   });
   test("models explicitly unsupported in the API are not advertised", () => {
     expect(id("gpt-5.3-codex-spark")).toBeNull();

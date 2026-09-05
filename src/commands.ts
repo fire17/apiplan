@@ -56,8 +56,14 @@ export function defaults(): Command[] {
       add(fam, fam, undefined, `newest ${fam}`);
       add(`${fam}-fast`, fam, fastFlags(m.provider), `${fam}, least reasoning + streaming`);
     }
-    // current-generation variants get their own command (sol / luna / terra)
-    if (m.variant && m.version.join("") === models(m.provider)[0].version.join("")) {
+    // A variant gets its own command when this is the NEWEST numbered model carrying that
+    // name (astra / sol / luna / terra / mini) — exactly the model `resolve(variant)`
+    // answers with. It used to require the provider's newest generation, which the day
+    // GPT-6 Astra shipped would have dropped `sol`, `luna` and `terra` from every fresh
+    // install while they are still served. Named products (gpt-reserve, codex-auto-review)
+    // carry no version and are reachable by exact id / alias, never as a default command.
+    if (m.variant && m.version.length && !seen.has(m.variant)
+        && models(m.provider).find((x) => x.variant === m.variant && x.version.length)?.id === m.id) {
       add(m.variant, m.variant, undefined, m.label);
     }
   }
