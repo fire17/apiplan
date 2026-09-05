@@ -123,3 +123,9 @@ numbers) → `DARWIN.md` (five rounds of findings, including the fixes that matt
 - **Percentage drift bands are meaningless at small absolute values** (10 % of 18 ms is
   1.8 ms), and a median of a few samples is the wrong estimator for deterministic work —
   use the floor. Both made the perf gate fail on ~half of identical runs.
+
+## Known gaps (2026-09-05)
+- Stateless Responses (Codex backend, `store: false`): reasoning output items are not replayed
+  (no `encrypted_content` round-trip), so multi-turn on gpt-6-astra is cached and correct but
+  not byte-equivalent to native Codex state. Found by astra-buddy's review; deferred pending a
+  scoped Codex compatibility probe. Ledger: `~/Creations/OM/REVIEW-LEDGER-2026-09-05.md` A4.
