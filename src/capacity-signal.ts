@@ -213,6 +213,139 @@ export function observationKey(o: CapacityObservation): string { return `${o.pro
 
 // ─── glue for the impure caller ─────────────────────────────────────────────────────────────
 
+// ─── the capacity record (U11) ──────────────────────────────────────────────────────────────
+
+/**
+ * What apiplan LEARNS from a refused request, in a form the OM workflow engine can park against.
+ *
+ * The gap this closes (`~/Creations/OM/.grand/UNKNOWNS.md` U11): OM parks with
+ * `resumeAt: outcome.resetsAt`, but nothing ever fills `resetsAt`, because the rate-limit facts are
+ * destroyed before they can reach it. `src/engine.ts:333` interpolates `retry-after` into a `die()`
+ * string and drops it; `src/engine.ts:653` forwards exactly two headers downstream
+ * (`content-type` and `x-retry-after`), so `anthropic-ratelimit-unified-reset` / `-status` never
+ * arrive. A parked run therefore has no wake-up time — a dead run with a reassuring message.
+ *
+ * This type and its parser are the pure half. They are deliberately header-name-driven rather than
+ * provider-specific, so the caller passes whatever the upstream response carried.
+ */
+export interface CapacityRecord {
+  provider: string;
+  /** Non-secret account fingerprint, when the caller knows one. */
+  account?: string;
+  observedAt: number;
+  limited: boolean;
+  /** Epoch ms when the window is expected to reopen, when the upstream said so. */
+  resetsAt?: number;
+  /** What is limited. Defaults to "account" — the only scope apiplan can currently distinguish. */
+  scope: "account" | "model" | "org";
+  /** Which header (or status) the reset time came from, so a stale record is diagnosable. */
+  source: string;
+  detail?: string;
+}
+
+/** Header names carrying a reset instant, most specific first. */
+const RESET_HEADERS = [
+  "anthropic-ratelimit-unified-reset",
+  "anthropic-ratelimit-requests-reset",
+  "anthropic-ratelimit-tokens-reset",
+  "x-ratelimit-reset-requests",
+  "x-ratelimit-reset",
+  "ratelimit-reset",
+] as const;
+
+/**
+ * Parse one reset value. Upstreams disagree on the encoding, so all three live forms are accepted:
+ * an absolute RFC-3339 timestamp, an absolute epoch (seconds or milliseconds), and a relative
+ * duration in seconds. Anything else yields undefined rather than a fabricated instant — a wrong
+ * wake-up time is worse than none, because it resumes a run into a window that is still closed.
+ */
+export function parseResetValue(raw: string | number | null | undefined, at: number): number | undefined {
+  if (raw === null || raw === undefined || raw === "") return undefined;
+  const str = String(raw).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) {
+    const n = Number(str);
+    if (!Number.isFinite(n) || n < 0) return undefined;
+    if (n > 1e12) return n;                       // epoch milliseconds
+    if (n > 1e9) return n * 1000;                 // epoch seconds
+    return at + n * 1000;                         // relative seconds (retry-after's own encoding)
+  }
+  // Date.parse is far too permissive to use as a validator — JavaScriptCore happily turns "soon"
+  // into a real instant (observed: 988675200000). Only the two encodings an HTTP upstream actually
+  // uses are accepted: RFC 3339, and the RFC 1123 HTTP-date that `retry-after` also allows.
+  const looksLikeDate = /^\d{4}-\d{2}-\d{2}([T ]|$)/.test(str) || /^[A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s/.test(str);
+  if (!looksLikeDate) return undefined;
+  const parsed = Date.parse(str);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Case-insensitive lookup over whatever header bag the caller has (Headers, Map, or a plain object). */
+function headerOf(headers: HeadersLike, name: string): string | undefined {
+  if (!headers) return undefined;
+  const anyH = headers as { get?(k: string): string | null };
+  if (typeof anyH.get === "function") return anyH.get(name) ?? anyH.get(name.toLowerCase()) ?? undefined;
+  for (const [k, v] of Object.entries(headers as Record<string, string>)) if (k.toLowerCase() === name) return v;
+  return undefined;
+}
+
+export type HeadersLike = { get?(k: string): string | null } | Record<string, string> | undefined;
+
+/**
+ * Turn a refused response into a CapacityRecord. Pure: `at` is supplied, never read from a clock, so
+ * a captured exchange replays deterministically.
+ *
+ * `limited` is true on a 429, on apiplan's own normalised `rate_limit_error`
+ * (`src/providers.ts:1358-1361`), and on a 402/billing refusal — the last of which is a capacity
+ * failure that no reset time will ever clear, so it is recorded with `resetsAt` undefined and the
+ * caller's blocker stays until a human or an account change resolves it.
+ */
+export function capacityRecordFromResponse(input: {
+  provider: string;
+  at: number;
+  account?: string;
+  status?: number;
+  errorType?: string;
+  headers?: HeadersLike;
+  scope?: CapacityRecord["scope"];
+  detail?: string;
+}): CapacityRecord {
+  const { provider, at, account, status, errorType, headers } = input;
+  const limited = status === 429 || status === 402 || errorType === "rate_limit_error" || errorType === "billing_error";
+  let resetsAt: number | undefined;
+  let source = status === 429 ? "status:429" : errorType ? `error:${errorType}` : "status";
+  for (const h of RESET_HEADERS) {
+    const v = headerOf(headers, h);
+    const parsed = parseResetValue(v, at);
+    if (parsed !== undefined) { resetsAt = parsed; source = h; break; }
+  }
+  if (resetsAt === undefined) {
+    // `retry-after` is the one apiplan already reads (src/engine.ts:399, :775) and the one it
+    // forwards as `x-retry-after` (src/engine.ts:653), so both spellings are accepted here.
+    const ra = headerOf(headers, "retry-after") ?? headerOf(headers, "x-retry-after");
+    const parsed = parseResetValue(ra, at);
+    if (parsed !== undefined) { resetsAt = parsed; source = "retry-after"; }
+  }
+  return {
+    provider, account, observedAt: at, limited,
+    resetsAt: limited ? resetsAt : undefined,
+    scope: input.scope ?? "account",
+    source,
+    detail: scrubDetail(input.detail),
+  };
+}
+
+/** A record is only useful next to the previous one; this makes it a `CapacityObservation`. */
+export function recordToObservation(record: CapacityRecord): CapacityObservation {
+  return { provider: record.provider, at: record.observedAt, account: record.account, limited: record.limited, resetsAt: record.resetsAt, note: record.detail };
+}
+
+/** Free text on a record is upstream-controlled; never let a credential ride along inside it. */
+function scrubDetail(detail: string | undefined): string | undefined {
+  if (!detail) return detail;
+  let out = detail;
+  for (const re of SECRET_RE) out = out.replace(new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"), "[redacted]");
+  return out;
+}
+
 /**
  * Build an observation from what a real apiplan request already produces: the HTTP status, the
  * `retry-after` header apiplan already reads (`src/engine.ts:333`, `:399`, `:775`), and the

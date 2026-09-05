@@ -7,8 +7,8 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-  NEAR_EXHAUSTED_FRACTION, assertNoSecrets, diffCapacity, diffCapacityTable, fingerprintAccount,
-  isExhausted, observationFromResponse, observationKey,
+  NEAR_EXHAUSTED_FRACTION, assertNoSecrets, capacityRecordFromResponse, diffCapacity, diffCapacityTable,
+  fingerprintAccount, isExhausted, observationFromResponse, observationKey, parseResetValue, recordToObservation,
 } from "../src/capacity-signal";
 import type { CapacityObservation } from "../src/capacity-signal";
 
@@ -153,5 +153,55 @@ describe("glue and tables", () => {
   test("observationKey is provider plus fingerprint", () => {
     expect(observationKey(obs())).toBe("anthropic|a:1111aaaa2222");
     expect(observationKey(obs({ account: undefined }))).toBe("anthropic|");
+  });
+});
+
+describe("the capacity record (U11) — what apiplan learns from a refusal", () => {
+  const T = 1_700_000_000_000;
+
+  test("a 429 with a relative retry-after yields a reset instant", () => {
+    const r = capacityRecordFromResponse({ provider: "anthropic", at: T, account: "a:1111aaaa2222", status: 429, headers: { "retry-after": "60" } });
+    expect(r).toMatchObject({ limited: true, resetsAt: T + 60_000, source: "retry-after", scope: "account" });
+  });
+
+  test("the unified reset header wins over retry-after, and every live encoding is accepted", () => {
+    const iso = new Date(T + 3_600_000).toISOString();
+    expect(capacityRecordFromResponse({ provider: "anthropic", at: T, status: 429, headers: { "anthropic-ratelimit-unified-reset": iso, "retry-after": "5" } }))
+      .toMatchObject({ resetsAt: T + 3_600_000, source: "anthropic-ratelimit-unified-reset" });
+    expect(parseResetValue("30", T)).toBe(T + 30_000);                       // relative seconds
+    expect(parseResetValue(String(Math.floor((T + 1000) / 1000)), T)).toBe(T + 1000); // epoch seconds
+    expect(parseResetValue(String(T + 1000), T)).toBe(T + 1000);             // epoch milliseconds
+    expect(parseResetValue(iso, T)).toBe(T + 3_600_000);                     // RFC 3339
+    // anything else must NOT become a fabricated wake-up time
+    expect(parseResetValue("Wed, 21 Oct 2015 07:28:00 GMT", T)).toBe(Date.parse("Wed, 21 Oct 2015 07:28:00 GMT")); // HTTP-date
+    // Date.parse alone is not a validator: JavaScriptCore turns "soon" into a real instant
+    expect(parseResetValue("soon", T)).toBeUndefined();
+    expect(parseResetValue("later today", T)).toBeUndefined();
+    expect(parseResetValue("", T)).toBeUndefined();
+    expect(parseResetValue(null, T)).toBeUndefined();
+    expect(parseResetValue(-5, T)).toBeUndefined();
+  });
+
+  test("apiplan's own normalised error name is enough, with or without headers", () => {
+    expect(capacityRecordFromResponse({ provider: "google", at: T, errorType: "rate_limit_error" })).toMatchObject({ limited: true, resetsAt: undefined, source: "error:rate_limit_error" });
+    // a billing refusal is a capacity failure no reset time will ever clear
+    expect(capacityRecordFromResponse({ provider: "openai", at: T, status: 402 })).toMatchObject({ limited: true, resetsAt: undefined });
+    expect(capacityRecordFromResponse({ provider: "openai", at: T, status: 200, headers: { "retry-after": "60" } })).toMatchObject({ limited: false, resetsAt: undefined });
+  });
+
+  test("it reads a Headers object as happily as a plain bag, case-insensitively", () => {
+    const h = new Headers({ "Retry-After": "120" });
+    expect(capacityRecordFromResponse({ provider: "anthropic", at: T, status: 429, headers: h }).resetsAt).toBe(T + 120_000);
+    expect(capacityRecordFromResponse({ provider: "anthropic", at: T, status: 429, headers: { "X-Retry-After": "10" } }).resetsAt).toBe(T + 10_000);
+  });
+
+  test("a record feeds straight into the diff, and no upstream detail can smuggle a credential", () => {
+    const before = recordToObservation(capacityRecordFromResponse({ provider: "anthropic", at: T, account: "a:1111aaaa2222", status: 429, headers: { "retry-after": "60" } }));
+    const after = recordToObservation(capacityRecordFromResponse({ provider: "anthropic", at: T + 61_000, account: "a:1111aaaa2222", status: 200 }));
+    expect(diffCapacity(before, after).map(s => s.kind)).toEqual(["window-reset"]);
+
+    const leaky = capacityRecordFromResponse({ provider: "anthropic", at: T, status: 429, detail: "refused for sk-ant-api03-AAAABBBBCCCCDDDD (ops.person@example.com)" });
+    expect(JSON.stringify(leaky)).not.toContain("sk-ant-api03-AAAABBBBCCCCDDDD");
+    expect(JSON.stringify(leaky)).not.toContain("ops.person@example.com");
   });
 });
