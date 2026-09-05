@@ -28,9 +28,47 @@ export const HARNESS_ORDER = [
 export const DUMB_LABEL = "(dumb - do not use)";
 const isDumb = (m: Model) => m.provider === "anthropic" && (m.family === "sonnet" || m.family === "haiku");
 
+export type ModelCost = { input: number; output: number; cacheRead: number; cacheWrite: number };
 export type RosterEntry = {
   id: string; name: string; reasoning: boolean; input: string[];
   efforts?: string[]; defaultLevel?: string; contextWindow: number; maxTokens: number;
+  /** USD per 1M tokens, the provider's published list price (a subscription bills none of it). */
+  cost?: ModelCost;
+};
+
+/**
+ * What the providers PUBLISH for these models (read 2026-09-05 from developers.openai.com
+ * /api/docs/models/<id> and platform.claude.com/docs/en/about-claude/pricing). The Codex
+ * catalog's `context_window` (272000) is its operating default, not the model's window:
+ * gpt-6-astra took a 916,284-token prompt on the subscription endpoint and refused ~962k
+ * with `context_length_exceeded` — exactly the documented 922k input cap inside 1.05M.
+ * Prices are the standard tier; OpenAI's >272K-input requests bill 2x input / 1.5x output
+ * (Astra: 2x on every column), which no harness cost schema can express, so the short-context
+ * rate is what is written. Anthropic's 5m cache write is 1.25x input; Fable 5.1 reads at 0.025x.
+ */
+type Documented = { contextWindow: number; maxTokens: number; cost: ModelCost };
+const oai = (ctx: number, input: number, output: number): Documented =>
+  ({ contextWindow: ctx, maxTokens: 128_000, cost: { input, output, cacheRead: input / 10, cacheWrite: input * 1.25 } });
+const claude = (ctx: number, input: number, output: number, cacheRead = input / 10, maxTokens = 128_000): Documented =>
+  ({ contextWindow: ctx, maxTokens, cost: { input, output, cacheRead, cacheWrite: input * 1.25 } });
+export const DOCUMENTED: Record<string, Documented> = {
+  "gpt-6-astra": oai(1_050_000, 10, 50),
+  "gpt-5.6-sol": oai(1_050_000, 4, 20),
+  "gpt-5.6-luna": oai(1_050_000, 0.2, 1.2),
+  "gpt-5.6-terra": oai(1_050_000, 2, 12),
+  "gpt-5.5": oai(1_050_000, 5, 30),
+  "gpt-5.4-mini": oai(400_000, 0.75, 4.5),
+  "claude-fable-5-1": claude(1_000_000, 10, 50, 0.25),
+  "claude-fable-5": claude(1_000_000, 10, 50),
+  "claude-opus-5": claude(1_000_000, 5, 25),
+  "claude-opus-4-8": claude(1_000_000, 5, 25),
+  "claude-opus-4-7": claude(1_000_000, 5, 25),
+  "claude-opus-4-6": claude(1_000_000, 5, 25),
+  "claude-opus-4-5-20251101": claude(200_000, 5, 25),
+  "claude-sonnet-5": claude(1_000_000, 2, 10),
+  "claude-sonnet-4-6": claude(1_000_000, 3, 15),
+  "claude-sonnet-4-5-20250929": claude(200_000, 3, 15),
+  "claude-haiku-4-5-20251001": claude(200_000, 1, 5, 0.1, 64_000),
 };
 
 /** Registry model → the fields a harness needs. Context sizes are the providers' own. */
@@ -43,14 +81,15 @@ function entryFor(m: Model): RosterEntry {
   // an effort it does not serve; omp is told not to send one, apiplan's own default holds.
   const reasoning = m.provider !== "google" && efforts.length > 0;
   const image = m.provider !== "ollama";
-  const ctx = m.provider === "anthropic" ? (m.family === "haiku" ? 200_000 : 1_000_000)
+  const doc = DOCUMENTED[m.id];
+  const ctx = doc?.contextWindow ?? (m.provider === "anthropic" ? (m.family === "haiku" ? 200_000 : 1_000_000)
     : m.provider === "openai" ? (m.contextWindow ?? 272_000)
-    : m.provider === "google" ? 1_048_576 : 32_000;
-  const max = m.provider === "anthropic" ? (m.family === "haiku" ? 64_000 : 128_000)
-    : m.provider === "openai" ? 128_000 : m.provider === "google" ? 65_535 : 8_000;
+    : m.provider === "google" ? 1_048_576 : 32_000);
+  const max = doc?.maxTokens ?? (m.provider === "anthropic" ? (m.family === "haiku" ? 64_000 : 128_000)
+    : m.provider === "openai" ? 128_000 : m.provider === "google" ? 65_535 : 8_000);
   return { id, name, reasoning, input: image ? ["text", "image"] : ["text"],
     ...(reasoning ? { efforts, defaultLevel: efforts.includes("medium") ? "medium" : efforts[0] } : {}),
-    contextWindow: ctx, maxTokens: max };
+    contextWindow: ctx, maxTokens: max, ...(doc ? { cost: doc.cost } : m.provider === "ollama" ? { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}) };
 }
 
 const jimmy = (): Model => ({ id: JIMMY_ID, provider: "ollama", family: "llama", version: [], label: "Jimmy (local llama, no credential)", efforts: [] });
@@ -92,6 +131,7 @@ export function rosterYaml(base = "http://127.0.0.1:8787"): string {
     // 2026-09-05 on gpt-6-astra through omp.
     if (e.reasoning && e.efforts?.length) lines.push(`        thinking:`, `          mode: anthropic-adaptive`, `          efforts: [${e.efforts.join(", ")}]`, `          defaultLevel: ${e.defaultLevel}`);
     lines.push(`        contextWindow: ${e.contextWindow}`, `        maxTokens: ${e.maxTokens}`);
+    if (e.cost) lines.push(`        cost: { input: ${e.cost.input}, output: ${e.cost.output}, cacheRead: ${e.cost.cacheRead}, cacheWrite: ${e.cost.cacheWrite} }`);
   }
   return lines.join("\n") + "\n";
 }
