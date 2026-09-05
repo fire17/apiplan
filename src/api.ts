@@ -7,7 +7,7 @@
 // field. So `/v1/chat/completions` with `model: "opus"` gives you Claude in OpenAI's
 // shape — which is the whole point, since most tooling only speaks one dialect.
 import { PROVIDERS, providerFor, speakRealtime, flatText, rememberToolSig, providerRuntime, warmCreds, type CredFp, type Creds, type Delta, type ImageRef, type Turn, type ToolUse, type ToolResult, type ToolDef, type ToolChoice, type CallOpts } from "./providers.ts";
-import { models, resolve, type Model } from "./registry.ts";
+import { models, resolve, aliasesFor, type Model } from "./registry.ts";
 import { refreshOllama } from "./providers-ollama.ts";
 import { framePayload, deltasOf, watchTerminal, UPSTREAM_TRUNCATED } from "./stream-shape.ts";
 import { STATE_DIR, readJson, writeJson } from "./platform.ts";
@@ -710,6 +710,11 @@ export function fromAnthropic(body: any): { turns: Turn[]; system?: string; syst
 }
 
 /** Shared knobs. Effort is accepted under either vendor's spelling. */
+/** omp's budget ladder, inverted (see optsFrom). */
+export function effortFromBudget(budget: number): string {
+  return budget <= 2048 ? "low" : budget <= 8192 ? "medium" : budget <= 16384 ? "high" : "xhigh";
+}
+
 /** The stable prefix of a conversation, hashed: model + system prompt + first user turn. */
 export function derivedCacheKey(body: any, system?: string): string | undefined {
   const msgs = Array.isArray(body?.messages) ? body.messages : [];
@@ -744,6 +749,12 @@ export function optsFrom(body: any, system?: string): CallOpts {
   if (!o.promptCacheKey) o.promptCacheKey = derivedCacheKey(body, system);
   const effort = body?.reasoning_effort ?? body?.reasoning?.effort ?? body?.thinking?.effort ?? body?.output_config?.effort;
   if (typeof effort === "string") o.effort = effort;
+  // A legacy `thinking.budget_tokens` with no effort beside it IS the caller's effort — omp
+  // sends exactly that for a custom anthropic-messages model in `effort` mode (its table:
+  // minimal 1024 · low 2048 · medium 8192 · high 16384 · xhigh/max 32768). Dropping it
+  // silently ran every such request at the backend's default. Thresholds follow that table;
+  // the top bucket reads as xhigh because the two are one number on the wire.
+  else if (typeof body?.thinking?.budget_tokens === "number" && body.thinking.type !== "disabled") o.effort = effortFromBudget(body.thinking.budget_tokens);
   const max = body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens;
   if (typeof max === "number") o.maxTokens = max;
   if (typeof body?.temperature === "number") o.temperature = body.temperature;
@@ -1332,7 +1343,12 @@ function listModels(dialect: "openai" | "anthropic"): Response {
   if (dialect === "anthropic") {
     return json({ data: all.map((m) => ({ type: "model", id: m.id, display_name: m.label, created_at: new Date(0).toISOString() })), has_more: false, first_id: all[0]?.id ?? null, last_id: all.at(-1)?.id ?? null });
   }
-  return json({ object: "list", data: all.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.provider })) });
+  // `aliases` and `display_name` are extra fields no SDK minds: they let a harness ask
+  // apiplan what a short name means — `opus` is the NEWEST opus, by the registry's law —
+  // instead of guessing from substrings (omp's own fuzzy match picked opus-4-8 for "opus"
+  // and fable-5 for "fable", observed 2026-09-05).
+  return json({ object: "list", data: all.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.provider, display_name: m.label,
+    aliases: m.provider === "jimmy" ? [...JIMMY_ALIASES] : aliasesFor(m) })) });
 }
 
 async function speech(body: any): Promise<Response> {

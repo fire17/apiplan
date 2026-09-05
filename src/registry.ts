@@ -18,6 +18,7 @@ export type Model = {
   variant?: string;        // "sol" | "luna" | "terra" | "mini"
   label: string;          // "Claude Opus 5"
   efforts?: string[];     // reasoning levels the provider advertises
+  contextWindow?: number; // when the provider's catalog states one (Codex does)
 };
 
 /**
@@ -63,11 +64,12 @@ const FALLBACK: Record<ProviderId, { id: string; label: string; efforts?: string
   openai: [
     // GPT-6 Astra (2026-09-05): read live from the Codex catalog, which lists it only for
     // `client_version` ≥ 0.153.0 (its `minimal_client_version`) — see CODEX_CLIENT_VERSION
-    // in bin/apiplan.ts. Efforts are the catalog's own six.
-    { id: "gpt-6-astra", label: "GPT-6-Astra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
-    { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    // in bin/apiplan.ts. Efforts are the catalog's, minus `ultra`: that one is a Codex CLI
+    // delegation mode the Responses endpoint rejects as a reasoning effort (400, live).
+    { id: "gpt-6-astra", label: "GPT-6-Astra", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh", "max"] },
     { id: "gpt-5.6-luna", label: "GPT-5.6-Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
-    { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", efforts: ["low", "medium", "high", "xhigh", "max"] },
     { id: "gpt-5.5", label: "GPT-5.5", efforts: ["low", "medium", "high", "xhigh"] },
     // gpt-5.4 left the live catalog by 2026-09-05; only its -mini sibling is still served.
     { id: "gpt-5.4-mini", label: "GPT-5.4-mini", efforts: ["low", "medium", "high", "xhigh"] },
@@ -156,9 +158,9 @@ export function unparseable(p: ProviderId, raw: { id: string }[]): string[] {
   return raw.filter((r) => !parse(r.id, "")).map((r) => r.id);
 }
 
-function normalizeList(p: ProviderId, raw: { id: string; label: string; efforts?: string[] }[]): Model[] {
+function normalizeList(p: ProviderId, raw: { id: string; label: string; efforts?: string[]; contextWindow?: number }[]): Model[] {
   const parse = PARSERS[p];
-  return raw.map((r) => parse(r.id, r.label, r.efforts)).filter(Boolean) as Model[];
+  return raw.map((r) => { const m = parse(r.id, r.label, r.efforts); if (m && r.contextWindow) m.contextWindow = r.contextWindow; return m; }).filter(Boolean) as Model[];
 }
 const cmpVersion = (a: Model, b: Model) => {
   // Named products with no version are real and exactly addressable, but they never
@@ -193,7 +195,7 @@ export function cacheStale(p: ProviderId): boolean {
   const a = cacheAge(p);
   return a === null || a > TTL_MS;
 }
-export function saveModels(p: ProviderId, list: { id: string; label: string; efforts?: string[] }[]) {
+export function saveModels(p: ProviderId, list: { id: string; label: string; efforts?: string[]; contextWindow?: number }[]) {
   writeJson(CACHE(p), { fetched_at: Date.now(), models: list });
 }
 
@@ -235,6 +237,10 @@ function anthropicFallback(name: string, all: Model[]): Model | null {
  * Returns null for an unknown name, so callers can pass a raw id straight through.
  */
 export function resolve(name: string): Model | null {
+  // A trailing parenthetical is a LABEL, not identity: a harness roster may list
+  // "claude-sonnet-5 (dumb - do not use)" so the warning travels in the one field every
+  // picker actually shows — the id. Stripped here, it still reaches claude-sonnet-5.
+  name = name.replace(/\s*\([^()]*\)\s*$/, "").trim();
   const all = models();
   const n = norm(name);
   const exact = all.find((m) => norm(m.id) === n || m.id === name);

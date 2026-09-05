@@ -21,9 +21,14 @@ describe("gpt-6-astra is addressable", () => {
     expect(resolve("sol")?.id).toBe("gpt-5.6-sol");
     expect(resolve("gpt56")?.id).toBe("gpt-5.6-sol");
   });
-  test("aliases and efforts come from the catalog entry", () => {
+  test("aliases and efforts come from the catalog entry — minus `ultra`, which the endpoint rejects", () => {
     expect(aliasesFor(astra())).toEqual(["gpt", "gpt6astra", "astra"]);
-    expect(openai.efforts(astra())).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    // live 2026-09-05: reasoning.effort 'ultra' → 400 on gpt-5.6-sol and gpt-6-astra;
+    // 'minimal' → 400 on gpt-6-astra. What is advertised must be what is accepted.
+    expect(openai.efforts(astra())).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    for (const e of ["low", "high", "xhigh", "max"]) {
+      expect(openai.build(astra(), [{ role: "user", text: "hi" }], { effort: e }, CREDS).body.reasoning).toEqual({ effort: e });
+    }
   });
   test("astra gets a default command WITHOUT evicting sol / luna / terra", () => {
     const names = defaults().map((c) => c.name);

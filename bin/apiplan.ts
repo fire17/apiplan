@@ -11,6 +11,7 @@ import * as C from "../src/commands.ts";
 import { osLabel, onPath, defaultBinDir, whichSync, IS_WIN, STATE_DIR, HOME, readJson, writeJson } from "../src/platform.ts";
 import { OLLAMA_BASE, OLLAMA_META_FILE, refreshOllama } from "../src/providers-ollama.ts";
 import { VERSION, daemonAlive, daemonStop, runDaemon, die } from "../src/engine.ts";
+import { rosterYaml, applyRoster } from "../src/roster.ts";
 
 // ── presentation ──────────────────────────────────────────────────────────────
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -56,10 +57,19 @@ function dropNote(id: ProviderId, list: { id: string }[]): string {
 const CODEX_CLIENT_VERSION = "0.153.4";
 const semverMax = (...vs: (string | undefined)[]) => vs.filter((v): v is string => !!v && /^\d+\.\d+\.\d+$/.test(v))
   .sort((a, b) => { const x = a.split(".").map(Number), y = b.split(".").map(Number); return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]); }).at(-1) ?? CODEX_CLIENT_VERSION;
-type CatalogEntry = { id: string; label: string; efforts?: string[] };
+type CatalogEntry = { id: string; label: string; efforts?: string[]; contextWindow?: number };
+/**
+ * The catalog's `ultra` ("maximum reasoning with automatic task delegation") is a Codex
+ * CLI mode, not a `reasoning.effort` the Responses endpoint accepts — sent as one it is a
+ * 400 ("Invalid value: 'ultra'. Supported values are: 'none', 'minimal', 'low', 'medium',
+ * 'high', 'xhigh', and 'max'", observed live 2026-09-05 on gpt-5.6-sol and gpt-6-astra).
+ * Advertising it would make `-e ultra` fail on the models that list it, so it is dropped.
+ */
+const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const fromCodexCatalog = (raw: any): CatalogEntry[] => (raw?.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
   id: m.slug ?? m.id, label: m.display_name ?? m.slug,
-  efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter(Boolean),
+  efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter((e: any) => typeof e === "string" && RESPONSES_EFFORTS.has(e)),
+  ...(typeof m.context_window === "number" ? { contextWindow: m.context_window } : {}),
 })).filter((m: any) => m.id);
 async function refreshOpenaiCatalog(p = PROVIDERS.openai): Promise<{ list: CatalogEntry[]; source: string }> {
   const file = join(HOME, ".codex", "models_cache.json");
@@ -384,6 +394,7 @@ USAGE
   apiplan                        interactive dashboard (providers · models · commands)
   apiplan status                 which providers am I connected to?
   apiplan models [provider]      every model + the aliases that reach it   ${dim("--refresh")}
+  apiplan roster omp [--apply <models.yml>]   the one-provider model list for omp/OM, in apiplan's order
   apiplan media                  image/video/music/speech models on your Gemini key
   apiplan vision <video>         ordered concurrent Gemini frame understanding
   apiplan commands               every global command, and whether PATH finds it
@@ -451,6 +462,23 @@ function spawnTalkDaemon() {
 switch (sub) {
   case undefined: await tui(); break;
   case "status": case "providers": await cmdStatus(); break;
+  case "roster": {
+    // `apiplan roster omp` prints the `apiplan:` provider block; `--apply <file>` rewrites
+    // that file in place (backup beside it), replacing every apiplan* provider it had.
+    const yaml = rosterYaml();
+    const i = argv.indexOf("--apply");
+    if (i < 0) { process.stdout.write(yaml); break; }
+    const file = argv[i + 1];
+    if (!file) die("--apply needs the models.yml to rewrite");
+    const fs = require("node:fs");
+    const before = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    const bak = `${file}.bak-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}`;
+    if (before) fs.writeFileSync(bak, before);
+    fs.writeFileSync(file, applyRoster(before, yaml));
+    const n = (yaml.match(/^      - id:/gm) ?? []).length;
+    process.stdout.write(`${ok("✓")} ${file.replace(HOME, "~")}: one \`apiplan\` provider, ${n} models in apiplan's order${before ? dim(`  (backup ${bak.replace(HOME, "~")})`) : ""}\n`);
+    break;
+  }
   case "models": {
     if (has("--refresh") || has("-r")) for (const n of await refreshModels(valOf("--provider") as ProviderId | undefined)) process.stdout.write(dim(`  ${n}\n`));
     cmdModels(argv[1] && !argv[1].startsWith("-") ? argv[1] : undefined);

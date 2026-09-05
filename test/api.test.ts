@@ -101,6 +101,13 @@ describe("cache identity normalization", () => {
     expect(optsFrom({ ...t1, prompt_cache_key: "mine" }).promptCacheKey).toBe("mine");   // the caller's key always wins
     expect(optsFrom({ model: "astra", messages: [] }).promptCacheKey).toBeUndefined();  // nothing to anchor on
   });
+  test("a legacy thinking budget with no effort beside it becomes the effort (omp's ladder)", () => {
+    const at = (budget_tokens: number) => optsFrom({ thinking: { type: "enabled", budget_tokens } }).effort;
+    expect([at(1024), at(2048), at(8192), at(16384), at(32768), at(100000)]).toEqual(["low", "low", "medium", "high", "xhigh", "xhigh"]);
+    expect(optsFrom({ thinking: { type: "enabled", budget_tokens: 32768 }, output_config: { effort: "max" } }).effort).toBe("max"); // an explicit effort wins
+    expect(optsFrom({ thinking: { type: "disabled", budget_tokens: 0 } })).toMatchObject({ thinkOff: true });
+    expect(optsFrom({ thinking: { type: "disabled", budget_tokens: 0 } }).effort).toBeUndefined();
+  });
   test("keeps opaque Anthropic metadata compatible", () => {
     expect(optsFrom({ metadata: { user_id: "opaque-affinity" } }).promptCacheKey).toBe("opaque-affinity");
     const unrelated = JSON.stringify({ tenant: "stable-tenant" });
