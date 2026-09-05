@@ -387,7 +387,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 
 **The dialect and backend are independent.** The path decides response shape; `model`
 decides who answers. The server preserves native Anthropic `cache_control` blocks and
-OpenAI `prompt_cache_key`, reports cache-read/write usage in both dialects, and keeps the
+OpenAI `prompt_cache_key` (a client that sends neither gets a key derived from model +
+system + first user turn, so its turns still land on the same cache), reports
+cache-read/write usage in both dialects, and keeps the
 cached route as the only production policy. There is no legacy non-cached mode to drift
 back into.
 

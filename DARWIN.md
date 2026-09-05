@@ -649,8 +649,20 @@ Two identity gaps closed on the way: the interactive REPL sent no cache identity
 (every turn was a new conversation to Codex), so it now mints one key per session; and
 `--chat` transcripts from the shell gained `--session <key>` for the same reason.
 
-**Degradation check:** 286 tests, 285 green; the one failure (GATE 4) pre-dates this round
+**Degradation check:** 287 tests, 286 green; the one failure (GATE 4) pre-dates this round
 and is environment-coupled — it posts this machine's freshly cached `gemini-3.8-flash` at a
 probe upstream that 404s it — and passes on a fresh HOME. All 7 performance budgets met
 (20 ms client overhead, 2 ms dispatch+drain, 57 MB idle daemon). Contract tests for Astra (`test/astra.test.ts`) run with no network: aliases,
 efforts, the Responses shape, the stable prefix across turns, the cache receipt, `--session`.
+
+**Addendum — omp, the real client.** `omp` (oh-my-pi v18.0.10) reaches these models through
+`apiplan serve` on 8787; its roster is static in `~/.omp/agent/models.yml`, so `gpt-6-astra`
+was added there. First two-turn run: the conversation held (turn 2 answered "teal") but read
+**0 cached tokens**. A capture proxy in front of 8787 showed why: omp's chat-completions
+transport sends no cache identity at all (`model, messages, stream, stream_options, store,
+tools, max_completion_tokens`), and Codex routes its prompt cache on `session_id` /
+`prompt_cache_key` — a keyless conversation is a fresh one every turn. Fix at the proxy, for
+every keyless client: `optsFrom` now derives a deterministic key from model + system prompt
++ first user turn (a caller's own key still wins). Re-run through omp, same requests, still
+no client key: turn 1 `cacheRead 0` → turn 2 **`cacheRead 7808`** → turn 3 `7808`.
+

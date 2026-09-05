@@ -17,7 +17,10 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   client; Astra needs 0.153.0). Cached multi-turn verified on the wire: turn 2 on one
   `prompt_cache_key` returned **1,024 `cached_tokens`** through both the CLI probe and the
   OpenAI-shaped local API. `--session <key>` gives `--chat` transcripts that identity from
-  the shell; the interactive REPL mints one per session. DARWIN round 25 has the receipts.
+  the shell; the interactive REPL mints one per session. **omp** reaches it as
+  `apiplan-openai/gpt-6-astra` (roster in `~/.omp/agent/models.yml`); omp sends no cache
+  key, so the server derives one from model + system + first user turn — omp's turns 2–3 read
+  7,808 cached tokens. DARWIN round 25 has the receipts.
 - Four provider families answer through one engine: Anthropic (Claude Code OAuth), OpenAI
   (Codex/ChatGPT), Google (Antigravity/Gemini Code Assist) and Ollama (loopback/local).
 - The localhost API preserves native cache identity: Anthropic `cache_control` blocks and
@@ -29,7 +32,7 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   `gemini → gemini-3.7-flash`, `heretic → heretic:latest`. The live API lists 32 models:
   10 Anthropic, 8 OpenAI, 4 Google, 9 Ollama and jimmy.
 - 37 global commands are installed in `~/.bun/bin`; `apiplan doctor` reports all clear.
-- **286 tests: 285 green locally; the 1 failure (GATE 4, outcome-anchor) pre-dates this
+- **287 tests: 286 green locally; the 1 failure (GATE 4, outcome-anchor) pre-dates this
   round and is environment-coupled — it posts this machine's freshly cached
   `gemini-3.8-flash` at a probe upstream that 404s it. A fresh HOME (CI) resolves from the
   baked fallback. 7 of 7 performance budgets met; `apiplan doctor` reports one pre-existing item (the `opus-fast` shim is not on disk).** Release measurements: 23 ms

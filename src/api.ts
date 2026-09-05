@@ -12,6 +12,7 @@ import { refreshOllama } from "./providers-ollama.ts";
 import { framePayload, deltasOf, watchTerminal, UPSTREAM_TRUNCATED } from "./stream-shape.ts";
 import { STATE_DIR, readJson, writeJson } from "./platform.ts";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 /**
  * chatjimmy.ai is reachable here too, but it is not an apiplan *provider*: it needs no
@@ -709,6 +710,16 @@ export function fromAnthropic(body: any): { turns: Turn[]; system?: string; syst
 }
 
 /** Shared knobs. Effort is accepted under either vendor's spelling. */
+/** The stable prefix of a conversation, hashed: model + system prompt + first user turn. */
+export function derivedCacheKey(body: any, system?: string): string | undefined {
+  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  const first = msgs.find((m: any) => m?.role === "user");
+  if (!first) return undefined;
+  const sys = system ?? (typeof body?.system === "string" ? body.system : Array.isArray(body?.system) ? flatText(body.system) : "");
+  const seed = JSON.stringify([String(body?.model ?? ""), sys, typeof first.content === "string" ? first.content : flatText(first.content)]);
+  return "apiplan-" + createHash("sha256").update(seed).digest("hex").slice(0, 24);
+}
+
 export function optsFrom(body: any, system?: string): CallOpts {
   const o: CallOpts = {};
   if (system) o.system = system;
@@ -722,6 +733,15 @@ export function optsFrom(body: any, system?: string): CallOpts {
   if (!o.promptCacheKey && typeof body?.metadata?.user_id === "string" && body.metadata.user_id) {
     o.promptCacheKey = body.metadata.user_id;
   }
+  // No identity from the caller at all (omp's chat-completions transport sends none —
+  // captured live 2026-09-05: keys were model/messages/stream/store/tools only, and its
+  // second turn on gpt-6-astra read 0 cached tokens). Codex routes the prompt cache on
+  // `session_id`/`prompt_cache_key`, so a keyless conversation is a fresh conversation
+  // every turn. Derive one from what never changes across a conversation's turns: the
+  // model, the system prompt and the FIRST user turn. Deterministic, so turn N lands
+  // where turn 1 did; two conversations that share that prefix share affinity, which is
+  // exactly what a prefix cache wants. A caller's own key always wins (above).
+  if (!o.promptCacheKey) o.promptCacheKey = derivedCacheKey(body, system);
   const effort = body?.reasoning_effort ?? body?.reasoning?.effort ?? body?.thinking?.effort ?? body?.output_config?.effort;
   if (typeof effort === "string") o.effort = effort;
   const max = body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens;

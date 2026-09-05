@@ -88,6 +88,19 @@ describe("cache identity normalization", () => {
     const wrapped = JSON.stringify({ device_id: "stable-device", session_id: "stable-session" });
     expect(optsFrom({ metadata: { user_id: wrapped } }).promptCacheKey).toBe(wrapped);
   });
+  // omp's chat-completions transport sends NO cache identity (captured live 2026-09-05), so
+  // its every turn was a new conversation to Codex — 0 cached tokens on turn 2 of astra.
+  test("a keyless request gets a stable key derived from model + system + first user turn", () => {
+    const t1 = { model: "astra", messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hello" }] };
+    const t2 = { model: "astra", messages: [...t1.messages, { role: "assistant", content: "hi" }, { role: "user", content: "and?" }] };
+    const k1 = optsFrom(t1, "be brief").promptCacheKey, k2 = optsFrom(t2, "be brief").promptCacheKey;
+    expect(k1).toMatch(/^apiplan-[0-9a-f]{24}$/);
+    expect(k2).toBe(k1);                                                        // turn N lands where turn 1 did
+    expect(optsFrom({ ...t1, model: "sol" }, "be brief").promptCacheKey).not.toBe(k1);   // another model, another prefix
+    expect(optsFrom(t1, "be terse").promptCacheKey).not.toBe(k1);              // another system prompt, another prefix
+    expect(optsFrom({ ...t1, prompt_cache_key: "mine" }).promptCacheKey).toBe("mine");   // the caller's key always wins
+    expect(optsFrom({ model: "astra", messages: [] }).promptCacheKey).toBeUndefined();  // nothing to anchor on
+  });
   test("keeps opaque Anthropic metadata compatible", () => {
     expect(optsFrom({ metadata: { user_id: "opaque-affinity" } }).promptCacheKey).toBe("opaque-affinity");
     const unrelated = JSON.stringify({ tenant: "stable-tenant" });
