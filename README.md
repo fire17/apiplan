@@ -132,6 +132,12 @@ COMMANDS 37 configured in ~/.bun/bin
 follows it, because the list comes from the provider's own model endpoint rather than a
 table someone has to remember to edit. Explicit versions never stop working:
 
+> **Harnesses:** `apiplan roster omp --apply ~/.omp/agent/models.yml` writes ONE `apiplan`
+> provider for omp/OM — every subscription model, Anthropic shape for all backends, exact
+> efforts on each, in apiplan's default order (Astra, Fable 5.1, Sol, Fable 5, Opus 5 …),
+> with the models not to pick labelled `(dumb - do not use)` in the id itself. `/v1/models`
+> publishes `aliases`, so a harness can ask what `opus` means instead of guessing.
+>
 > GPT-6 Astra (2026-09-05) proved the rule the hard way. The Codex catalog is gated by
 > `client_version` — every model carries a `minimal_client_version`, and Astra's is 0.153.0
 > — so reading Codex's own cache file only ever showed what the *installed* Codex could see.

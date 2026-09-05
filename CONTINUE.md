@@ -21,6 +21,13 @@ already pays for. `VISION.md` is the verbatim founding brief and governs everyth
   `apiplan-openai/gpt-6-astra` (roster in `~/.omp/agent/models.yml`); omp sends no cache
   key, so the server derives one from model + system + first user turn — omp's turns 2–3 read
   7,808 cached tokens. DARWIN round 25 has the receipts.
+- **Harness roster (2026-09-05):** `apiplan roster omp [--apply <models.yml>]` (src/roster.ts)
+  generates the single `apiplan` provider omp/OM use — anthropic-messages for every backend,
+  `anthropic-adaptive` thinking (exact `output_config.effort` on GPT/Claude alike, wire-captured),
+  fire17's order, `(dumb - do not use)` labels on sonnet/haiku ids (resolve() strips a trailing
+  parenthetical). `/v1/models` carries `aliases` + `display_name`; a legacy `thinking.budget_tokens`
+  maps to an effort; `ultra` is filtered from Codex effort lists (the endpoint rejects it).
+  OM's overlay `/model <name>[:level]` uses the aliases (see ~/Creations/OM/CONTINUE.md).
 - Four provider families answer through one engine: Anthropic (Claude Code OAuth), OpenAI
   (Codex/ChatGPT), Google (Antigravity/Gemini Code Assist) and Ollama (loopback/local).
 - The localhost API preserves native cache identity: Anthropic `cache_control` blocks and

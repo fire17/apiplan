@@ -666,3 +666,35 @@ every keyless client: `optsFrom` now derives a deterministic key from model + sy
 + first user turn (a caller's own key still wins). Re-run through omp, same requests, still
 no client key: turn 1 `cacheRead 0` → turn 2 **`cacheRead 7808`** → turn 3 `7808`.
 
+## Round 26 — the harnesses: one provider, exact efforts, `/model sol`
+
+omp/OM reached the same models through two hand-edited providers (one per wire dialect)
+plus canary copies; the picker showed the file's order, `gpt-6-astra` had no effort column
+(omp's catalog does not know the id), and `/model sol` in the TUI went to the model as prose.
+
+**One provider, generated.** `apiplan roster omp --apply <models.yml>` (src/roster.ts) writes
+a single `apiplan` provider on `anthropic-messages` for EVERY backend — the dialect and the
+backend are independent on the server (round 21) — in fire17's order, sonnet/haiku labelled
+`(dumb - do not use)` in the id (the one field a picker shows; `resolve()` strips a trailing
+parenthetical so the label costs nothing on the wire). Applied to `~/.omp/agent/models.yml`
+and OM's `flavors/models.shared.yml`.
+
+**Exact efforts, measured.** In omp's `effort` thinking mode the anthropic-messages wire
+carries a legacy `thinking.budget_tokens` whose table maps xhigh AND max to 32768; in
+`anthropic-adaptive` mode it carries `output_config.effort`. Captured through a proxy on
+gpt-6-astra: `:xhigh` → `{"effort":"xhigh"}`, `:max` → `max`; opus-5 `:high`, sol `:low`,
+fable-5-1 `medium` likewise. apiplan additionally maps a bare budget to an effort (omp's
+ladder inverted) so older clients are no longer run at the backend default. `ultra` left
+the advertised Codex efforts: the Responses endpoint answers 400 for it on sol and astra.
+
+**`/model <name>` (OM overlay, both harnesses).** apiplan's `/v1/models` now publishes each
+model's `aliases`; OM's `harness-model.ts` resolves a short name to the newest model of that
+name, apiplan first, then roster order offline, then the stock fuzzy matcher (which had picked
+opus-4-8 for "opus" and fable-5 for "fable"). Live in tmux, omp and `om run codex`:
+`/model sol` → gpt-5.6-sol · `/model fable:high` → claude-fable-5-1, thinking high ·
+`/model astra:max` · `/model opus` → claude-opus-5 · `/model opus48` · `/model haiku` → the
+labelled id · unknown names refused with the alias hint.
+
+**Degradation check:** 296 tests, 295 green (GATE 4 pre-existing); OM install.sh green,
+selftest 71/71, `om verify` OK; overlay resolver tests 7/7.
+
