@@ -42,8 +42,9 @@ export type RosterEntry = {
  * catalog's `context_window` (272000) is its operating default, not the model's window:
  * gpt-6-astra took a 916,284-token prompt on the subscription endpoint and refused ~962k
  * with `context_length_exceeded` — exactly the documented 922k input cap inside 1.05M.
- * Prices are the standard tier; OpenAI's >272K-input requests bill 2x input / 1.5x output
- * (Astra: 2x on every column), which no harness cost schema can express, so the short-context
+ * Prices are the standard tier; OpenAI's >272K-input requests bill 2x input and cache rates and
+ * 1.5x output for the full request (Astra included — the model page says so verbatim, verified
+ * 2026-09-05), which no harness cost schema can express, so the short-context
  * rate is what is written. Anthropic's 5m cache write is 1.25x input; Fable 5.1 reads at 0.025x.
  */
 type Documented = { contextWindow: number; maxTokens: number; cost: ModelCost };
@@ -153,7 +154,7 @@ export function applyRoster(text: string, block = rosterYaml()): string {
   for (const ln of lines) {
     if (/^\S/.test(ln)) {
       flush(); skipping = false;
-      inProviders = /^providers:\s*$/.test(ln);
+      inProviders = /^providers:\s*(#.*)?$/.test(ln);
       out.push(ln);
       if (inProviders && !inserted) { out.push(...blockLines); inserted = true; }
       continue;

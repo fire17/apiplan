@@ -103,4 +103,12 @@ modelRoles:
     // no providers section at all → one is appended
     expect(applyRoster("modelRoles:\n  default: x\n", "  apiplan:\n    baseUrl: X\n")).toBe("modelRoles:\n  default: x\nproviders:\n  apiplan:\n    baseUrl: X\n");
   });
+  test("applyRoster keeps unrelated providers when the providers key carries a comment", async () => {
+    const { applyRoster } = await import("../src/roster");
+    const before = "providers: # custom providers\n  ollama:\n    baseUrl: http://x\n  apiplan-old:\n    baseUrl: http://y\n";
+    const after = applyRoster(before);
+    expect(after.match(/^providers:/gm)).toHaveLength(1);
+    expect(after).toContain("  ollama:");
+    expect(after).not.toContain("apiplan-old:");
+  });
 });

@@ -705,7 +705,7 @@ prompt was accepted and answered (the buried secret came back), a ~962k prompt w
 with `context_length_exceeded` — the documented 922,000 input cap inside a 1,050,000 window.
 The roster now carries a documented-spec table (src/roster.ts `DOCUMENTED`): windows, output
 caps and list prices per 1M tokens from developers.openai.com and platform.claude.com, read
-2026-09-05 — Astra $10 in / $1 cached / $12.50 cache write / $50 out (2x above 272K input);
+2026-09-05 — Astra $10 in / $1 cached / $12.50 cache write / $50 out (above 272K input: 2x input and cache, 1.5x output, for the full request — corrected 2026-09-05 from an earlier "2x every column" reading);
 Sol $4/$20, Luna $0.20/$1.20, Terra $2/$12, GPT-5.5 $5/$30, 5.4-mini $0.75/$4.50 (400K
 window); Fable 5.1 $10/$50 with $0.25 cache reads; Opus 5 $5/$25; Sonnet 5 $2/$10; Haiku
 4.5 $1/$5. omp inherits built-in prices only for ids it already knows and had reported Astra

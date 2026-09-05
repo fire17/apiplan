@@ -137,6 +137,9 @@ describe("cache identity normalization", () => {
     expect(first.systemBlocks).toEqual([
       { type: "text", text: "stable system", cache_control: { type: "ephemeral" } },
     ]);
+    // the string view (what the OpenAI/Responses build and the derived cache key consume) agrees
+    expect(first.system).toBe("stable system");
+    expect(second.system).toBe(first.system);
   });
 });
 

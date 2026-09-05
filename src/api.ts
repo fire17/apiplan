@@ -694,18 +694,19 @@ export function fromAnthropic(body: any): { turns: Turn[]; system?: string; syst
   if (!turns.length) throw new HttpError(400, "`messages` must contain at least one message");
   const sys = body?.system;
   let system = typeof sys === "string" ? sys
-    : Array.isArray(sys) ? sys.map((s: any) => s?.text ?? "").filter(Boolean).join("\n\n")
+    : Array.isArray(sys) ? sys.filter((b: any) => !isAttestation(b)).map((s: any) => s?.text ?? "").filter(Boolean).join("\n\n")
     : undefined;
   if (inline) system = system ? `${system}\n\n${inline}` : inline;
   // Preserve native blocks and cache controls, except Claude Code's request-bound billing
   // attestation. Its cch hashes the ORIGINAL request body; forwarding it after this proxy
   // rebuilds the body makes the stable system prefix change every turn. Remove it only at
   // this Anthropic-in adapter boundary. Direct provider callers remain lossless.
-  const blocks: any[] = Array.isArray(sys)
-    ? sys.filter((b: any) => b && typeof b === "object" &&
-      (typeof b.text !== "string" || !b.text.startsWith("x-anthropic-billing-header:")))
-    : [];
+  const blocks: any[] = Array.isArray(sys) ? sys.filter((b: any) => b && typeof b === "object" && !isAttestation(b)) : [];
   if (inline) blocks.push({ type: "text", text: inline });
+  // The joined string and the block list must agree: the request-bound billing attestation
+  // (see below) is dropped from BOTH, or the OpenAI build (which consumes the string) and the
+  // derived cache key would still churn every turn while the Anthropic build stayed stable.
+  const isAttestation = (b: any) => typeof b?.text === "string" && b.text.startsWith("x-anthropic-billing-header:");
   return { turns, ...(system ? { system } : {}), ...(blocks.length ? { systemBlocks: blocks } : {}) };
 }
 
