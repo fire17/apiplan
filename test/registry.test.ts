@@ -49,8 +49,13 @@ describe("humans type versions many ways", () => {
 });
 
 describe("variants", () => {
-  test.each([["astra", "gpt-6-astra"], ["sol", "gpt-5.6-sol"], ["luna", "gpt-5.6-luna"], ["terra", "gpt-5.6-terra"]])("%s → %s", (a, want) => {
+  test.each([["astra", "gpt-6-astra"], ["terra", "gpt-5.6-terra"]])("%s → %s", (a, want) => {
     expect(id(a)).toBe(want);
+  });
+  test.each(["sol", "luna"])("%s → the NEWEST openai model carrying it", (w) => {
+    const carriers = models("openai").filter((m) => m.variant === w && m.version.length);
+    expect(id(w)).toBe(carriers[0].id);                                                   // models() is newest-first
+    expect(id(`gpt${carriers.at(-1)!.version.join("")}${w}`)).toBe(carriers.at(-1)!.id); // older stays reachable
   });
   test("a bare generation picks that generation's flagship", () => {
     expect(id("gpt56")).toBe("gpt-5.6-sol");

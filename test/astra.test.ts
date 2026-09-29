@@ -18,7 +18,8 @@ describe("gpt-6-astra is addressable", () => {
   test("it is the newest gpt, so the family alias follows it and the older variants stay reachable", () => {
     expect(resolve("gpt")?.id).toBe("gpt-6-astra");
     expect(resolve("codex")?.id).toBe("gpt-6-astra");
-    expect(resolve("sol")?.id).toBe("gpt-5.6-sol");
+    expect(resolve("sol")?.variant).toBe("sol");
+    expect(resolve("gpt56sol")?.id).toBe("gpt-5.6-sol");
     expect(resolve("gpt56")?.id).toBe("gpt-5.6-sol");
   });
   test("aliases and efforts come from the catalog entry — minus `ultra`, which the endpoint rejects", () => {

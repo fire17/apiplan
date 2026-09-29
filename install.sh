@@ -93,7 +93,7 @@ else
   if [ -n "$PATH_LINE" ]; then echo "Two lines finish the setup:"; else echo "One line finishes the setup:"; fi
   echo
   [ -n "$PATH_LINE" ] && echo "  $PATH_LINE"
-  echo "  $INIT_LINE      # so \`opus is this right?\` needs no quotes"
+  echo "  $INIT_LINE      # quote-free prompts (\`opus is this right?\`) + tab completion"
   echo
   DO=n
   if [ -t 0 ] && [ "${APIPLAN_ASSUME_YES:-0}" != "1" ]; then
@@ -115,7 +115,8 @@ fi
 
 echo
 echo "  apiplan            dashboard: providers · models · commands"
-echo "  apiplan doctor     check PATH, logins, daemon"
+echo "  apiplan doctor     check PATH, logins, catalog, daemon"
+echo "  apiplan completions zsh|bash|fish   print the tab-completion script (shell-init includes it)"
 echo "  apiplan update     pull the latest and re-sync"
 echo
 echo "You need to be logged into \`claude\` and/or \`codex\` — apiplan never asks for a key."
