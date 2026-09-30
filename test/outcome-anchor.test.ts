@@ -166,13 +166,46 @@ describe("GATE 4 — a genuine rotation carry still reads ok", () => {
     expect(cold.verified).toBe("unverified");            // premise: nothing proven yet
     expect(cold.connected).toBe(true);
 
-    const { models } = await import("../src/registry.ts");
-    const m = models("google")[0];
-    expect(m).toBeTruthy();                              // premise: there is a google model
+    // THE MODEL IS READ FROM THE SERVER'S OWN CATALOG, not from this process's registry.
+    // models() resolves against STATE_DIR, and STATE_DIR is read once at import — so the
+    // PARENT here reads the OPERATOR's ~/.apiplan cache while the server under test runs on
+    // an isolated APIPLAN_HOME with an empty state dir and therefore serves the FALLBACK
+    // list. The two lists diverge whenever a refresh adds a model the fallback lacks, and
+    // then this gate asks the server for an id it has never heard of and reads the 404 as a
+    // broken carry. Observed 2026-09-06: parent `gemini-3.8-flash,3.7,3.6,3.5-flash,3.1-pro`
+    // (cache refreshed 2026-09-05) vs server `3.7,3.6,3.5-flash,3.1-pro` — latent since the
+    // gate was written, exposed by the 3.8 refresh, and green on any machine whose newest
+    // cached google model happens to also be in the fallback.
+    // Asking the process under test what it serves makes the assertion source and the
+    // assertion target the same world, which is the whole point of the gate.
+    // WHY `owned_by === "google"`, exactly and strictly. listModels() emits
+    // `owned_by: m.provider` verbatim (api.ts), and this GET answers the OPENAI dialect, so
+    // the field is present here — measured on this very server: 43 rows, owned_by histogram
+    // {anthropic:12, openai:8, google:4, grok:4, gemini:14, jimmy:1}. Google is TWO routes
+    // since the API-key provider landed: `google` is the Antigravity subscription, `gemini`
+    // is the API-key route with `gemini-key-*` ids. Strict equality can never match
+    // "gemini", so this selects the subscription route only — which is the one this gate
+    // needs, because ENV() points APIPLAN_GOOGLE_BASE at the local stub whose hit counter
+    // the next assertion reads. Taking `data[0].id` instead would pick claude-fable-5-1
+    // (anthropic, measured) and never reach the stub at all, so the provider filter is
+    // load-bearing rather than decoration.
+    const published: unknown = await fetch(`${base}/v1/models`).then((r) => r.json());
+    const isRow = (d: unknown): d is { id: string; owned_by: string } =>
+      !!d && typeof d === "object" && "id" in d && "owned_by" in d
+      && typeof d.id === "string" && typeof d.owned_by === "string";
+    const rows: unknown[] = published && typeof published === "object" && "data" in published
+      && Array.isArray(published.data) ? published.data : [];
+    const ids = rows.filter(isRow).filter((d) => d.owned_by === "google").map((d) => d.id);
+    // Non-empty FIRST, and said out loud: if the server ever publishes no google model at
+    // all, `ids[0]` would be undefined and the call below would 404 again — an identical red
+    // bar meaning something entirely different ("no google models served" rather than "this
+    // google model was rejected"). One assertion keeps those two worlds distinguishable.
+    expect(ids.length, "the server under test published no google models").toBeGreaterThan(0);
+    const modelId = ids[0];                              // premise: there is a google model
     const hitsBefore = apiHits;
     const call = await fetch(`${base}/v1/messages`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: m.id, max_tokens: 64, messages: [{ role: "user", content: "ping" }] }),
+      body: JSON.stringify({ model: modelId, max_tokens: 64, messages: [{ role: "user", content: "ping" }] }),
     });
     expect(call.status).toBe(200);                       // premise: the call was ACCEPTED
     expect(apiHits).toBe(hitsBefore + 1);                // …by the STUB, never by a vendor

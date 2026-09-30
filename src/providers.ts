@@ -8,25 +8,26 @@ import { HOME, IS_MAC, STATE_DIR, readJson, writeJson } from "./platform.ts";
 import type { Model, ProviderId } from "./registry.ts";
 import { ANTHROPIC_EFFORTS, GOOGLE_EFFORTS, saveModels } from "./registry.ts";
 import type { StreamShape } from "./stream-shape.ts";
+import { realtimeModelId } from "./live-models.ts";
 
 /**
- * A wall-clock stamp a HUMAN can act on: local time with an EXPLICIT UTC offset.
+ * Wall-clock with its ZONE, re-exported from `./responses-wire.ts` where it now lives.
  *
- * ── WHY (round four, 2026-08-27) ── every expiry printed here used to be
+ * ── WHY IT SAYS THE ZONE (round four, 2026-08-27) ── every expiry printed here used to be
  * `toISOString().slice(0,16)` — UTC, with nothing saying so. `/health` therefore told him
  * the google token "expires 21:14" while it was in fact good until 00:14 local (+0300):
  * a reader three hours out of step with reality, on the one number he uses to decide
  * whether a credential is about to die. An unlabelled timestamp is a lie by omission, so
  * every stamp now carries its zone and no reader has to guess which clock it is on.
+ *
+ * ── WHY IT MOVED ── the grok adapter needs it for the same expiry line, and importing it
+ * from here would have re-created the providers ⇄ providers-grok cycle that
+ * ./responses-wire.ts exists to end. Re-exported so every existing caller is unchanged.
  */
-export function stampZ(ms: number): string {
-  const d = new Date(ms);
-  const p = (n: number) => String(n).padStart(2, "0");
-  const off = -d.getTimezoneOffset();               // minutes EAST of UTC (JS reports the inverse)
-  const a = Math.abs(off);
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-       + ` ${off < 0 ? "-" : "+"}${p(Math.floor(a / 60))}${p(a % 60)}`;
-}
+// One import, one re-export of the bound name — never also `export … from`, which does not
+// bind locally and would declare `stampZ` twice (Bun rejects the whole module).
+import { stampZ } from "./responses-wire.ts";
+export { stampZ };
 
 /**
  * Knobs a HOST sets once, that change how a credential may be obtained — never what it is.
@@ -66,6 +67,11 @@ export type ToolResult = { toolUseId: string; content: any; isError?: boolean };
 export type Turn = {
   role: "user" | "assistant"; text: string; images?: ImageRef[];
   toolUses?: ToolUse[]; toolResults?: ToolResult[];
+  /**
+   * A mid-conversation system/developer turn, kept in position instead of hoisted into the
+   * system prompt. Opt-in so the three backends keep switching on a three-value `role`.
+   */
+  isSystem?: boolean;
   /** Native Anthropic content blocks, retained only for Anthropic-in/out passthrough. */
   nativeAnthropicContent?: unknown[];
 };
@@ -80,6 +86,14 @@ export type ToolDef = { name: string; description?: string; parameters?: any; ra
 export type ToolChoice = "auto" | "none" | "required" | { name: string };
 export type CallOpts = {
   effort?: string; maxTokens?: number; system?: string; thinkOff?: boolean;
+  /**
+   * Chat vs Work — the two composer modes chatgpt.com itself exposes, chosen per request.
+   * ONLY the `online` website provider acts on it; every other provider ignores it, because
+   * no other transport has the concept (the Codex responses backend has no mode at all).
+   * Strictly orthogonal to `effort`: a mode never implies a reasoning level, never changes
+   * one, and never downgrades one.
+   */
+  mode?: "chat" | "work";
   /** Stable caller identity for provider-side prompt-cache affinity. */
   promptCacheKey?: string;
   /**
@@ -96,10 +110,23 @@ export type CallOpts = {
   rawPrompt?: boolean;
   /** Tools the caller offered, and how hard the model is pushed to pick one. */
   tools?: ToolDef[]; toolChoice?: ToolChoice;
+  /**
+   * OpenAI Responses `service_tier`. "priority" is the Codex Fast tier ("fast" is accepted
+   * as its alias). Falls back to `fast` → "priority", then env APIPLAN_SERVICE_TIER. The
+   * Codex backend accepts exactly `priority` and `default` (live 2026-09-29: flex/auto/fast
+   * answer 400 "Unsupported service_tier"). Only the `openai` provider reads it.
+   */
+  serviceTier?: string;
+  /**
+   * OpenAI `input_image.detail` for EVERY image in the request (user images and images
+   * inside tool results): low | high | auto | original (the backend's own list, live
+   * 2026-09-29). Falls back to env APIPLAN_IMAGE_DETAIL. Only the `openai` provider reads it.
+   */
+  imageDetail?: string;
 };
 
 /** Text-to-speech is a different shape from a chat call: one request, binary back. */
-export type SpeechOpts = { text: string; voice: string; format: string; model?: string; speed?: number;
+export type SpeechOpts = { text: string; voice: string; format: string; model?: string; liveModel?: string; speed?: number;
   /** How to perform it — emotion, pace, character. Separate input from the words. */
   direction?: string };
 export type SpeechResult = { bytes: Uint8Array; contentType: string };
@@ -136,11 +163,72 @@ export type Delta = {
    *  fills and closes a block for it on the spot, under a ref of its own making. `sig` is
    *  Gemini's thought signature, which that vendor REQUIRES echoed back on the next turn. */
   toolCallDone?: { id?: string; name: string; args: any; sig?: string };
-  /** Token counts the upstream stream reported. Absent means it reported none.
-   *  cacheRead/cacheWrite are Anthropic's prompt-cache counters: without them a caller
-   *  cannot tell a cache HIT from a full re-read of the prefix, which is the whole point
-   *  of sending cache_control in the first place. */
-  usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  /**
+   * Token counts the upstream stream reported. Absent means it reported none.
+   * cacheRead/cacheWrite are Anthropic's prompt-cache counters: without them a caller
+   * cannot tell a cache HIT from a full re-read of the prefix, which is the whole point
+   * of sending cache_control in the first place.
+   *
+   * ── THE THREE BUCKETS, AND WHY EVERYTHING ELSE IS A SUB-DIVISION OF ONE OF THEM ──
+   *
+   * input/cacheRead/cacheWrite are the only BUCKETS: after api.ts's normalizeTally() has
+   * converted an inclusive vendor to this gateway's exclusive footing, those three cover
+   * the prompt exactly once and nothing else may be added to a total. Every other counter
+   * a vendor reports is therefore modelled as a SUB-DIVISION — a finer description of a
+   * bucket already counted — or is deliberately not carried at all.
+   *
+   * That rule is not a house style; it is what the vendors themselves state. Anthropic:
+   * "the current cache_creation_input_tokens field equals the sum of the values in the
+   * cache_creation object". A fourth bucket would double-count the same physical tokens
+   * and break the disjointness the provider-cache contract suite asserts on both fronts.
+   *
+   * AND A DROPPED OPTIONAL FIELD IS A REAL FAULT, not a tidy omission. It produces no
+   * symptom whatsoever — the numbers stay self-consistent, every test passes — and shows
+   * up only as money nobody notices, or as a working cache that reads as one that never
+   * hits. Two were live here (UNKNOWNS I-13): the anthropic TTL breakdown below, and
+   * google's cachedContentTokenCount, which is the cache-HIT counter and was simply never
+   * read. So the standing rule for anything a vendor documents: forward it as a
+   * sub-division, or record why it is not carried. "We didn't notice it" is not a reason.
+   */
+  usage?: {
+    input?: number; output?: number; cacheRead?: number; cacheWrite?: number;
+    /**
+     * HOW cacheWrite splits across cache lifetimes, when the vendor said. A pure
+     * SUB-DIVISION of cacheWrite: m5 + h1 == cacheWrite whenever both are stated, and
+     * neither is ever added to anything.
+     *
+     * It exists because the two components cost DIFFERENT money — a 1-hour write bills at
+     * 2x base input where a 5-minute write bills at 1.25x — so a consumer handed only the
+     * flat total prices every write at the cheaper 5-minute rate. Anthropic is the only
+     * vendor here that reports a lifetime breakdown at all.
+     *
+     * NEVER SYNTHESIZED. Absent means the vendor reported no breakdown, which a consumer
+     * already handles by pricing the flat total; inventing a split would put a
+     * derived-looking number in front of a reader who would take it as measured.
+     */
+    cacheWriteTtl?: { m5?: number; h1?: number };
+    /**
+     * The reasoning/thinking share OF output — a SUB-DIVISION of output, always already
+     * contained in it, never added to it.
+     *
+     * The containment is stated here rather than left to each consumer because the vendors
+     * disagree about their own wire shape and getting it wrong costs money in both
+     * directions. OpenAI's `output_tokens_details.reasoning_tokens` is already inside
+     * `output_tokens`; Google's `thoughtsTokenCount` is NOT inside `candidatesTokenCount`
+     * ("totalTokenCount … (prompt + thoughts + response candidates)") and is billed as
+     * output, so the google adapter adds it INTO `output` and reports the same number
+     * here. Either way the invariant a consumer can rely on is the same one: reasoning is
+     * a share of output, so `reasoning <= output`, and summing them double-counts.
+     */
+    reasoning?: number;
+    /**
+     * Vendor-side tool invocations billed per REQUEST rather than per token — Anthropic's
+     * `server_tool_use`. Not tokens at all, so it cannot be a bucket or a sub-division of
+     * one; it rides beside them, and only the front whose vendor defines the field
+     * republishes it.
+     */
+    serverTools?: { webSearch?: number; webFetch?: number };
+  };
   /** Why generation stopped, in Anthropic's vocabulary:
    *  "end_turn" | "max_tokens" | "stop_sequence" | "tool_use". */
   stopReason?: string;
@@ -152,9 +240,99 @@ export type Delta = {
   progress?: string;
 };
 
+/**
+ * WHAT A VENDOR MEANS BY "INPUT TOKENS" — the one fact that decides whether this gateway's
+ * three usage buckets are disjoint or double-counted.
+ *
+ *   "exclusive"  the vendor's input counter holds ONLY what was neither read from nor
+ *                written to the cache, so input + cacheRead + cacheWrite is the whole
+ *                prompt exactly once, with no conversion needed.
+ *   "inclusive"  the vendor's input counter is the WHOLE prompt and the cache counters are
+ *                a breakdown OF it, so the cached share must be subtracted once before the
+ *                three can be published side by side.
+ *
+ * Read from each vendor's own documentation, never assumed — see the per-provider doc
+ * comments below for the quoted sentence. api.ts's normalizeTally() is the ONE consumer,
+ * and it converts at the dialect boundary rather than at each emission site.
+ */
+export type UsageBasis = "inclusive" | "exclusive";
+
+/**
+ * HOW A PREFIX BECOMES A CACHE ENTRY, as a mechanism this GATEWAY can actually drive.
+ *
+ *   "implicit-prefix"          the vendor places the breakpoint itself; a client influences
+ *                              only WHERE the request lands (routing), not what is cached.
+ *   "explicit-breakpoint"      the client marks the end of the reusable prefix in the body.
+ *   "cached-content-resource"  the prefix is uploaded as a SEPARATE, named server-side
+ *                              object first, and later requests reference it by name.
+ *   "none"                     this vendor has no prompt cache to address.
+ *
+ * IT NAMES THE MECHANISM THIS GATEWAY USES — not the only one the vendor offers. Three of
+ * the four vendors now support several at once (Anthropic added top-level automatic
+ * caching beside explicit `cache_control`; OpenAI added explicit breakpoints beside
+ * implicit ones on GPT-5.6+; Google caches implicitly as well as by CachedContent). A
+ * single-valued `kind` is still the right shape because a gateway drives exactly one of
+ * them per provider, and `identity` below is that mechanism's handle.
+ */
+export type CacheKind = "implicit-prefix" | "explicit-breakpoint" | "cached-content-resource" | "none";
+
+/**
+ * The FIELD a request uses to reach the right cache entry — the mechanism's handle, spelled
+ * the way its vendor spells it, so a reader never has to guess which body key this provider
+ * expects.
+ *
+ * "none" means there is nothing to address, and that is TWO different situations which the
+ * `kind` beside it tells apart:
+ *   · kind "none" too      the vendor has no prompt cache at all.
+ *   · kind names a mechanism   the cache is real but fully internal — it exists, it changes
+ *                          the bill, and no client field reaches it. A purely implicit
+ *                          prefix cache is exactly this: the vendor decides, and the only
+ *                          lever a caller has is what it sends and when.
+ * So a real identity implies a real kind (a handle for a cache that does not exist is
+ * incoherent), but a real kind does NOT imply a real identity. Only that one direction is
+ * a coherence rule; the contract suite asserts it in that direction only.
+ */
+export type CacheIdentity = "prompt_cache_key" | "cache_control" | "cachedContent" | "none";
+
+/**
+ * One vendor's prompt cache, as facts rather than as code.
+ *
+ * Every field is DOCUMENTED-OR-ABSENT. An optional field left off means the vendor does not
+ * state that number, and an undocumented number must never be invented here: a consumer
+ * that reads `minTokens: undefined` learns "unknown", while one that reads a guessed 4096
+ * learns something false and cannot tell. This is the same unknown-stays-unknown law
+ * normalizeTally() applies to token counts, applied to the contract itself.
+ */
+export type CacheContract = {
+  kind: CacheKind;
+  /**
+   * The SMALLEST prefix any currently-active model of this vendor will cache — the floor
+   * below which no model caches at all, so a caller under it can stop wondering. Above it
+   * the threshold is model-dependent, and the per-provider comment names the spread. Absent
+   * means the vendor publishes no minimum.
+   */
+  minTokens?: number;
+  /** The DEFAULT lifetime of an entry, in ms, as the vendor documents it. Absent means the
+   *  vendor documents none — not that entries live forever. */
+  ttlMs?: number;
+  identity: CacheIdentity;
+};
+
 export interface Provider {
   id: ProviderId;
   label: string;
+  /**
+   * How this vendor counts input tokens — see UsageBasis. REQUIRED, because a provider that
+   * declines to say leaves api.ts guessing, and the wrong guess double-counts the cached
+   * prefix (or drives the uncached remainder negative) on every single turn it serves.
+   */
+  usageBasis: UsageBasis;
+  /**
+   * This vendor's prompt cache, as facts — see CacheContract. REQUIRED for the same reason:
+   * a new provider added without it would silently inherit nothing, and "no declaration"
+   * and "no cache" would become indistinguishable. `kind: "none"` states the absence.
+   */
+  cache: CacheContract;
   /** Where the login lives, for `apiplan status` — never throws. */
   probe(): { connected: boolean; detail: string; loginHint: string };
   /** Throws Error (with a fix-it message) when not logged in. */
@@ -186,6 +364,12 @@ export interface Provider {
   credFp?(): CredFp;
   efforts(m: Model): string[];
   build(m: Model, turns: Turn[], o: CallOpts, c: Creds): Built;
+  /**
+   * Open a provider-specific transport from the already-built request. Absent keeps the
+   * ordinary streamed HTTP POST. Local providers can use this hook without pretending
+   * their account/session state is an upstream bearer credential or URL.
+   */
+  open?(built: Built, signal?: AbortSignal): Promise<Response>;
   delta(ev: any): Delta;
   /**
    * Does this vendor accept the engine's `stream: true` body flag? Absent means yes
@@ -201,6 +385,29 @@ export interface Provider {
    * stale, so "run `agy` and log in again" would send a user to re-auth a healthy account.
    */
   explain?(status: number, body: string): string | undefined;
+  /**
+   * An upstream refusal this provider can REPAIR by dropping local state it holds, so that
+   * the caller's NEXT request succeeds. Side effect only: it returns nothing, changes no
+   * status, and never throws — the refusal in hand is still reported honestly.
+   *
+   * IT EXISTS BECAUSE A STALE HANDLE POISONS EVERY LATER REQUEST, not just the one that
+   * hit it. Google's explicit cache is the case: an evicted or expired CachedContent is
+   * answered 403 PERMISSION_DENIED "CachedContent not found" (NOT 404 — recovery written
+   * against 404 by instinct never fires), and a provider still holding that dead name
+   * keeps referencing a corpse on every subsequent turn with the same prefix, until the
+   * process restarts. Nothing in build() or delta() can see a status: build() is
+   * synchronous by contract and delta() only ever sees stream frames.
+   *
+   * NO RETRY IS IMPLIED, and none is performed. The engine calls this for its side effect
+   * and then reports the fault exactly as it would have — a hook that promised a retry
+   * nothing performs would be a contract asserting a capability that is absent. The
+   * repair shows up as the next request working, which is the honest shape of it.
+   *
+   * The body is the RAW upstream text, not a narrowed message: an implementation matching
+   * on any field outside `error.message` would otherwise silently never fire, which looks
+   * exactly like the bug it was written to fix while still being broken.
+   */
+  recover?(status: number, body: string, m: Model): void;
   /** Can this provider draw? Absent means no, and the CLI says so by name. */
   canGenerateImages?: boolean;
   /** A provider-native image endpoint. OpenAI draws through its chat tool; Google exposes
@@ -269,7 +476,8 @@ function perform(o: SpeechOpts): string {
  * only burns CPU and holds context memory (honored by Bun ≥1.3.14, ignored harmlessly before).
  * No OpenAI-Beta header: the beta shape is retired and answers beta_api_shape_disabled.
  */
-export function openRealtime(token: string, model = env("APIPLAN_REALTIME_MODEL", "gpt-realtime")): WebSocket {
+export function openRealtime(token: string, selected?: string): WebSocket {
+  const model = realtimeModelId(selected);
   return new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
     { headers: { Authorization: `Bearer ${token}` }, perMessageDeflate: false } as any,
@@ -277,7 +485,7 @@ export function openRealtime(token: string, model = env("APIPLAN_REALTIME_MODEL"
 }
 
 export function speakRealtime(c: Creds, o: SpeechOpts, timeoutMs = 120000): Promise<SpeechResult> {
-  const model = o.model || env("APIPLAN_REALTIME_MODEL", "gpt-realtime");
+  const model = realtimeModelId(o.liveModel || o.model);
   return new Promise((resolve, reject) => {
     let ws: WebSocket;
     try { ws = openRealtime(c.token, model); }
@@ -509,14 +717,241 @@ async function readAnthropicRawFresh(): Promise<{ json: any; source: string } | 
 /** F9-2: on a resident host this is a snapshot read; in the CLI it is the direct read. */
 const readAnthropicRaw = residentCache(readAnthropicRawSync, readAnthropicRawFresh);
 
-/** Modern contract: output_config.effort + adaptive thinking. Legacy: budget_tokens. */
-const MODERN_THINKING = (id: string) => /opus-(5|4-(5|6|7|8))|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(id);
+/** Modern contract: output_config.effort + adaptive thinking. Legacy: budget_tokens.
+ *  Opus 4.5 is deliberately NOT here: the vendor's per-model table (thinking-troubleshooting
+ *  #supported-models, read 2026-09-06) lists Opus 4.5 / Sonnet 4.5 / Haiku 4.5 as "Extended
+ *  only" — `adaptive` is rejected with a 400 — so it takes the legacy budget branch. */
+const MODERN_THINKING = (id: string) => /opus-(5|4-(6|7|8))|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(id);
 const LEGACY_BUDGET: Record<string, number> = { low: 0, medium: 4000, high: 10000, xhigh: 24000, max: 48000 };
 const HIGH_EFFORT = new Set(["high", "xhigh", "max"]);
+/**
+ * Models where thinking CANNOT be turned off: `thinking: {type: "disabled"}` is a 400.
+ *
+ * The vendor publishes this per model, listing the `thinking.type` values each one
+ * "rejects with a 400 error; any value not listed as rejected is accepted". For Claude
+ * Fable 5.1, Mythos 5.1, Fable 5, Mythos 5 and Mythos Preview that list contains
+ * `"disabled"`: they are "Always on", and "Models marked `Always on` cannot turn thinking
+ * off." (docs/en/build-with-claude/thinking-troubleshooting#supported-models, read
+ * 2026-09-06.) Confirmed live through this gateway on claude-fable-5-1 — HTTP 400
+ * invalid_request_error, verbatim: `"thinking.type.disabled" is not supported for this
+ * model. Thinking defaults to adaptive mode when not specified; use
+ * "thinking.type.enabled" with "budget_tokens" for extended thinking.` That message's own
+ * suggestion is a second 400 on this model, which is why it is not the remedy here.
+ *
+ * The remedy is the vendor's: "Omit the `thinking` parameter; these models think without
+ * any configuration", and where the goal was to stop paying for thinking, "use lower
+ * `effort` levels to control token cost instead". So on these ids thinkOff travels as
+ * effort, never as a thinking field — see build().
+ *
+ * FAMILY-level and deliberately version-agnostic. The vendor states this of the Fable and
+ * Mythos lines as such, so the next member of either inherits it instead of silently
+ * falling out of a version-pinned pattern — the failure mode MODERN_THINKING's `fable-5`
+ * already has, where it matches claude-fable-5-1 by prefix but not a future claude-fable-6.
+ * This predicate also covers claude-mythos-preview, which MODERN_THINKING does not match
+ * at all: that id lands in the legacy branch, where thinkOff means budget 0 and no
+ * thinking field is emitted, so it is already free of the rejected shape.
+ */
+const THINKING_ALWAYS_ON = (id: string) => /fable|mythos/.test(id);
+/**
+ * Efforts at which `thinking: {type: "disabled"}` is itself rejected on the models below.
+ * The vendor's phrase is "accepts `"disabled"` at effort `high` or below; combining it
+ * with effort `xhigh` or `max` returns a 400 error", so this is the complement of "high or
+ * below" and NOT HIGH_EFFORT, which includes `high` and would over-clamp by one level.
+ */
+const ABOVE_HIGH: Record<string, true> = { xhigh: true, max: true };
+/**
+ * Models that enforce that ceiling: "This restriction applies to Claude Opus 5 and later
+ * models and is enforced on each request." Read as Opus 5 plus any generation after 5,
+ * because "and later models" is forward-looking while the footnote sits on the Opus 5 row
+ * alone — Claude Sonnet 5's row carries no such footnote, so a gen-5 non-Opus id is left
+ * exactly as the table has it. Parsed rather than pattern-matched because a regex for
+ * "generation 6 or newer" reads the trailing `-6` of claude-opus-4-6 as a generation.
+ */
+const NO_DISABLED_ABOVE_HIGH = (id: string) => {
+  const g = /(opus|sonnet|haiku|fable|mythos)-(\d+)/.exec(id);
+  if (!g) return false;
+  const major = Number(g[2]);
+  return major > 5 || (major === 5 && g[1] === "opus");
+};
+/**
+ * Only these first-party Anthropic models accept a `role:"system"` entry INSIDE
+ * `messages[]`. Everywhere else that role is a 400, so a mid-conversation system turn has
+ * to travel as a `user` turn — still in position, which is the point.
+ *
+ * This is the ANTHROPIC-BACKEND half of the gateway capability. Ask
+ * {@link honoursMidConversationInstruction} instead unless you specifically mean this backend.
+ */
+export const MIDCONV_SYSTEM = (id: string) => /opus-(5|4-8)|sonnet-5|fable-5|mythos-5/.test(id);
+
+/**
+ * Does THIS GATEWAY carry a mid-conversation operator instruction as a distinct role for `model`?
+ *
+ * The one capability function, exported because a harness cannot derive it and a second copy would
+ * drift. `src/roster.ts` emits it as `compat.supportsMidConversationSystem`.
+ *
+ * WHY IT MUST BE ASKED AT ALL, and why it is broader than the Anthropic predicate: a harness
+ * catalog derives its mid-conversation opt-in from the base URL being the first-party Anthropic
+ * API. This gateway is loopback, so that derivation is false for EVERY model, and a harness that
+ * believes it DEMOTES the operator turn to `role:"user"` before the request ever leaves. The
+ * gateway's intake only tags `isSystem` for a non-leading `system`/`developer` message, so a
+ * pre-demoted turn is indistinguishable from an ordinary user turn and the instruction is lost
+ * UPSTREAM of every backend mapping. The flag therefore describes what this gateway ACCEPTS AND
+ * FORWARDS — not what api.anthropic.com accepts.
+ *
+ * Observed per backend on the outbound wire (test/lx/midsystem-gateway-capability.ts):
+ *   · openai — the Responses API spells it `developer`, and `toResponsesItems` maps every
+ *     `isSystem` turn to that role for ALL models on this backend. gpt-6-astra and gpt-5.6-sol
+ *     were both observed emitting `[user, developer]`. So it is capable regardless of the id.
+ *   · anthropic — wire `role:"system"`, but only for {@link MIDCONV_SYSTEM} ids and only where
+ *     Anthropic's placement rules hold; claude-opus-5 emitted `[user, system]`, claude-opus-4-6
+ *     was correctly downgraded to `[user, user]`.
+ *   · google — Gemini has no mid-conversation system role, so the turn stays `user` in position.
+ *   · ollama — no `isSystem` handling at all.
+ * The last two are NOT capable, and claiming otherwise would make a harness send a role that is
+ * then silently flattened.
+ */
+export function honoursMidConversationInstruction(provider: ProviderId, id: string): boolean {
+  if (provider === "openai") return true;
+  if (provider === "anthropic") return MIDCONV_SYSTEM(id);
+  return false;
+}
+/**
+ * Anthropic's placement rules for a wire `system` message, as the API states them
+ * (observed live against api.anthropic.com, 2026-08-31, claude-opus-5):
+ *   (a) it must FOLLOW a `user` turn - "role 'system' must follow a 'user' message or an
+ *       'assistant' message ending in a server tool result"; never first, because
+ *       "use the top-level 'system' parameter for the initial system prompt";
+ *   (b) it must PRECEDE an `assistant` turn or END the array - "role 'system' must precede
+ *       an 'assistant' message or end the array".
+ * (b) also subsumes the no-consecutive-`system` rule: a `system` turn followed by another
+ * `system` turn precedes neither an assistant nor the end.
+ *
+ * A turn that would break either rule is DOWNGRADED to `user` - it keeps its position,
+ * only its role changes. Without (b) this proxy forwarded `[user, system, user]`, which
+ * the API rejects outright, so the whole request 400ed instead of merely losing the role.
+ * Allocation-light: the original array comes straight back when every flag is already
+ * legal (and when none is set at all).
+ */
+function placeSystemTurns(turns: Turn[], allowed: boolean): Turn[] {
+  let out: Turn[] | null = null;
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (!t.isSystem) { out?.push(t); continue; }
+    // `prev` is the PLACED predecessor: a system turn already downgraded to `user` is a
+    // legal anchor, so read it out of `out` whenever the copy has started.
+    const prev = (out ?? turns)[i - 1];
+    const followsUser = i > 0 && prev !== undefined && !prev.isSystem && prev.role === "user";
+    // An `isSystem` turn carries `role: "user"`, so it never satisfies this test - which is
+    // exactly the no-consecutive-`system` guarantee.
+    const next = turns[i + 1];
+    const lastOrBeforeAssistant = next === undefined || next.role === "assistant";
+    if (allowed && followsUser && lastOrBeforeAssistant) { out?.push(t); continue; }
+    if (!out) out = turns.slice(0, i);
+    const { isSystem: _drop, ...rest } = t;
+    out.push({ ...rest, role: "user" });
+  }
+  return out ?? turns;
+}
+
+/**
+ * The two wire guards — `unknown` in, a finite number or a real object out — now live in
+ * `./wire.ts`, a dependency-free leaf, and are imported here for the three vendor usage
+ * readers that need them (anthropicUsage, googleUsage, and the Responses reader that moved
+ * to ./responses-wire.ts). They were extracted for exactly that third case: the leaf that
+ * ended the providers ⇄ providers-grok import cycle could not import back into this file
+ * without reinstating it.
+ *
+ * Their contract is the load-bearing one in this whole file: a vendor may send null, a
+ * string, or nothing at all for any counter, and each of those must read as "NOT STATED"
+ * rather than as a zero — an explicit zero is measured evidence of a cache miss, which is
+ * exactly the distinction a cache reader must keep.
+ */
+import { wireNum, wireObj } from "./wire.ts";
+/**
+ * One Anthropic `usage` object → this gateway's buckets and their sub-divisions. ONE reader
+ * for one wire shape, because that object arrives TWICE per turn — an opening count on
+ * `message_start` and a corrected one on `message_delta` — and a second copy is how the two
+ * snapshots drift into disagreeing about what the same turn cost.
+ *
+ * WHAT THE VENDOR DOCUMENTS, AND WHERE EACH FIELD GOES (Messages API `Usage`):
+ *   input_tokens                 → input        the uncached remainder (this vendor is EXCLUSIVE)
+ *   output_tokens                → output
+ *   cache_read_input_tokens      → cacheRead
+ *   cache_creation_input_tokens  → cacheWrite   the FLAT write total
+ *   cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}
+ *                                → cacheWriteTtl.{m5, h1}   a sub-division of cacheWrite
+ *   server_tool_use.{web_search_requests, web_fetch_requests}
+ *                                → serverTools.{webSearch, webFetch}   requests, not tokens
+ *   iterations[]                 NOT carried: per-attempt counts inside a server-side
+ *                                fallback chain, whose totals are already the fields above.
+ *                                Republishing them would invite a reader to sum the same
+ *                                tokens twice, and no front dialect has a field for them.
+ *
+ * WHY THE TTL BREAKDOWN IS WORTH CARRYING AT ALL. The two components cost different money:
+ * a 1-hour write bills at 2x base input where a 5-minute write bills at 1.25x, so a
+ * consumer handed only the flat total prices every 1h write at the cheaper 5-minute rate.
+ * It is a pure sub-division and the vendor says so — "the current
+ * cache_creation_input_tokens field equals the sum of the values in the cache_creation
+ * object" — so it never becomes a fourth bucket and is never added to anything.
+ *
+ * NOTHING IS SYNTHESIZED, AND AN ALL-ZERO BREAKDOWN IS NOT EMITTED. A consumer treats an
+ * explicit all-zero `cache_creation` as a command to CLEAR any breakdown a previous
+ * snapshot of the same turn established, so emitting one on the message_delta correction
+ * would erase the real split the message_start carried. Absent means the vendor reported no
+ * breakdown, which a consumer already handles by pricing the flat total.
+ */
+export const anthropicUsage = (u: unknown): Delta["usage"] | undefined => {
+  if (!u || typeof u !== "object") return undefined;
+  const cc = wireObj(u, "cache_creation"), st = wireObj(u, "server_tool_use");
+  const input = wireNum(u, "input_tokens"), output = wireNum(u, "output_tokens");
+  const cacheRead = wireNum(u, "cache_read_input_tokens"), cacheWrite = wireNum(u, "cache_creation_input_tokens");
+  const m5 = wireNum(cc, "ephemeral_5m_input_tokens"), h1 = wireNum(cc, "ephemeral_1h_input_tokens");
+  const webSearch = wireNum(st, "web_search_requests"), webFetch = wireNum(st, "web_fetch_requests");
+  return {
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    // Only a breakdown that actually SAYS something rides along: see the all-zero note above.
+    ...((m5 ?? 0) > 0 || (h1 ?? 0) > 0 ? { cacheWriteTtl: { ...(m5 ? { m5 } : {}), ...(h1 ? { h1 } : {}) } } : {}),
+    ...((webSearch ?? 0) > 0 || (webFetch ?? 0) > 0 ? { serverTools: { ...(webSearch ? { webSearch } : {}), ...(webFetch ? { webFetch } : {}) } } : {}),
+  };
+};
 
 export const anthropic: Provider & StreamShape = {
   id: "anthropic",
   label: "Anthropic (Claude Code subscription)",
+  /**
+   * EXCLUSIVE. The docs state the identity outright: "total_input_tokens =
+   * cache_read_input_tokens + cache_creation_input_tokens + input_tokens", and define the
+   * input counter as "Number of input tokens which were not read from or used to create a
+   * cache (that is, tokens after the last cache breakpoint)".
+   */
+  usageBasis: "exclusive",
+  /**
+   * Explicit breakpoints: `cache_control` marks the end of the reusable prefix, and "Prompt
+   * caching references the entire prompt - tools, system, and messages (in that order) up
+   * to and including the block designated with cache_control." That is the mechanism this
+   * gateway drives — it forwards the caller's own cache_control blocks untouched, which is
+   * why CallOpts.systemBlocks exists at all (flattening the system prompt to a string lost
+   * every marker). The vendor also offers a top-level automatic mode; this gateway does not
+   * substitute it for the caller's explicit placement.
+   *
+   * minTokens 512 is the LOWEST floor across active models, and the floor is NOT monotonic
+   * in version: 512 for Opus 5 / Fable 5 / Fable 5.1 / Mythos 5(.1), 1,024 for Opus 4.8 and
+   * Sonnet 5 / 4.6 / 4.5, 2,048 for Opus 4.7, 4,096 for Opus 4.6 / 4.5 and Haiku 4.5. So
+   * this number is a necessary condition, not a sufficient one: below it NOTHING caches
+   * ("Shorter prompts cannot be cached, even if marked with cache_control … and no error is
+   * returned"), while at or above it the answer is per-MODEL. A per-provider scalar cannot
+   * express a non-monotonic per-model function, and the honest choice is the one number
+   * that is true for every model rather than one that is wrong for half of them.
+   *
+   * ttlMs 5 minutes: "Currently, \"ephemeral\" is the only supported cache type, which by
+   * default has a 5-minute lifetime", refreshed free on every hit. A 1-hour duration is
+   * opt-in per request via `cache_control.ttl` at a higher write price — a caller's choice,
+   * not this vendor's default, so the default is what is declared here.
+   */
+  cache: { kind: "explicit-breakpoint", minTokens: 512, ttlMs: 5 * 60_000, identity: "cache_control" },
   probe() {
     const raw = readAnthropicRaw();
     const t = raw?.json?.claudeAiOauth;
@@ -560,7 +995,8 @@ export const anthropic: Provider & StreamShape = {
     if (o.systemBlocks?.length) system.push(...o.systemBlocks);
     else if (o.system) system.push({ type: "text", text: o.system });
 
-    const body: any = { model: m.id, system, messages: turns.map(toAnthropicMsg) };
+    const placed = placeSystemTurns(turns, MIDCONV_SYSTEM(m.id));
+    const body: any = { model: m.id, system, messages: placed.map(toAnthropicMsg) };
     if (o.promptCacheKey) body.metadata = { user_id: o.promptCacheKey };
     if (o.fast) body.speed = "fast";
     // Anthropic is the native shape: tools go out as they came in.
@@ -570,10 +1006,31 @@ export const anthropic: Provider & StreamShape = {
     }
 
     if (MODERN_THINKING(m.id)) {
-      if (o.thinkOff) body.thinking = { type: "disabled" };
-      else if (o.effort) body.thinking = o.showThinking ? { type: "adaptive", display: "summarized" } : { type: "adaptive" };
-      if (o.effort) body.output_config = { effort: o.effort };
-      body.max_tokens = o.maxTokens ?? (o.effort && HIGH_EFFORT.has(o.effort) ? 32000 : 8192);
+      // `thinking: {type: "disabled"}` is NOT universally accepted, so thinkOff resolves
+      // against the per-model table BEFORE it can become a field. Two classes of id reject
+      // it, each with a documented substitute; everywhere else it goes out as asked.
+      const alwaysOn = !!o.thinkOff && THINKING_ALWAYS_ON(m.id);
+      const overCeiling = !!o.thinkOff && !alwaysOn && NO_DISABLED_ABOVE_HIGH(m.id) && !!o.effort && !!ABOVE_HIGH[o.effort];
+      // The caller asked to stop paying for thinking, and on both rejecting classes the
+      // vendor answers with effort rather than a thinking field. An always-on model has no
+      // "off" at all, so the faithful reading of thinkOff is the least thinking it will do
+      // — the vendor's own substitute, "use lower `effort` levels to control token cost
+      // instead" — hence `low`, deliberately overriding a higher effort the caller paired
+      // with it, because the two are contradictory and thinkOff is the more specific ask.
+      // Over Opus 5's ceiling the vendor lists "Lower the effort level, or leave thinking
+      // on"; the first keeps the explicit request (no thinking) and only relaxes the
+      // implicit one, so effort steps down to the highest level that still accepts it.
+      const effort = alwaysOn ? "low" : overCeiling ? "high" : o.effort;
+      // On an always-on id this omits `thinking` entirely — "these models think without any
+      // configuration". Nothing is lost for a thinkOff caller: `display` already defaults to
+      // "omitted" there, so no thinking text comes back either way.
+      if (o.thinkOff) { if (!alwaysOn) body.thinking = { type: "disabled" }; }
+      else if (effort) body.thinking = o.showThinking ? { type: "adaptive", display: "summarized" } : { type: "adaptive" };
+      if (effort) body.output_config = { effort };
+      // The EFFECTIVE effort, never the requested one: a body whose output_config says
+      // `low` while max_tokens reserved room for `max` would bill a ceiling the request
+      // can no longer reach, and the two fields would disagree about the same request.
+      body.max_tokens = o.maxTokens ?? (effort && HIGH_EFFORT.has(effort) ? 32000 : 8192);
     } else {
       const budget = o.thinkOff ? 0 : LEGACY_BUDGET[o.effort ?? ""] ?? 0;
       if (budget > 0) betas.push("interleaved-thinking-2025-05-14");
@@ -610,26 +1067,16 @@ export const anthropic: Provider & StreamShape = {
     // Closes text blocks too; the dialect layer ignores a ref it never opened as a tool.
     if (ev.type === "content_block_stop") return { toolStop: { ref: String(ev.index) } };
     if (ev.type === "message_start") {
-      const u = ev.message?.usage;
-      return { served: ev.message?.model, ...(u ? { usage: {
-        input: u.input_tokens, output: u.output_tokens,
-        ...(typeof u.cache_read_input_tokens === "number" ? { cacheRead: u.cache_read_input_tokens } : {}),
-        ...(typeof u.cache_creation_input_tokens === "number" ? { cacheWrite: u.cache_creation_input_tokens } : {}),
-      } } : {}) };
+      const u = anthropicUsage(ev.message?.usage);
+      return { served: ev.message?.model, ...(u ? { usage: u } : {}) };
     }
     // The one event that says WHY generation stopped, and the final output count.
     // Dropping it is what made every reply look like a clean end_turn costing 0 tokens.
     if (ev.type === "message_delta") {
       const d: Delta = {};
       if (typeof ev.delta?.stop_reason === "string") d.stopReason = ev.delta.stop_reason;
-      if (ev.usage) {
-        d.usage = {
-          ...(typeof ev.usage.input_tokens === "number" ? { input: ev.usage.input_tokens } : {}),
-          ...(typeof ev.usage.output_tokens === "number" ? { output: ev.usage.output_tokens } : {}),
-          ...(typeof ev.usage.cache_read_input_tokens === "number" ? { cacheRead: ev.usage.cache_read_input_tokens } : {}),
-          ...(typeof ev.usage.cache_creation_input_tokens === "number" ? { cacheWrite: ev.usage.cache_creation_input_tokens } : {}),
-        };
-      }
+      const u = anthropicUsage(ev.usage);
+      if (u) d.usage = u;
       return d;
     }
     if (ev.type === "error") return { error: ev.error?.message ?? "stream error", ...(typeof ev.error?.type === "string" ? { errorType: ev.error.type } : {}) };
@@ -637,12 +1084,15 @@ export const anthropic: Provider & StreamShape = {
   },
 };
 function toAnthropicMsg(t: Turn) {
+  // A mid-conversation system turn differs from a user turn ONLY in this wire role;
+  // placeSystemTurns already proved the position is legal for this model.
+  const role = t.isSystem ? "system" : t.role;
   if (t.nativeAnthropicContent) {
-    return { role: t.role, content: t.nativeAnthropicContent.length ? t.nativeAnthropicContent : " " };
+    return { role, content: t.nativeAnthropicContent.length ? t.nativeAnthropicContent : " " };
   }
   if (!t.images?.length && !t.toolUses?.length && !t.toolResults?.length) {
     // An empty string here is a 400 upstream, so a blank turn goes as one space.
-    return { role: t.role, content: t.text || " " };
+    return { role, content: t.text || " " };
   }
   const content: any[] = [];
   // Results first: Anthropic requires every tool_result at the head of its turn.
@@ -659,7 +1109,7 @@ function toAnthropicMsg(t: Turn) {
     content.push({ type: "tool_use", id: u.id, name: u.name, input: u.input ?? {} });
   }
   if (!content.length) content.push({ type: "text", text: " " });
-  return { role: t.role, content };
+  return { role, content };
 }
 function toAnthropicTool(t: ToolDef) {
   return t.raw ?? { name: t.name, description: t.description ?? "", input_schema: t.parameters ?? { type: "object", properties: {} } };
@@ -680,40 +1130,124 @@ function readCodexRaw(): any | null {
 function jwtExp(tok: string): number | undefined {
   try { const p = JSON.parse(Buffer.from(tok.split(".")[1], "base64").toString()); return p.exp ? p.exp * 1000 : undefined; } catch { return undefined; }
 }
-const responsesUsage = (r: any): Delta["usage"] | undefined => {
-  if (!r?.usage) return undefined;
-  const details = r.usage.input_tokens_details;
-  return {
-    input: r.usage.input_tokens,
-    output: r.usage.output_tokens,
-    ...(typeof details?.cached_tokens === "number" ? { cacheRead: details.cached_tokens } : {}),
-    ...(typeof details?.cache_write_tokens === "number" ? { cacheWrite: details.cache_write_tokens } : {}),
-  };
-};
-/** Responses-API completion status -> Anthropic's stop vocabulary. Only a real
- *  output-cap truncation becomes "max_tokens"; everything else is an end_turn. */
-const responsesStop = (r: any): string =>
-  r?.incomplete_details?.reason === "max_output_tokens" ? "max_tokens" : "end_turn";
-/** The handle every event of one function call agrees on: the OUTPUT ITEM id. The added/
- *  done events carry it as `item.id`, the argument events as `item_id`; output_index is
- *  the last resort, and is the only field present on all three when a backend omits ids. */
-const fnRef = (ev: any): string => String(ev?.item?.id ?? ev?.item_id ?? ev?.item?.call_id ?? ev?.output_index ?? 0);
-/** JSON-Schema framing that is not a parameter schema. `$schema` in particular makes the
- *  Responses backend inconsistent, and no model needs it to call a tool. */
-function stripSchemaMeta(sch: any): any {
-  if (!sch || typeof sch !== "object" || Array.isArray(sch)) return sch;
-  const { $schema, $id, ...rest } = sch as any;
-  return rest;
+/**
+ * THE RESPONSES WIRE SHAPE LIVES IN ITS OWN MODULE, AND THIS RE-EXPORTS IT.
+ *
+ * These readers were written here, next to the `openai` adapter that first needed them.
+ * They now have a SECOND consumer — the grok subscription proxy, whose own catalog declares
+ * `api_backend: "responses"` — and importing them from providers-grok.ts made a CYCLE: this
+ * file imports the grok provider to put it in PROVIDERS, and that file imported this one for
+ * the helpers. That cycle is not a style problem but a temporal-dead-zone CRASH: ESM
+ * evaluated providers-grok.ts first, re-entered a providers.ts whose bindings were not yet
+ * initialised, and `PROVIDERS = { …, grok }` threw `ReferenceError: Cannot access '…' before
+ * initialization` at import time — before a single test could run.
+ *
+ * So they moved to `./responses-wire.ts`, a LEAF that imports only `type` from here (erased
+ * by ESM) plus the two guards in `./wire.ts`. Both adapters now depend on the leaf and
+ * neither depends on the other. Copying them into the grok adapter would also have broken
+ * the cycle, and would have been the wrong repair: a second parser for one wire shape is how
+ * two backends drift into disagreeing about what the same event meant.
+ *
+ * Re-exported under their historical names — including `openaiErrType`, which the leaf calls
+ * `responsesErrType` now that it serves two vendors — so every existing caller is unchanged.
+ */
+import {
+  responsesUsage, responsesStop, fnRef, stripSchemaMeta, toResponsesItems,
+  responsesErrType as openaiErrType,
+} from "./responses-wire.ts";
+// Re-exported from the LOCAL bindings above, not with a second `export … from`: that form
+// does not bind locally (the call sites below need `toResponsesItems`), so both statements
+// together declare each name twice and Bun rejects the module outright — "Cannot export a
+// duplicate function name". One import, one re-export of what it bound.
+export { responsesUsage, responsesStop, fnRef, stripSchemaMeta, toResponsesItems, openaiErrType };
+
+/** The Responses `service_tier` to send, or undefined for the backend default. Explicit
+ *  option → `fast` → env APIPLAN_SERVICE_TIER. "fast" (the Codex CLI's word) is spelled
+ *  "priority" on the wire; any other value passes through so the backend's 400 names it. */
+export function openaiServiceTier(o: CallOpts): string | undefined {
+  const raw = o.serviceTier ?? (o.fast ? "priority" : undefined) ?? process.env.APIPLAN_SERVICE_TIER;
+  const t = raw?.trim().toLowerCase();
+  return !t ? undefined : t === "fast" ? "priority" : t;
 }
 
-/** The Responses API names a fault in `type`, or failing that in `code`. */
-const openaiErrType = (e: any) =>
-  typeof e?.type === "string" ? { errorType: e.type }
-  : typeof e?.code === "string" ? { errorType: e.code } : {};
+/** Set `detail` on every `input_image` in a Responses input list — message content AND
+ *  `function_call_output.output` arrays (tool-result images). A part that already names
+ *  its own detail keeps it. Mutates the freshly built items in place. */
+export function withImageDetail(input: any[], detail: string): void {
+  const tag = (parts: unknown) => {
+    if (!Array.isArray(parts)) return;
+    for (const p of parts) if (p && typeof p === "object" && (p as any).type === "input_image" && !(p as any).detail) (p as any).detail = detail;
+  };
+  for (const it of input ?? []) {
+    if (it?.type === "message") tag(it.content);
+    else if (it?.type === "function_call_output") tag(it.output);
+  }
+}
 
 export const openai: Provider & StreamShape = {
   id: "openai",
   label: "OpenAI (Codex / ChatGPT subscription)",
+  /**
+   * INCLUSIVE. The prompt-caching guide's own cost sample computes the ordinary share by
+   * SUBTRACTION — "ordinaryInputTokens = inputTokens - cachedTokens - cacheWriteTokens" —
+   * which is only meaningful if `input_tokens` already contains both cached parts.
+   */
+  usageBasis: "inclusive",
+  /**
+   * Implicit prefix caching: "When prompt_cache_options.mode is implicit, OpenAI places a
+   * breakpoint at the end of the latest eligible message." That is the mechanism this
+   * gateway drives, and it is the right one here: a client of THIS server sends a growing
+   * conversation, not a hand-placed breakpoint, so the vendor's own end-of-latest-message
+   * placement is exactly what an appending thread wants. (GPT-5.6+ also accepts explicit
+   * `prompt_cache_breakpoint` markers; this gateway places none of its own.)
+   *
+   * identity `prompt_cache_key` — the field that INFLUENCES which machine serves the
+   * request, and nothing more: "Cached states live on individual machines … Set
+   * prompt_cache_key to help requests with the same prefix reach the same cache. Keys
+   * influence routing; they do not pin requests to a machine or guarantee a cache read hit."
+   * api.ts forwards the caller's key, and derives a stable one from model + system + first
+   * user turn when a client sends none, so a keyless conversation still gets a consistent
+   * routing hint.
+   *
+   * A KEY ROUTES, IT DOES NOT OWN. Measured: a never-before-used key read a resident prefix
+   * 1,339s after a DIFFERENT key wrote it. So a cache entry is not partitioned by key, and
+   * two consequences follow for anyone reasoning about this field: a fresh key is NOT a
+   * clean-cache condition (an experiment that varies the key is not isolated by it), and a
+   * changed key does not invalidate anything. Tuning the key's FORM is a known dead end.
+   *
+   * minTokens 1,024: "The minimum cacheable prompt length is 1,024 tokens for GPT-5.6 and
+   * later and 2,048 tokens for models older than GPT-5.6" — again the lowest floor across
+   * active models, and again necessary rather than sufficient (the older tier needs 2,048,
+   * and "You may occasionally get cache hits below 2,048 tokens for some earlier models").
+   * Hidden OpenAI system tokens do not count toward it.
+   *
+   * ttlMs 30 minutes: "Use prompt_cache_options.ttl to control the minimum cache lifetime.
+   * The only supported value, 30m, is also the default." Older models instead take
+   * `prompt_cache_retention` (in_memory ≈ 5-10 min idle, or 24h) — a per-model spread, so
+   * what is declared here is the current default, not a promise for every id.
+   *
+   * MEASURED ON ONE MODEL, NOT DOCUMENTED — on `gpt-6-astra` the reported `cached_tokens`
+   * is QUANTIZED TO 128, and the guide's claim that GPT-5.6+ reports an "Exact eligible
+   * boundary" does not hold there. Every non-zero value observed is a clean multiple:
+   * 7,424 = 58×128 and 6,144 = 48×128 from a 12-call run against a byte-stable fixture
+   * (0 errors; receipt .deify/cache-proof/live-ab.json), plus a production plateau of
+   * 10,368 = 81×128. Three arbitrary values landing on multiples by chance is ~5e-7, so the
+   * pattern is real — but it is THREE values on ONE id, which says nothing about
+   * gpt-5.6-sol / -terra / -luna, gpt-5.5 or the mini ids. Those are UNVERIFIED, and the
+   * cheapest falsifier is a small cache read (a low value has the most room to sit off-grid).
+   *
+   * There is deliberately NO granularity FIELD for it: the vendor publishes no such number,
+   * and inventing one would read as documented. It is recorded here so a test comparing a
+   * cache read against an expected prefix LENGTH allows a 128-token band on that id instead
+   * of flaking — the counters this gateway republishes are untouched either way, since a
+   * quantized count is still the count upstream reported. That distinction is the point: it
+   * is a test-assertion concern, not an accounting one, and no accounting fault appeared
+   * anywhere in the 12 calls.
+   *
+   * Also measured on that run: a reply NEVER echoes `prompt_cache_key`. The identity is
+   * send-only, so it can only be asserted on the OUTBOUND body, never from a response.
+   */
+  cache: { kind: "implicit-prefix", minTokens: 1024, ttlMs: 30 * 60_000, identity: "prompt_cache_key" },
   probe() {
     const a = readCodexRaw();
     if (!a) return { connected: false, detail: `no ${codexAuthFile().replace(HOME, "~")}`, loginHint: "run `codex` and log in" };
@@ -758,7 +1292,17 @@ export const openai: Provider & StreamShape = {
       stream: true,
       ...(o.promptCacheKey ? { prompt_cache_key: o.promptCacheKey } : {}),
     };
-    if (o.effort) body.reasoning = { effort: o.effort, ...(o.showThinking ? { summary: "auto" } : {}) };
+    // Thinking OFF has no field of its own on this wire: the faithful reading is the LEAST
+    // reasoning the model accepts — the bottom of its own ladder (`none` on gpt-6-sol/luna,
+    // `low` on gpt-6-astra, which 400s `none` live). It overrides a paired higher effort,
+    // exactly as the Anthropic adapter does: the two are contradictory and thinkOff is the
+    // more specific ask. An empty ladder leaves the backend default untouched.
+    const effort = o.thinkOff ? (openai.efforts(m)[0] ?? o.effort) : o.effort;
+    if (effort) body.reasoning = { effort, ...(o.showThinking ? { summary: "auto" } : {}) };
+    const tier = openaiServiceTier(o);
+    if (tier) body.service_tier = tier;
+    const detail = o.imageDetail ?? process.env.APIPLAN_IMAGE_DETAIL;
+    if (detail) withImageDetail(body.input, detail);
     // No max_output_tokens: the codex backend rejects it outright with
     // "Unsupported parameter: max_output_tokens" (400). Sending it broke every call
     // that carried a length cap — including any API client that sets max_tokens by
@@ -937,16 +1481,13 @@ export const openai: Provider & StreamShape = {
    * 44-byte WAV header and no codec at all.
    *
    * Measured 2026-08-02: `/v1/audio/speech` still refuses a subscription token (429
-   * "account is not active"), so the billed REST route is the fallback here, not the
-   * main path.
+   * "account is not active"). A REST speech backend must be configured explicitly.
    */
   async speak(o: SpeechOpts): Promise<SpeechResult> {
-    const key = process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY;
     const base = process.env.APIPLAN_TTS_BASE;
-    if (!base) {
-      try { return await speakRealtime(openai.creds(), o); }
-      catch (e) { if (!key) throw e; }        // with a key in hand, fall through and use it
-    }
+    if ((o.liveModel || process.env.APIPLAN_LIVE_MODEL) && base) throw new Error("--live-model selects subscription speech; unset APIPLAN_TTS_BASE to use it.");
+    if (!base) return speakRealtime(openai.creds(), o);
+    const key = process.env.OPENAI_API_KEY || process.env.APIPLAN_OPENAI_API_KEY;
     const url = base || env("APIPLAN_OPENAI_API_BASE", "https://api.openai.com");
     const model = o.model || env("APIPLAN_TTS_MODEL", "gpt-4o-mini-tts");
     const res = await fetch(`${url}/v1/audio/speech`, {
@@ -976,31 +1517,7 @@ export const openai: Provider & StreamShape = {
     return { backend: "api.openai.com (needs OPENAI_API_KEY)", voices: openai.voices ?? [] };
   },
 };
-/** Responses API items: user content is input_text/input_image, assistant is output_text. */
-/** One Turn can be SEVERAL Responses items: a tool result and a tool call are top-level
- *  items there, not content blocks of a message. */
-function toResponsesItems(t: Turn): any[] {
-  const items: any[] = [];
-  for (const r of t.toolResults ?? []) {
-    items.push({ type: "function_call_output", call_id: r.toolUseId, output: flatText(r.content) });
-  }
-  const content: any[] = [];
-  if (t.role === "assistant") {
-    if (t.text) content.push({ type: "output_text", text: t.text });
-  } else {
-    if (t.text) content.push({ type: "input_text", text: t.text });
-    for (const im of t.images ?? []) {
-      content.push({ type: "input_image", image_url: im.url ?? `data:${im.mediaType};base64,${im.base64}` });
-    }
-  }
-  if (content.length) items.push({ type: "message", role: t.role, content });
-  for (const u of t.toolUses ?? []) {
-    items.push({ type: "function_call", call_id: u.id, name: u.name, arguments: typeof u.input === "string" ? u.input : JSON.stringify(u.input ?? {}) });
-  }
-  // A turn that carried only blocks this backend cannot express still has to exist.
-  if (!items.length) items.push({ type: "message", role: t.role, content: [{ type: t.role === "assistant" ? "output_text" : "input_text", text: t.text || " " }] });
-  return items;
-}
+
 /** A tool_result content may be a string or a block array; these backends take text. */
 export function flatText(c: any): string {
   if (typeof c === "string") return c;
@@ -1475,9 +1992,101 @@ function googleBest(t: { access?: string; expiresAt?: number; account?: string }
   return t;
 }
 
+/**
+ * One Gemini `usageMetadata` → this gateway's buckets. EXPORTED so the API-key Gemini
+ * provider and this subscription one cannot drift: they wrap the same proto, and two
+ * readers of one wire shape is how two routes end up disagreeing about what a turn cost.
+ *
+ * WHAT THE VENDOR DOCUMENTS, AND WHERE EACH FIELD GOES (UsageMetadata reference):
+ *   promptTokenCount          → input      the WHOLE prompt (this vendor is INCLUSIVE)
+ *   candidatesTokenCount      → output     plus thoughts, see below
+ *   cachedContentTokenCount   → cacheRead  a breakdown OF promptTokenCount
+ *   thoughtsTokenCount        → output (added) and reported again as `reasoning`
+ *   totalTokenCount           NOT carried: "(prompt + thoughts + response candidates)", so
+ *                             it is derivable from the above and each front computes its
+ *                             own total. A second total invites two answers to one question.
+ *   toolUsePromptTokenCount   NOT carried, and this one is a genuine unknown rather than a
+ *                             redundancy: the vendor documents it only as "Number of tokens
+ *                             present in tool-use prompt(s)" and never says whether
+ *                             promptTokenCount contains it — the totalTokenCount identity
+ *                             above omits it entirely. Folding it into `input` could
+ *                             double-count and subtracting it could go negative, so it stays
+ *                             absent until the vendor states the containment. Documented-or-
+ *                             absent: a guessed partition outlives the person who guessed.
+ *   promptTokensDetails[] / cacheTokensDetails[]
+ *                             NOT carried: per-MODALITY breakdowns (TEXT/IMAGE/AUDIO) of
+ *                             counters already carried in full. Neither front dialect has a
+ *                             modality dimension, so there is nowhere to put them.
+ *   serviceTier               NOT carried: not a token count.
+ *
+ * TWO FAULTS THIS READER EXISTS TO FIX, both silent (UNKNOWNS I-13):
+ *
+ * 1. cachedContentTokenCount was DROPPED, and it is the cache-HIT counter. Downstream, a
+ *    dropped counter is indistinguishable from a measured zero, so a cache that was working
+ *    read as one that never hit — the exact question a caller sends cached content to
+ *    answer. It maps straight to cacheRead, UNSUBTRACTED: this provider declares
+ *    `usageBasis: "inclusive"` and api.ts's normalizeTally() owns the single conversion, so
+ *    subtracting here as well would double-subtract.
+ *
+ * 2. thoughtsTokenCount was DROPPED, and unlike OpenAI's reasoning_tokens it is NOT already
+ *    inside the output counter: "totalTokenCount … Total token count for the generation
+ *    request (prompt + thoughts + response candidates)" makes thoughts a THIRD addend, and
+ *    the thinking guide prices it as output. So publishing candidatesTokenCount alone
+ *    under-reports the BILLED output on every thinking turn. It is added into `output` and
+ *    ALSO reported as `reasoning`, whose contract is "the reasoning share of output" — that
+ *    way a consumer reads one invariant (reasoning is inside output) on every vendor and
+ *    never has to know which of them nests its own counters.
+ */
+export const googleUsage = (um: unknown): Delta["usage"] | undefined => {
+  if (!um || typeof um !== "object") return undefined;
+  const input = wireNum(um, "promptTokenCount"), cand = wireNum(um, "candidatesTokenCount");
+  const cacheRead = wireNum(um, "cachedContentTokenCount"), reasoning = wireNum(um, "thoughtsTokenCount");
+  // Each addend counts only when the vendor stated it: absent output plus stated thoughts
+  // is still a real billed output, and stated output plus absent thoughts is unchanged.
+  const output = cand === undefined && reasoning === undefined ? undefined : (cand ?? 0) + (reasoning ?? 0);
+  return {
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+  };
+};
+
 export const google: Provider & StreamShape = {
   id: "google",
   label: "Google (Antigravity / Gemini Code Assist subscription)",
+  /**
+   * INCLUSIVE. The UsageMetadata reference states that `promptTokenCount` is "still the
+   * total effective prompt size meaning this includes the number of tokens in the cached
+   * content", with `cachedContentTokenCount` as the breakdown of it.
+   */
+  usageBasis: "inclusive",
+  /**
+   * A CACHED-CONTENT RESOURCE: unlike the other two vendors, the prefix is not marked inside
+   * the request at all — it is uploaded first as a separate, server-side `CachedContent`
+   * object, and later requests reference it by name in `cachedContent`. Google ALSO caches
+   * implicitly (no client field, no guarantee), which is why the vendor advises sending
+   * similar-prefix requests close together; the named resource is the only mechanism a
+   * client can actually address, so it is the one this contract declares.
+   *
+   * NOT YET DRIVEN BY THE REQUEST PATH. build() sends no `cachedContent` and delta() reads
+   * no `cachedContentTokenCount` today — this declaration is the vendor fact, not a claim
+   * about this gateway's behaviour. The basis above is live and load-bearing regardless:
+   * normalizeTally() already converts Google's inclusive counters the moment any cache
+   * counter appears, so the day delta() starts reporting one, the partition is correct
+   * rather than double-counted.
+   *
+   * minTokens 2,048 — the documented floor for Gemini 2.5 Flash and 2.5 Pro, and the lowest
+   * across the family (newer 3.x versions require 4,096). Necessary, not sufficient, for the
+   * same reason as the other two vendors.
+   *
+   * ttlMs is ABSENT ON PURPOSE. Google documents no implicit-cache lifetime (only the
+   * advice to "send requests with similar prefix in a short amount of time") and states no
+   * default TTL for a CachedContent resource — its `ttl` is set per resource, and storage
+   * is billed per token-hour. An undocumented number would read as a measured one, so
+   * nothing is declared: absent means unknown here, exactly as it does for a token count.
+   */
+  cache: { kind: "cached-content-resource", minTokens: 2048, identity: "cachedContent" },
   probe() {
     const r = readGoogle();
     if (r.state === "unreadable") return {
@@ -1666,8 +2275,8 @@ export const google: Provider & StreamShape = {
       if (p.thought) out.reasoning = (out.reasoning ?? "") + p.text;
       else out.text = (out.text ?? "") + p.text;
     }
-    const um = r.usageMetadata;
-    if (um) out.usage = { input: um.promptTokenCount, output: um.candidatesTokenCount };
+    const u = googleUsage(r.usageMetadata);
+    if (u) out.usage = u;
     if (cand?.finishReason === "STOP" && out.toolCallDone) out.stopReason = "tool_use";
     else if (cand?.finishReason === "MAX_TOKENS") out.stopReason = "max_tokens";
     // A refusal arrives as a finish reason on an empty candidate, and a prompt-level block
@@ -1698,81 +2307,46 @@ export const google: Provider & StreamShape = {
     return undefined;
   },
 };
-/** A Turn → a Gemini `Content`: role mapped (assistant→model), images sent INLINE as
- *  base64 — the measured-correct choice, since routing the frame through an agent tool cost
- *  an extra model turn (~2.5s) for nothing the model could not read from the bytes. */
-function toGeminiContent(t: Turn, nameOf?: Map<string, string>) {
-  const parts: any[] = [];
-  for (const r of t.toolResults ?? []) {
-    parts.push({ functionResponse: {
-      name: nameOf?.get(r.toolUseId) ?? r.toolUseId ?? "tool",
-      response: { output: flatText(r.content) },
-    } });
-  }
-  if (t.text) parts.push({ text: t.text });
-  for (const im of t.images ?? []) {
-    if (im.base64) parts.push({ inlineData: { mimeType: im.mediaType ?? "image/png", data: im.base64 } });
-    else if (im.url) parts.push({ fileData: { mimeType: im.mediaType ?? "image/png", fileUri: im.url } });
-  }
-  for (const u of t.toolUses ?? []) {
-    const sig = recallToolSig(u.id);
-    parts.push({ functionCall: { name: u.name, args: typeof u.input === "string" ? safeJson(u.input) : (u.input ?? {}) }, ...(sig ? { thoughtSignature: sig } : {}) });
-  }
-  if (!parts.length) parts.push({ text: " " });
-  return { role: t.role === "assistant" ? "model" : "user", parts };
-}
-const safeJson = (v: string) => { try { const j = JSON.parse(v); return j && typeof j === "object" ? j : {}; } catch { return {}; } };
-
 /**
- * Gemini 3 refuses a transcript whose functionCall parts come back without the
- * `thoughtSignature` it issued ("Function call is missing a thought_signature ... required
- * for tools to work correctly" — observed live 2026-08-27). Neither the Anthropic nor the
- * OpenAI dialect has a field to carry an opaque vendor blob across a turn, and a client
- * only ever echoes the tool-call ID, so the signature is remembered HERE, keyed by that id.
- * Process-local and bounded: a conversation that outlives a server restart simply loses the
- * signature and Gemini asks for it again — no state on disk, no unbounded growth.
+ * The GEMINI PROTO now lives in a LEAF, src/gemini-wire.ts — `toGeminiContent`, the
+ * `Schema` pruner and the thought-signature store, all moved VERBATIM.
+ *
+ * They lived here because the `google` adapter was written here, but they are facts about
+ * the VENDOR rather than about this route, and the API-key adapter
+ * (`providers-gemini.ts`) needs every one of them. Importing them from there made a
+ * genuine CYCLE — this file imports the gemini provider to put it in PROVIDERS, and that
+ * provider imported this file for the helpers — which is a hard temporal-dead-zone crash
+ * rather than a style complaint: `PROVIDERS = { …, gemini }` threw `ReferenceError: Cannot
+ * access '…' before initialization` at import time, taking every test in the repo with it.
+ * Exactly the failure `responses-wire.ts` was extracted to end for the grok adapter, and
+ * the fix is the same one: a leaf with no runtime imports, which both adapters may depend
+ * on and which depends on neither.
+ *
+ * ONE import, ONE re-export of the bound names — never also `export … from`, which does
+ * not bind locally and would declare each name twice (Bun rejects the whole module). The
+ * historical names stay exported, so `rememberToolSig`'s caller in api.ts is unchanged.
  */
-const GOOGLE_SIGS = new Map<string, string>();
-const GOOGLE_SIGS_MAX = 2000;
-export function rememberToolSig(id: string, sig: string) {
-  if (!id || !sig) return;
-  if (GOOGLE_SIGS.size >= GOOGLE_SIGS_MAX) GOOGLE_SIGS.delete(GOOGLE_SIGS.keys().next().value as string);
-  GOOGLE_SIGS.set(id, sig);
-}
-const recallToolSig = (id: string) => GOOGLE_SIGS.get(id);
+import { geminiSchema, rememberToolSig, recallToolSig, toGeminiContent } from "./gemini-wire.ts";
+export { geminiSchema, rememberToolSig, recallToolSig, toGeminiContent };
 
-/**
- * Gemini's endpoint is strict proto-JSON: an unknown field is a 400, and its `Schema` is a
- * SUBSET of JSON Schema. Claude Code's tool schemas carry $schema, additionalProperties,
- * const and exclusiveMinimum, none of which exist in that proto — so the schema is pruned
- * to the fields the proto has, rather than sent whole and rejected. `type` is a proto enum,
- * so it goes up-cased; a `["string","null"]` union collapses to its first real type.
- */
-const GEMINI_SCHEMA_KEYS = new Set([
-  "type", "format", "title", "description", "nullable", "enum", "items", "properties",
-  "required", "minItems", "maxItems", "minLength", "maxLength", "pattern", "minimum",
-  "maximum", "example", "anyOf", "propertyOrdering", "default",
-]);
-function geminiSchema(sch: any): any {
-  if (Array.isArray(sch)) return sch.map(geminiSchema);
-  if (!sch || typeof sch !== "object") return sch;
-  const out: any = {};
-  for (const [k, v] of Object.entries(sch)) {
-    if (!GEMINI_SCHEMA_KEYS.has(k)) continue;
-    if (k === "properties" && v && typeof v === "object") {
-      out.properties = Object.fromEntries(Object.entries(v as any).map(([p, ps]) => [p, geminiSchema(ps)]));
-    } else if (k === "items" || k === "anyOf") out[k] = geminiSchema(v);
-    else if (k === "type") {
-      const t = Array.isArray(v) ? (v as any[]).find((x) => x !== "null") ?? "string" : v;
-      if (typeof t === "string") { out.type = t.toUpperCase(); if (Array.isArray(v)) out.nullable = true; }
-    } else out[k] = v;
-  }
-  return Object.keys(out).length ? out : undefined;
-}
-
-// The local vendor lives in its own file — it shares no helper with the three subscription
-// adapters — and its import sits HERE, beside the map it joins, so adding a provider touches
-// one place instead of two. ESM hoists imports; the position changes nothing at runtime.
+// Providers in their own files import HERE, beside the map they join, so adding one touches
+// a single place instead of two. ESM hoists imports; the position changes nothing at
+// runtime. ollama is the local vendor and shares no helper with the subscription adapters;
+// grok is a subscription adapter that DOES — its endpoint's own catalog reports
+// `api_backend: "responses"`, so it imports this file's Responses helpers rather than
+// forking a second parser for one wire shape. gemini is the same vendor as `google`
+// reached by API KEY instead of the Antigravity OAuth: a different credential, endpoint,
+// body envelope and catalog, so a separate provider — but it shares this file's
+// `geminiSchema` and `rememberToolSig`, which are facts about the vendor rather than
+// about either route.
 import { ollama } from "./providers-ollama.ts";
-export const PROVIDERS: Record<ProviderId, Provider> = { anthropic, openai, google, ollama };
+import { grok } from "./providers-grok.ts";
+import { gemini } from "./providers-gemini.ts";
+// zen is the OpenCode Zen gateway on an API key. Like grok it speaks the Responses wire and so
+// imports responses-wire.ts rather than forking a second parser for one shape; unlike every
+// other adapter here it is a RESELLER, which is why its registry ids carry a `zen-` prefix
+// (parseZen says why) and why models() lists it last.
+import { zen } from "./providers-zen.ts";
+import { online } from "./providers-online.ts";
+export const PROVIDERS: Record<ProviderId, Provider> = { anthropic, openai, google, ollama, grok, gemini, zen, online };
 export const providerFor = (m: Model): Provider => PROVIDERS[m.provider];

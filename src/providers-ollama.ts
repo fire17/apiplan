@@ -229,6 +229,26 @@ function compatDeltas(ev: any): Delta[] {
 export const ollama: Provider & StreamShape = {
   id: "ollama",
   label: "Ollama (local models on this machine)",
+  /**
+   * EXCLUSIVE, because there is nothing for an inclusive total to include. Neither endpoint
+   * reports a cache counter at all: the native wire's `prompt_eval_count` is the tokens the
+   * daemon actually evaluated, and the compat wire's usage carries no cached breakdown. With
+   * no cache counters in play, no share can be double-counted, so the counts pass straight
+   * through — the same reasoning api.ts's normalizeTally() applies.
+   *
+   * Should a future ollama grow cache counters, this basis must be re-derived from ITS OWN
+   * documentation and changed HERE. That is the point of the declaration living beside the
+   * adapter that reads the wire, rather than in a table somewhere else.
+   */
+  usageBasis: "exclusive",
+  /**
+   * No prompt cache to ADDRESS. The daemon does hold KV state between calls for a resident
+   * model (that is what `keep_alive` keeps warm), but it exposes no field to reference an
+   * entry and reports no read/write counts — so from a client's side there is nothing to
+   * mark, name, or measure. `kind: "none"` is that absence stated, which is a different
+   * fact from a provider that simply never declared one.
+   */
+  cache: { kind: "none", identity: "none" },
   // The native endpoint frames with newlines, not blank-line-separated `data:` events.
   get framing() { return WIRE() === "compat" ? ("sse" as const) : ("ndjson" as const); },
   probe() {

@@ -4,9 +4,10 @@
 // just materialised copies of it. That means renaming or adding a command is a
 // config edit plus a re-sync, and `apiplan sync` can always rebuild PATH from scratch.
 import { join } from "node:path";
-import { existsSync } from "node:fs";
-import { STATE_DIR, defaultBinDir, readJson, writeJson, writeShim, removeShim, shadowsExisting, whichSync, isOurShim, IS_WIN } from "./platform.ts";
-import { resolve, models, aliasesFor } from "./registry.ts";
+import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { STATE_DIR, defaultBinDir, readJson, writeJson, writeShim as writeShimTo, removeShim, shadowsExisting, whichSync, isOurShim, IS_WIN } from "./platform.ts";
+import { resolve, models, aliasesFor, type Model } from "./registry.ts";
 import { PROVIDERS } from "./providers.ts";
 
 export type Command = {
@@ -32,6 +33,10 @@ export const binDirOf = (c: Config) => c.binDir || defaultBinDir();
 /** The bun (or compatible) runtime the shims exec. */
 export const runnerOf = (c: Config) => c.runner || process.execPath;
 
+/** Providers whose moved variant words get pinned twins (luna6 / luna56). A gateway (zen)
+ *  republishes other vendors' lines, so twins there would mint names for someone else's bill. */
+const PINNED_TWIN_PROVIDERS: readonly string[] = ["openai"];
+
 /** The default set: one command per model family + per current variant, plus -fast twins. */
 export function defaults(): Command[] {
   // "fast" = the least reasoning the provider allows + streaming, so the first token
@@ -50,6 +55,10 @@ export function defaults(): Command[] {
     out.push({ name, model, ...(flags ? { flags } : {}), ...(note ? { note } : {}) });
   };
   for (const m of models()) {
+    // Website routes are reached as `online/astra` / `online/chat` or `--chatmode` (FALLBACK.online
+    // is deliberately route-prefixed); minting `onlinegpt*` commands would put a browser-session
+    // route on PATH nobody asked for (observed: mergeDefaults on a real config added 4 of them).
+    if (m.provider === "online") continue;
     const fam = m.family;
     // family command → always the newest member of that family
     if (!seen.has(fam)) {
@@ -67,6 +76,31 @@ export function defaults(): Command[] {
       add(m.variant, m.variant, undefined, m.label);
     }
   }
+  // `spark` — Muse Spark on OpenCode Zen, named EXPLICITLY rather than left to the variant
+  // rule above. The rule is right for a vendor's own line-up and wrong for a gateway: it mints
+  // a command for the newest NUMBERED model carrying a variant word, and `resolve("spark")` is
+  // what a user actually types after reading opencode's docs. Stated here, the command follows
+  // resolve() by construction instead of depending on where zen's versions happen to sort.
+  // `add()` still refuses to shadow a real tool already on PATH, and still refuses a duplicate,
+  // so this is additive in every case.
+  // PINNED TWINS — only where a bare variant word has MOVED. The day GPT-6 Luna shipped, `luna`
+  // started meaning gpt-6-luna (resolve's newest-first rule); both generations then deserve a
+  // name that never moves: luna6 → gpt6luna, luna56 → gpt56luna. A word with one numbered carrier
+  // (astra, terra) gets no twin — nothing moved, so a pinned name would be noise on PATH.
+  for (const p of PINNED_TWIN_PROVIDERS) {
+    const byWord = new Map<string, Model[]>();
+    for (const m of models(p as any)) if (m.variant && m.version.length) byWord.set(m.variant, [...(byWord.get(m.variant) ?? []), m]);
+    for (const [word, carriers] of byWord) {
+      if (carriers.length < 2) continue;
+      for (const m of carriers) {
+        const v = m.version.join("");
+        const target = `${m.family}${v}${word}`;            // gpt6luna / gpt56luna
+        if (resolve(target)?.id !== m.id) continue;          // never mint a name that lands elsewhere
+        add(`${word}${v}`, target, undefined, `${m.label} (pinned)`);
+      }
+    }
+  }
+  if (resolve("spark")) add("spark", "spark", undefined, "Muse Spark on OpenCode Zen");
   // Non-text jobs, named after what they do. Only offered by a provider that can:
   // drawing runs on the OpenAI subscription; speech needs a billed key and says so.
   const drawer = models().find((m) => PROVIDERS[m.provider].canGenerateImages);
@@ -110,6 +144,20 @@ export function mergeDefaults(c: Config): string[] {
   return added;
 }
 
+/** A default command's note is its model's label ("GPT-5.6-Luna"); when the word moves the note lies.
+ *  Rewrites ONLY notes that exactly equal some registry label, on commands whose model is a bare word
+ *  with no flags — a note the user wrote by hand is never touched. Returns "name: old → new" lines. */
+export function refreshNotes(c: Config): string[] {
+  const labels = new Set(models().map((m) => m.label));
+  const out: string[] = [];
+  for (const cmd of c.commands) {
+    if (!cmd.note || !labels.has(cmd.note) || cmd.flags?.length || /\d/.test(cmd.model)) continue;
+    const now = resolve(cmd.model)?.label;
+    if (now && now !== cmd.note) { out.push(`${cmd.name}: ${cmd.note} → ${now}`); cmd.note = now; }
+  }
+  return out;
+}
+
 export type SyncReport = { written: string[]; skipped: { name: string; why: string }[]; binDir: string };
 
 /**
@@ -117,8 +165,12 @@ export type SyncReport = { written: string[]; skipped: { name: string; why: stri
  * executable already on PATH (that's how `gpt` silently shadowed macOS's
  * partition-table tool) unless the command is explicitly marked force.
  */
-export function sync(c: Config, opts: { force?: boolean; only?: string[] } = {}): SyncReport {
+export function sync(c: Config, opts: { force?: boolean; only?: string[]; writeDir?: string } = {}): SyncReport {
   const binDir = binDirOf(c);
+  // writeDir: materialise into another directory (the dry run's scratch dir) while every
+  // shadow check still asks about the REAL bin dir — so the preview is the real decision.
+  const writeShim = (dir: string, name: string, run: string, ent: string, args: string[]) =>
+    writeShimTo(opts.writeDir ?? dir, name, run, ent, args).map((f) => (opts.writeDir ? join(binDir, f.slice(opts.writeDir.length + 1)) : f));
   const runner = runnerOf(c);
   const entry = join(import.meta.dir, "..", "bin", "ask.ts");
   const written: string[] = [];
@@ -126,6 +178,9 @@ export function sync(c: Config, opts: { force?: boolean; only?: string[] } = {})
   // `apiplan` itself is always present, so a broken install can always be repaired
   // with the same tool that manages everything else.
   if (!opts.only) written.push(...writeShim(binDir, "apiplan", runner, join(import.meta.dir, "..", "bin", "apiplan.ts"), []));
+  if (!opts.only && !shadowsExisting("chatgpt", binDir)) {
+    written.push(...writeShim(binDir, "chatgpt", runner, join(import.meta.dir, "..", "bin", "chatgpt.ts"), []));
+  }
   // `jimmy` has its own entry point rather than a --model shim: chatjimmy.ai needs no
   // credential and streams raw text, so it shares none of the provider plumbing.
   if (!opts.only && !shadowsExisting("jimmy", binDir)) {
@@ -139,6 +194,31 @@ export function sync(c: Config, opts: { force?: boolean; only?: string[] } = {})
     written.push(...writeShim(binDir, cmd.name, runner, entry, ["--model", cmd.model, ...(cmd.flags ?? [])]));
   }
   return { written, skipped, binDir };
+}
+
+export type SyncPlan = { add: string[]; change: { name: string; before: string; after: string }[]; same: string[];
+  skipped: { name: string; why: string }[]; binDir: string };
+/**
+ * What `sync` WOULD do, touching nothing: the shims are rendered into a scratch dir by the
+ * same code path and compared byte-for-byte with what is on disk now.
+ */
+export function planSync(c: Config, opts: { force?: boolean; only?: string[] } = {}): SyncPlan {
+  const scratch = mkdtempSync(join(tmpdir(), "apiplan-sync-plan-"));
+  try {
+    const r = sync(c, { ...opts, writeDir: scratch });
+    const plan: SyncPlan = { add: [], change: [], same: [], skipped: r.skipped, binDir: r.binDir };
+    for (const f of r.written) {
+      const rel = f.slice(r.binDir.length + 1);
+      const after = readFileSync(join(scratch, rel), "utf8");
+      const name = rel.replace(/\.(cmd|ps1)$/, "");
+      if (!existsSync(f)) { if (!plan.add.includes(name)) plan.add.push(name); continue; }
+      const before = readFileSync(f, "utf8");
+      if (before === after) { if (!plan.same.includes(name)) plan.same.push(name); }
+      else plan.change.push({ name: rel, before, after });
+    }
+    plan.same = plan.same.filter((n) => !plan.add.includes(n) && !plan.change.some((x) => x.name.replace(/\.(cmd|ps1)$/, "") === n));
+    return plan;
+  } finally { try { rmSync(scratch, { recursive: true, force: true }); } catch {} }
 }
 
 export function add(c: Config, cmd: Command): { ok: boolean; why?: string } {
@@ -173,7 +253,7 @@ export function orphans(c: Config): string[] {
   const binDir = binDirOf(c);
   // apiplan and jimmy have their own entry points and are never in commands.json,
   // so without naming them here prune would treat them as leftovers and delete them.
-  const keep = new Set<string>(["apiplan", "jimmy", ...c.commands.map((x) => x.name)]);
+  const keep = new Set<string>(["apiplan", "jimmy", "chatgpt", ...c.commands.map((x) => x.name)]);
   const out: string[] = [];
   try {
     for (const f of require("node:fs").readdirSync(binDir) as string[]) {

@@ -161,7 +161,7 @@ describe("the capacity record (U11) — what apiplan learns from a refusal", () 
 
   test("a 429 with a relative retry-after yields a reset instant", () => {
     const r = capacityRecordFromResponse({ provider: "anthropic", at: T, account: "a:1111aaaa2222", status: 429, headers: { "retry-after": "60" } });
-    expect(r).toMatchObject({ limited: true, resetsAt: T + 60_000, source: "retry-after", scope: "account" });
+    expect(r).toMatchObject({ limited: true, resetsAt: T + 60_000, source: "retry-after", scope: "unknown" });
   });
 
   test("the unified reset header wins over retry-after, and every live encoding is accepted", () => {

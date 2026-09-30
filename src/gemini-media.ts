@@ -1,13 +1,57 @@
-// Public Gemini media generation. This is deliberately separate from the AGY provider:
-// AGY's OAuth scope/catalog currently exposes image generation only, while a Gemini API
-// key exposes Veo (video), Lyria (music), TTS, and image models.
+// Public Gemini media generation, and the one place a Gemini API KEY is resolved.
+//
+// This is deliberately separate from the AGY provider: AGY's OAuth scope/catalog currently
+// exposes image generation only, while a Gemini API key exposes Veo (video), Lyria (music),
+// TTS, and image models. The key resolution below is shared with providers-gemini.ts (the
+// API-key chat provider), because a second copy would be a second answer to "which key is
+// this machine using" the day the search order changes.
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { HOME } from "./platform.ts";
 import type { CallOpts, Turn } from "./providers.ts";
 
 const BASE = () => process.env.APIPLAN_GEMINI_API_BASE ?? "https://generativelanguage.googleapis.com";
 const KEY_FILE = () => process.env.APIPLAN_GEMINI_API_KEY_FILE ?? join(HOME, ".config", "gemini", "api_key");
+/** Where a key would be read from, for a fix-it line that names the actual path. */
+export const geminiApiKeyFile = KEY_FILE;
+
+/**
+ * WHERE the key comes from, and a stable handle for it — WITHOUT the key.
+ *
+ * A provider has to answer three questions no caller may see a secret to answer: is there a
+ * credential at all (`apiplan status`), is the file safe (a key world-readable is a real
+ * finding), and is the credential the SAME one as a moment ago (`credFp`, whose value is
+ * written to the capacity ledger on disk and read by every /health). So the fingerprint is
+ * a truncated sha256 — enough to tell two keys apart and to notice a rotation, and not
+ * enough to be a key. Twelve hex chars is the same width providers.ts's own `h12` uses for
+ * OAuth tokens, so the two read alike in a status line.
+ *
+ * Never throws: a probe runs on a machine with no key at all, and that is an answer rather
+ * than an error.
+ */
+export type GeminiKeySource =
+  | { kind: "absent"; file: string }
+  | { kind: "env"; name: string; fingerprint: string; file: string }
+  | { kind: "file"; file: string; fingerprint: string };
+export function geminiApiKeySource(): GeminiKeySource {
+  const file = KEY_FILE();
+  for (const name of ["APIPLAN_GEMINI_API_KEY", "GEMINI_API_KEY"]) {
+    const v = process.env[name]?.trim();
+    if (v) return { kind: "env", name, fingerprint: fingerprint(v), file };
+  }
+  if (existsSync(file)) {
+    // An unreadable file is reported as absent on purpose: this returns a fact about
+    // whether a key is USABLE, and one that cannot be read is not. The read below throws
+    // for a caller that genuinely needs the key, with the fix-it line attached.
+    try {
+      const key = readFileSync(file, "utf8").trim();
+      if (key) return { kind: "file", file, fingerprint: fingerprint(key) };
+    } catch {}
+  }
+  return { kind: "absent", file };
+}
+const fingerprint = (key: string) => createHash("sha256").update(key).digest("hex").slice(0, 12);
 
 export function geminiApiKey(): string {
   const direct = process.env.APIPLAN_GEMINI_API_KEY ?? process.env.GEMINI_API_KEY;
@@ -17,7 +61,7 @@ export function geminiApiKey(): string {
     const key = readFileSync(file, "utf8").trim();
     if (key) return key;
   }
-  throw new Error(`Gemini media generation needs an API key — set APIPLAN_GEMINI_API_KEY or write it to ${file}`);
+  throw new Error(`Gemini needs an API key — set APIPLAN_GEMINI_API_KEY or write it to ${file}`);
 }
 
 const headers = (key: string) => ({ "content-type": "application/json", "x-goog-api-key": key });

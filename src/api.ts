@@ -6,11 +6,17 @@
 // get is decided by the path you call, which MODEL answers is decided by the `model`
 // field. So `/v1/chat/completions` with `model: "opus"` gives you Claude in OpenAI's
 // shape — which is the whole point, since most tooling only speaks one dialect.
-import { PROVIDERS, providerFor, speakRealtime, flatText, rememberToolSig, providerRuntime, warmCreds, type CredFp, type Creds, type Delta, type ImageRef, type Turn, type ToolUse, type ToolResult, type ToolDef, type ToolChoice, type CallOpts } from "./providers.ts";
-import { models, resolve, aliasesFor, type Model } from "./registry.ts";
+import { PROVIDERS, providerFor, speakRealtime, flatText, rememberToolSig, providerRuntime, warmCreds, type Built, type CredFp, type Creds, type Delta, type ImageRef, type Turn, type ToolUse, type ToolResult, type ToolDef, type ToolChoice, type CallOpts } from "./providers.ts";
+import { openProviderRequest } from "./provider-transport.ts";
+import { models, resolve, aliasesFor, type Model, type ProviderId } from "./registry.ts";
 import { refreshOllama } from "./providers-ollama.ts";
 import { framePayload, deltasOf, watchTerminal, UPSTREAM_TRUNCATED } from "./stream-shape.ts";
 import { STATE_DIR, readJson, writeJson } from "./platform.ts";
+import { recordCapacity } from "./capacity-events.ts";
+import { capacityRecordFromResponse, isRealAccountIdent } from "./capacity-signal.ts";
+import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinking,
+         reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
+import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -383,7 +389,11 @@ const rid = (p: string) => `${p}-${crypto.randomUUID().replace(/-/g, "").slice(0
 
 /** One call, normalised to our own Delta events. The CLI's consume() can't be reused: it
  *  writes to stdout and calls die(), which would take the server down with it. */
-async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal): AsyncGenerator<Delta> {
+/** A Delta plus the one thing openai.delta() (providers.ts) cannot surface: the raw Responses
+ *  reasoning item, carried so the Anthropic front can mint a replayable thinking block (A4). */
+type DeltaX = Delta & { reasoningItem?: ReasoningItem & { model: string } };
+
+async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal): AsyncGenerator<DeltaX> {
   const p = providerFor(m);
   // An expired subscription token is an AUTHENTICATION fault, not a server fault. creds()
   // throws a plain Error, which used to land in the 500 bucket below — and Anthropic-shaped
@@ -418,29 +428,105 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
       throw new HttpError(401, e2?.message ?? "no usable provider credential");
     }
   }
-  const { url, headers, body } = p.build(m, turns, o, c);
+  // Bind the observation to the credential in hand, before an in-flight call can see a swap.
+  //
+  // `credFp()` reports an unreadable or missing well as a PLACEHOLDER string in this same field
+  // ("absent", "unusable:<state>") rather than as undefined, so it is filtered here: a placeholder
+  // would collapse different accounts (and no account) onto one capacity line, which is precisely the
+  // exhausted->open edge that fabricates a window-reset. No identity means NO capacity observation.
+  let capacityAccount: string | undefined;
+  try {
+    const ident = p.credFp?.().ident;
+    capacityAccount = isRealAccountIdent(ident) ? ident : undefined;
+  } catch {}
+  let built: Built;
+  try { built = p.build(m, turns, o, c); }
+  catch (error: any) {
+    if (Number.isInteger(error?.status)) throw new HttpError(error.status, error?.message ?? String(error), error?.code);
+    throw error;
+  }
+  // A4: ask for the encrypted reasoning item on the Codex backend only (grok/zen also speak
+  // Responses; nobody has proven replay there).
+  const rsReplay = m.provider === "openai" && reasoningReplayOn();
+  if (rsReplay) withReasoningInclude(built.body);
   // Always stream upstream, exactly as callDirect does — build() leaves `stream` to the
   // caller, and Anthropic answers a plain JSON body without it, which the SSE reader
   // below would then read as zero events (an empty, silent reply).
   // `signal`: when the client hangs up (ESC in Claude Code, a cancelled tool call) the
   // upstream generation must die with it, or it runs to completion and bills the
   // subscription for an answer nobody will ever read.
-  const res = await fetch(url, {
-    method: "POST", headers,
-    body: JSON.stringify(p.wantsStreamFlag === false ? body : { ...body, stream: true }),
-    ...(signal ? { signal } : {}),
-  });
+  let responseHeaders: Headers | undefined;
+  let responseAt: number | undefined;
+  try {
+  const res = await openProviderRequest(p, built, signal);
+  responseHeaders = res.headers;
+  responseAt = Date.now();
   if (!res.ok || !res.body) {
-    let detail = (await res.text()).slice(0, 500);
-    try { const j = JSON.parse(detail); detail = j?.error?.message || j?.detail || detail; } catch {}
+    const raw = (await res.text()).slice(0, 500);
+    let detail = raw;
+    let errorType: string | undefined;
+    let errBody: any;
+    try {
+      const j = JSON.parse(detail);
+      errBody = j;
+      // The Responses API names a fault in `type` OR `code`; on the Codex backend the precise
+      // one (usage_limit_reached, invalid_encrypted_content, …) is often the code. Aliased to
+      // the Anthropic vocabulary a client's retry policy reads; the vendor's word stays in
+      // the message.
+      const rawType = m.provider === "openai" && typeof j?.error?.code === "string" ? j.error.code
+        : typeof j?.error?.type === "string" ? j.error.type : undefined;
+      errorType = m.provider === "openai" ? responsesFaultAlias(rawType) : rawType;
+      detail = j?.error?.message || j?.detail || detail;
+      if (rawType && errorType !== rawType && typeof detail === "string" && !detail.includes(rawType)) detail = `${detail} [${rawType}]`;
+    } catch {}
+    if (m.provider === "openai") { const hh = codexCapacityHeaders(res.headers, errBody); if (hh) responseHeaders = hh; }
+    // ── THE PROVIDER'S OWN FIX-IT LINE, WHEN IT HAS ONE ──
+    // A vendor's error text says what it refused; only the adapter knows what a caller
+    // should DO about it, and the two are routinely different. Google answers 403
+    // SUBSCRIPTION_REQUIRED when the CLIENT IDENTITY is wrong rather than the login, so the
+    // generic reading sends a user to re-authenticate a perfectly healthy account — the one
+    // outcome that provider's explain() was written to prevent. Every implementation of it
+    // was unreachable before this call: four providers published careful guidance that
+    // nothing ever read.
+    //
+    // THE VENDOR'S OWN WORDS ARE KEPT BESIDE THE DIAGNOSIS, not replaced by it. The
+    // fix-it line is an INTERPRETATION of an upstream refusal, and an interpretation that
+    // erases its own evidence cannot be checked — if the adapter's reading is wrong, the
+    // one person who could notice is the human staring at the message. (x_apiplan_failure
+    // carries provider/status/scope metadata, never the body, so it is not that record.)
+    //
+    // Status and errorType are untouched: a fix-it line changes what a human reads, and
+    // must never change what a client's retry logic branches on. A throwing or absent
+    // explain() leaves the vendor's text exactly as it was.
+    try {
+      const said = p.explain?.(res.status, raw);
+      if (typeof said === "string" && said) detail = detail && detail !== said ? `${said} (upstream said: ${detail})` : said;
+    } catch {}
     // Only an AUTH rejection condemns the credential. A 429 is a busy account, a 400 is our
     // own request — neither means "log in again", and marking them degraded would make
     // /health cry wolf on the one signal a watchdog is meant to trust.
     if (res.status === 401 || res.status === 403) noteCall(m.provider, false, `HTTP ${res.status}: ${detail.slice(0, 160)}`);
-    throw new HttpError(res.status, detail);
+    // Other refusals say nothing about capacity; in particular, auth/5xx must not reopen it.
+    if (capacityAccount && (res.status === 429 || res.status === 402 || errorType === "rate_limit_error" || errorType === "billing_error")) {
+      try { recordCapacity({ provider: m.provider, account: capacityAccount, model: m.id, at: Date.now(), status: res.status, headers: responseHeaders ?? res.headers, errorType, scope: "unknown" }); } catch {}
+    }
+    // ── LET THE PROVIDER DROP LOCAL STATE THIS REFUSAL JUST INVALIDATED ──
+    // Side effect only, and the fault below is still reported exactly as it stands. A stale
+    // handle poisons every LATER request, not only the one that hit it: an evicted Google
+    // CachedContent is refused 403 and a provider still holding that dead name keeps
+    // referencing a corpse on every subsequent turn with the same prefix. Nothing in
+    // build() or delta() can see a status, so this is the only place the repair can happen.
+    // No retry — the caller gets one honest refusal, and the repair shows up as the next
+    // request working. Given the RAW body, since an implementation matching outside
+    // `error.message` would otherwise never fire. A throwing recover() changes nothing.
+    try { p.recover?.(res.status, raw, m); } catch {}
+    throw new HttpError(res.status, detail, errorType);
   }
   // The vendor accepted the credential and opened a stream: that is proof, and it is free.
   noteCall(m.provider, true, `accepted ${new Date().toISOString().slice(11, 19)}`);
+  if (capacityAccount) {
+    try { recordCapacity({ provider: m.provider, account: capacityAccount, model: m.id, at: Date.now(), status: res.status, headers: res.headers, scope: "unknown" }); } catch {}
+  }
   // ── max_tokens, enforced HERE because one backend cannot enforce it at all ──
   // APIPLAN_MAXTOK_ENFORCE. Anthropic's contract makes max_tokens a hard ceiling and
   // reports stop_reason "max_tokens" when it bites. The codex subscription backend
@@ -490,6 +576,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
       let ev: any;
       try { ev = JSON.parse(payload); } catch { continue }
       term.see(ev);
+      if (rsReplay) { const ri = reasoningItemOf(ev); if (ri) yield { reasoningItem: { ...ri, model: m.id } }; }
       for (const d of deltasOf(p, ev)) {
         // The vendor's own label rides along: `overloaded_error` must not reach a client
         // as `api_error`, or a loop that retries on overload and stops on api_error makes
@@ -498,7 +585,8 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
           // An auth fault can also arrive INSIDE an accepted stream (a token revoked between
           // the handshake and the answer) — that condemns the credential just the same.
           if (d.errorType === "authentication_error" || d.errorType === "permission_error") noteCall(m.provider, false, `mid-stream ${d.errorType}: ${d.error.slice(0, 160)}`);
-          throw new HttpError(STATUS_FOR_TYPE[d.errorType ?? ""] ?? 502, d.error, d.errorType);
+          const et = m.provider === "openai" ? responsesFaultAlias(d.errorType) : d.errorType;
+          throw new HttpError(STATUS_FOR_TYPE[et ?? ""] ?? 502, et !== d.errorType && d.errorType && !d.error.includes(d.errorType) ? `${d.error} [${d.errorType}]` : d.error, et);
         }
         if (d.toolStart) toolsOpen++;
         if (d.toolStop || d.toolCallDone) toolsOpen = Math.max(0, toolsOpen - 1);
@@ -528,9 +616,42 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
       UPSTREAM_TRUNCATED);
   }
   clearTruncations(m.provider);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    const failure = error instanceof HttpError ? error : new HttpError(502, error instanceof Error ? error.message : String(error));
+    const record = capacityRecordFromResponse({ provider: m.provider, account: capacityAccount, model: m.id,
+      at: responseAt ?? Date.now(), status: failure.status, errorType: failure.upstreamType, headers: responseHeaders, scope: "unknown" });
+    failure.requestFailure = { v: 1, provider: record.provider, accountFingerprint: record.account, model: m.id,
+      scope: record.scope, observedAt: record.observedAt, status: failure.status, errorType: failure.upstreamType,
+      resetAt: failure.status === 402 || failure.upstreamType === "billing_error" ? undefined : record.resetsAt };
+    throw failure;
+  }
 }
 
+// ─────────── A4 fallback: a refused replay is retried ONCE without it ───────────
+// Live 2026-09-29: a corrupted/foreign `encrypted_content` is refused 400
+// `invalid_encrypted_content` BEFORE any byte streams, so one retry with the minted
+// reasoning stripped is safe (the thinking-less turn takes the legacy toResponsesItems path).
+const REPLAY_REFUSED = /invalid_encrypted_content|encrypted content .*could not be (verified|decrypted)/i;
+const hasReplay = (turns: Turn[]) => turns.some((t) => t.nativeAnthropicContent?.some(isApiplanThinking));
+const stripReplay = (turns: Turn[]) => turns.map((t) => t.nativeAnthropicContent?.some(isApiplanThinking)
+  ? { ...t, nativeAnthropicContent: t.nativeAnthropicContent.filter((b) => !isApiplanThinking(b)) } : t);
+async function* runSafe(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal): AsyncGenerator<DeltaX> {
+  let yielded = false;
+  try { for await (const d of run(m, turns, o, signal)) { yielded = true; yield d; } }
+  catch (e) {
+    if (yielded || !(e instanceof HttpError) || e.status !== 400 || !REPLAY_REFUSED.test(e.message) || !hasReplay(turns)) throw e;
+    console.error(`[apiplan] ${m.id}: reasoning replay refused upstream (invalid_encrypted_content) — retried once without it`);
+    yield* run(m, stripReplay(turns), o, signal);
+  }
+}
+
+/** Only request-captured, non-secret fields cross the local error wire. */
+type RequestFailure = { v: 1; provider: string; accountFingerprint?: string; model: string;
+  scope: "account" | "model" | "org" | "unknown"; observedAt: number; status: number; errorType?: string; resetAt?: number };
+
 class HttpError extends Error {
+  requestFailure?: RequestFailure;
   /**
    * `upstreamType` is the vendor's OWN name for the fault, carried rather than re-derived:
    * a client that retries on `overloaded_error` but not on `api_error` makes the wrong call
@@ -652,20 +773,31 @@ function parseArgs(v: unknown): any {
   try { const j = JSON.parse(v); return j && typeof j === "object" ? j : {}; } catch { return {} }
 }
 
-/** OpenAI puts system turns in `messages`; we carry them separately, as Anthropic does. */
+/**
+ * OpenAI puts system/developer turns in `messages`. A LEADING one is prompt preamble and is
+ * carried separately, as Anthropic does. A LATER one is a mid-conversation instruction whose
+ * POSITION is part of its meaning, so it stays a turn (flagged `isSystem`) instead of being
+ * appended to the system prompt — appending mutates the cached prefix on every turn.
+ */
 function fromOpenAI(body: any): { turns: Turn[]; system?: string } {
   const turns: Turn[] = [];
   let system = "";
   for (const msg of Array.isArray(body?.messages) ? body.messages : []) {
     if (msg?.role === "system" || msg?.role === "developer") {
+      if (turns.length) { turns.push({ ...partsToTurn("user", msg.content), isSystem: true }); continue; }
       const t = typeof msg.content === "string" ? msg.content : partsToTurn("user", msg.content).text;
       system += (system ? "\n\n" : "") + t;
     } else if (msg?.role === "tool" || msg?.role === "function") {
       // OpenAI carries a tool result as its own message; Anthropic as a block on the next
       // user turn. Fold it onto a user turn so neither dialect loses it.
-      const r: ToolResult = { toolUseId: String(msg.tool_call_id ?? msg.id ?? ""), content: typeof msg.content === "string" ? msg.content : flatText(msg.content) };
+      // An image part is KEPT (toolOutputOf in responses-wire.ts sends it as input_image);
+      // anything else flattens exactly as before.
+      const keep = Array.isArray(msg.content) && msg.content.some((q: any) => q?.type === "image_url" || q?.type === "image");
+      const r: ToolResult = { toolUseId: String(msg.tool_call_id ?? msg.id ?? ""), content: keep ? msg.content : typeof msg.content === "string" ? msg.content : flatText(msg.content) };
       const last = turns.at(-1);
-      if (last?.role === "user") (last.toolResults ??= []).push(r);
+      // Never onto an `isSystem` turn: that turn's wire role is not `user`, and a
+      // tool_result must ride the user turn that answers the call.
+      if (last?.role === "user" && !last.isSystem) (last.toolResults ??= []).push(r);
       else turns.push({ role: "user", text: "", toolResults: [r] });
     } else if (msg?.role === "user" || msg?.role === "assistant") {
       const t = partsToTurn(msg.role, msg.content);
@@ -679,34 +811,71 @@ function fromOpenAI(body: any): { turns: Turn[]; system?: string } {
   return { turns, ...(system ? { system } : {}) };
 }
 
-export function fromAnthropic(body: any): { turns: Turn[]; system?: string; systemBlocks?: any[] } {
+export function fromAnthropic(body: any, target?: ProviderId): { turns: Turn[]; system?: string; systemBlocks?: any[] } {
   const turns: Turn[] = [];
   // Claude Code pointed straight at this server emits role:"system" entries BETWEEN turns
-  // (its system-reminders). The Messages API has no such role, so they are hoisted onto
-  // the system prompt rather than dropped — dropping them loses live instructions.
+  // (its system-reminders). Only a LEADING one is prompt preamble: it is hoisted onto the
+  // system prompt as before. A later one stays IN POSITION as an `isSystem` turn, because
+  // (a) its position is part of its meaning — a reminder attached to turn 12 is not an
+  // instruction that was there from the start — and (b) hoisting rewrites the stable cached
+  // system prefix on every single turn, which is cache-hostile. The Anthropic provider
+  // decides per model whether the wire role may actually be `system`.
+  // The ONE recognized marker: Claude Code's request-bound billing attestation. Its `cch`
+  // hashes the ORIGINAL request body, so it differs on EVERY turn — and forwarding it after
+  // this proxy has rebuilt the body rewrites the HEAD of the cached prefix each time, which
+  // is what pinned a live Astra session's cache read to a small constant while its input
+  // grew past 600k. Only this exact line is ever removed; every other character the caller
+  // sent survives, including a leading user instruction that merely mentions the header.
+  const ATTESTATION = "x-anthropic-billing-header:";
+  /** The text of a `system` block, when it has one. Three call sites below must agree on
+   *  what counts as block text, and none of them may assume the caller sent an object. */
+  const blockText = (b: unknown): string | undefined =>
+    b && typeof b === "object" && "text" in b && typeof b.text === "string" ? b.text : undefined;
+  /** Drop only whole LINES that ARE the attestation, keeping every other line verbatim.
+   *  A block-level test cannot reach those: a string `system`, and a leading role:"system"
+   *  message, carry the attestation as ONE line among real instructions. */
+  const stripAttestationLines = (t: string) =>
+    t.includes(ATTESTATION)
+      ? t.split("\n").filter((l) => !l.trimStart().startsWith(ATTESTATION)).join("\n").trim()
+      : t;
   let inline = "";
   for (const msg of Array.isArray(body?.messages) ? body.messages : []) {
     if (msg?.role === "system" || msg?.role === "developer") {
-      const t = typeof msg.content === "string" ? msg.content : partsToTurn("user", msg.content).text;
+      // A positional reminder keeps its place, but the attestation riding on it would still
+      // move a transcript item that every later turn replays, so it is cleaned here too.
+      const turn = partsToTurn("user", msg.content);
+      if (turns.length) { turns.push({ ...turn, text: stripAttestationLines(turn.text), isSystem: true }); continue; }
+      const t = stripAttestationLines(turn.text);
       if (t) inline += (inline ? "\n\n" : "") + t;
-    } else if (msg?.role === "user" || msg?.role === "assistant") turns.push(partsToTurn(msg.role, msg.content));
+    } else if (msg?.role === "user" || msg?.role === "assistant") {
+      const t = partsToTurn(msg.role, msg.content);
+      // A thinking block this gateway minted (A4) or an unsigned one is only expressible on
+      // the Codex backend; the Anthropic adapter forwards native blocks verbatim and would be
+      // refused 400. Anthropic's own signed blocks are untouched. No target = strip (safe).
+      if (target !== "openai" && t.nativeAnthropicContent?.some(isForeignThinking)) {
+        t.nativeAnthropicContent = t.nativeAnthropicContent.filter((b) => !isForeignThinking(b));
+      }
+      turns.push(t);
+    }
   }
   if (!turns.length) throw new HttpError(400, "`messages` must contain at least one message");
   const sys = body?.system;
-  let system = typeof sys === "string" ? sys
-    : Array.isArray(sys) ? sys.filter((b: any) => !isAttestation(b)).map((s: any) => s?.text ?? "").filter(Boolean).join("\n\n")
-    : undefined;
+  // The joined string and the block list must agree: the request-bound billing attestation
+  // (see below) is dropped from BOTH, or the OpenAI build (which consumes the string) and the
+  // derived cache key would still churn every turn while the Anthropic build stayed stable.
+  let system = typeof sys === "string" ? stripAttestationLines(sys)
+    : Array.isArray(sys)
+      ? sys.map(blockText).filter((t): t is string => !!t && !t.startsWith(ATTESTATION)).join("\n\n")
+      : undefined;
   if (inline) system = system ? `${system}\n\n${inline}` : inline;
   // Preserve native blocks and cache controls, except Claude Code's request-bound billing
   // attestation. Its cch hashes the ORIGINAL request body; forwarding it after this proxy
   // rebuilds the body makes the stable system prefix change every turn. Remove it only at
   // this Anthropic-in adapter boundary. Direct provider callers remain lossless.
-  const blocks: any[] = Array.isArray(sys) ? sys.filter((b: any) => b && typeof b === "object" && !isAttestation(b)) : [];
+  const blocks: unknown[] = Array.isArray(sys)
+    ? sys.filter((b: unknown) => b && typeof b === "object" && !blockText(b)?.startsWith(ATTESTATION))
+    : [];
   if (inline) blocks.push({ type: "text", text: inline });
-  // The joined string and the block list must agree: the request-bound billing attestation
-  // (see below) is dropped from BOTH, or the OpenAI build (which consumes the string) and the
-  // derived cache key would still churn every turn while the Anthropic build stayed stable.
-  const isAttestation = (b: any) => typeof b?.text === "string" && b.text.startsWith("x-anthropic-billing-header:");
   return { turns, ...(system ? { system } : {}), ...(blocks.length ? { systemBlocks: blocks } : {}) };
 }
 
@@ -732,6 +901,12 @@ export function optsFrom(body: any, system?: string): CallOpts {
   // OM's OpenAI-compatible transport emits the normalized cache key directly.
   // Retain it unchanged so APIPlan's Codex Responses request can route and cache on it.
   if (typeof body?.prompt_cache_key === "string" && body.prompt_cache_key) o.promptCacheKey = body.prompt_cache_key;
+  // Responses speed/vision knobs (2026-09-29): `service_tier` ("priority" = Codex Fast, 2.2x
+  // faster on gpt-6-luna live) and an `image_detail` for every image, top-level or in
+  // metadata (the Anthropic shape has no field for it). Unset keeps the backend default.
+  if (typeof body?.service_tier === "string" && body.service_tier) o.serviceTier = body.service_tier;
+  const imageDetail = body?.image_detail ?? body?.metadata?.image_detail;
+  if (typeof imageDetail === "string" && imageDetail) o.imageDetail = imageDetail;
   // Anthropic-compatible OM requests carry stable provider affinity in
   // metadata.user_id. Retain the caller's exact value: Anthropic cache reuse works for
   // both OM's JSON envelope and opaque ids, while rewriting metadata here would change
@@ -761,6 +936,25 @@ export function optsFrom(body: any, system?: string): CallOpts {
   if (typeof body?.temperature === "number") o.temperature = body.temperature;
   if (body?.thinking?.type === "disabled") o.thinkOff = true;
   return o;
+}
+
+/** GPT-6 lists none|low|medium|high|xhigh|max (model pages + live 2026-09-29); the backend
+ *  400s anything else ('minimal' → unsupported_value). OM's ladder includes 'minimal', and
+ *  OM's thinking-off must actually mean off. Scope: provider openai ONLY — every other
+ *  backend keeps its own, already-tested effort handling untouched. */
+export function clampEffort(m: Model, o: CallOpts): void {
+  if (m.provider !== "openai") return;
+  const ladder = providerFor(m).efforts(m);                 // registry list, e.g. low..max
+  // The model's OWN ladder decides, never the family name: gpt-6-sol/luna list `none`
+  // (registry WIRE_EFFORTS, live-proven), gpt-6-astra refuses it live 2026-09-29.
+  const offLevel = ladder.includes("none") ? "none" : ladder[0];
+  if (o.thinkOff) { if (offLevel) o.effort = offLevel; return; }
+  if (!o.effort || !ladder.length || ladder.includes(o.effort)) return;
+  // 'minimal' means "least thinking", not "no thinking": the lowest level above `none`.
+  if (o.effort === "minimal") o.effort = ladder.find((e) => e !== "none") ?? ladder[0];
+  else if (o.effort === "none") o.effort = ladder[0];
+  else if (o.effort === "ultra" || o.effort === "max") o.effort = ladder.at(-1);
+  else delete o.effort;                                     // unknown word → backend default, never a 400
 }
 
 // ─────────────────────────── tools the caller offered ───────────────────────────
@@ -878,28 +1072,235 @@ function estimateTokens(turns: Turn[], system?: string): number {
 }
 const estimateOut = (text: string) => (text ? Math.max(1, Math.ceil(text.length / 4)) : 0);
 
-/** What upstream actually told us during one call. Undefined = it told us nothing. */
-type Tally = { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; stopReason?: string };
+/**
+ * What upstream actually told us during one call. Undefined = it told us nothing.
+ *
+ * These numbers are on the BACKEND'S OWN basis, whatever that happens to be — this type is
+ * filled straight from provider Deltas, which are deliberately left alone (every provider
+ * still reports in its own vendor's convention, and nothing here changes that). Putting
+ * them on one comparable footing is normalizeTally()'s job, and only ITS result carries a
+ * stated basis; see normalizeTally() and each Provider's own `usageBasis`.
+ *
+ * THREE BUCKETS, AND SUB-DIVISIONS THAT RIDE ALONG UNTOUCHED. input/cacheRead/cacheWrite
+ * are the buckets normalizeTally() re-partitions. The rest describe a bucket already
+ * counted — how cacheWrite splits across cache lifetimes, which share of output was
+ * reasoning — and are therefore INVARIANT under that re-partition: they are never
+ * subtracted, never added to a total, and never reach the arithmetic. See Delta["usage"]
+ * in providers.ts for each field's contract, and normalizeTally() for why keeping them out
+ * of the arithmetic is what makes the partition provably exact.
+ */
+type Tally = {
+  input?: number; output?: number; cacheRead?: number; cacheWrite?: number; stopReason?: string;
+  cacheWriteTtl?: { m5?: number; h1?: number };
+  reasoning?: number;
+  serverTools?: { webSearch?: number; webFetch?: number };
+};
 function tally(t: Tally, d: Delta) {
   if (d.usage?.input !== undefined) t.input = d.usage.input;
   if (d.usage?.output !== undefined) t.output = d.usage.output;
   if (d.usage?.cacheRead !== undefined) t.cacheRead = d.usage.cacheRead;
   if (d.usage?.cacheWrite !== undefined) t.cacheWrite = d.usage.cacheWrite;
+  // A later snapshot of the same turn REPLACES an earlier one, exactly as the buckets do:
+  // Anthropic reports usage twice (message_start, then a corrected message_delta) and the
+  // correction is the truth. An absent sub-division on the correction leaves the earlier
+  // one standing rather than clearing it — the provider adapter only emits a breakdown the
+  // vendor actually stated, so absence here means "this snapshot said nothing about it".
+  if (d.usage?.cacheWriteTtl !== undefined) t.cacheWriteTtl = d.usage.cacheWriteTtl;
+  if (d.usage?.reasoning !== undefined) t.reasoning = d.usage.reasoning;
+  if (d.usage?.serverTools !== undefined) t.serverTools = d.usage.serverTools;
   if (d.stopReason) t.stopReason = d.stopReason;
 }
-/** Provider cache counters translated into each caller dialect's own spelling. Preserve
- *  explicit zeroes: zero is measured evidence of a miss; absence means unavailable. */
-const cacheUsageAnthropic = (t: Tally) => ({
-  ...(t.cacheWrite !== undefined ? { cache_creation_input_tokens: t.cacheWrite } : {}),
-  ...(t.cacheRead !== undefined ? { cache_read_input_tokens: t.cacheRead } : {}),
-});
-const cacheUsageOpenAI = (t: Tally) => ({
-  ...(t.cacheRead !== undefined || t.cacheWrite !== undefined ? {
-    prompt_tokens_details: {
-      ...(t.cacheRead !== undefined ? { cached_tokens: t.cacheRead } : {}),
-      ...(t.cacheWrite !== undefined ? { cache_write_tokens: t.cacheWrite } : {}),
+
+/**
+ * ── THE TWO VENDORS MEAN DIFFERENT THINGS BY "INPUT TOKENS" ──
+ *
+ * This server's whole point is that the endpoint dialect and the backend are independent,
+ * so a prompt-cache counter routinely crosses from one vendor's accounting convention into
+ * the other's — and the two conventions are opposites. Read from each vendor's own
+ * documentation rather than assumed:
+ *
+ *   EXCLUSIVE (anthropic)  `input_tokens` counts only what was NOT read from or written to
+ *                          the cache. The docs state the identity outright:
+ *                          total = cache_read + cache_creation + input_tokens.
+ *   INCLUSIVE (openai)     `input_tokens` is the WHOLE prompt; the cached part is a
+ *                          breakdown OF it. The prompt-caching guide's own cost sample
+ *                          computes ordinary = input - cached_tokens - cache_write_tokens.
+ *   INCLUSIVE (google)     `promptTokenCount` is "still the total effective prompt size
+ *                          meaning this includes the number of tokens in the cached
+ *                          content" (UsageMetadata reference).
+ *
+ * Copying either one straight through the other's field name is a real accounting fault in
+ * both directions, and both were live here:
+ *   · Codex behind /v1/messages published an inclusive input as Anthropic `input_tokens`
+ *     while ALSO publishing cache_read_input_tokens, so every consumer applying Anthropic's
+ *     documented sum counted the cached prefix TWICE and the turn read bigger than it was.
+ *   · Claude behind /v1/chat/completions published an exclusive input as `prompt_tokens`
+ *     with cached_tokens beside it, so a consumer applying OpenAI's documented subtraction
+ *     went NEGATIVE on the ordinary part and under-counted the prompt by the whole cache.
+ * A cost model reading either number is wrong by the size of the cached prefix, which on a
+ * cache-heavy agent turn is most of the prompt.
+ *
+ * The fix is ONE conversion at the dialect boundary rather than an adjustment at each of the
+ * four emission sites: the backend's counters are restated once (normalizeTally), and each
+ * dialect renders that restatement in its OWN convention on the way out. Physical token
+ * counts are only ever re-PARTITIONED between the three buckets — never scaled, discounted,
+ * dropped, or turned into money. What a token costs stays the reader's business.
+ *
+ * WHERE THE BASIS LIVES. Each vendor's basis is declared on its own Provider (see
+ * `usageBasis` in providers.ts), beside the adapter that reads that vendor's wire and quotes
+ * the documentation sentence it came from — not in a table here. A table in this file is one
+ * place a new provider can be forgotten while everything still compiles and runs, silently
+ * defaulting to a basis nobody chose; a REQUIRED field on the interface cannot be, and the
+ * provider-cache contract suite asserts every entry declares one.
+ */
+
+/**
+ * One backend's counters restated so the three buckets are DISJOINT — input holding only
+ * what was neither read from nor written to the cache, so input + cacheRead + cacheWrite
+ * covers the whole prompt exactly once.
+ *
+ * `basis` says how far that restatement actually got, because sometimes it cannot get all
+ * the way and pretending otherwise is how a false number is born:
+ *   exclusive            the partition is exact; both dialects render losslessly.
+ *   unavailable          the backend did not report enough to derive it. Nothing is
+ *                        invented; the raw counters are published and this marker rides
+ *                        along.
+ *   source-inconsistent  the backend's own counters contradict each other, so the cache
+ *                        counters are not publishable at all — see usageOpenAI/Anthropic.
+ */
+type Norm = Tally & { basis: "exclusive" | "unavailable" | "source-inconsistent" };
+
+/**
+ * Restate one backend's counters, or say honestly that they cannot be restated.
+ *
+ * UNKNOWN STAYS UNKNOWN. An absent counter is never invented. In particular an INCLUSIVE
+ * backend that reports an input total and NO cache fields at all cannot be converted: the
+ * absence is that backend declining to say what share was cached, not evidence that none of
+ * it was, and subtracting an assumed zero would publish a derived-looking number nothing
+ * supports. That reads `unavailable` — the total is still true and still published, and no
+ * cache counter is conjured to sit beside it.
+ *
+ * AN EXPLICIT ZERO IS EVIDENCE, and a different thing entirely: it means measured, and it
+ * was a miss — exactly what a cache-effectiveness reader needs to tell apart from "cannot
+ * say". Explicit zeroes therefore convert normally and survive into the reply.
+ *
+ * AN UNMEASURED INPUT CANNOT BE PARTITIONED. When upstream reported cache counters but no
+ * input at all, the input published downstream is this file's ESTIMATE, which models the
+ * whole prompt; treating it as the uncached remainder would count the cached prefix twice
+ * on top of a figure that was never measured. That is `unavailable` too, for every backend.
+ *
+ * AN IMPOSSIBLE READING IS REPORTED, NOT REPAIRED. If an inclusive backend says its cached
+ * tokens outnumber the input they are supposed to be part of, subtracting fabricates a
+ * negative and clamping to zero silently destroys real tokens. So the measured input total
+ * is preserved as-is under `source-inconsistent` and the contradictory cache counters are
+ * withheld rather than republished: a count this server cannot reconcile must never be
+ * emitted as though a reader could add it up.
+ */
+function normalizeTally(t: Tally, provider?: ProviderId): Norm {
+  const cacheKnown = t.cacheRead !== undefined || t.cacheWrite !== undefined;
+  // An estimate stands in for the whole prompt, so it can never serve as the uncached share.
+  if (t.input === undefined) return { ...t, basis: cacheKnown ? "unavailable" : "exclusive" };
+  if (!provider || PROVIDERS[provider].usageBasis !== "inclusive") return { ...t, basis: "exclusive" };
+  if (!cacheKnown) return { ...t, basis: "unavailable" };
+  const cached = (t.cacheRead ?? 0) + (t.cacheWrite ?? 0);
+  if (cached > t.input) return { ...t, basis: "source-inconsistent" };
+  return { ...t, input: t.input - cached, basis: "exclusive" };
+}
+
+/**
+ * OpenAI's `prompt_tokens` is inclusive BY DEFINITION, so an exact partition is folded back
+ * into one total — and that is what makes the round trip lossless in both directions: a
+ * consumer applying OpenAI's documented `input - cached - cache_write` recovers exactly the
+ * uncached count this server measured, while one applying Anthropic's documented sum on the
+ * other endpoint arrives at the same prompt total. The cached buckets are published beside
+ * it either way, so the folding loses nothing.
+ *
+ * Whenever the partition is NOT exact — unavailable, source-inconsistent, or an estimated
+ * input — the number is published exactly as it stands. Adding cache counters to a total
+ * that already contains them, or to an estimate of the whole prompt, would inflate the very
+ * figure a cost reader trusts.
+ */
+const promptTokensOpenAI = (n: Norm, input: number, measured: boolean) =>
+  measured && n.basis === "exclusive" ? input + (n.cacheRead ?? 0) + (n.cacheWrite ?? 0) : input;
+/** How honest the published partition is, for a reader that must know. Emitted only when
+ *  something is genuinely off, so an ordinary exact reply stays clean — the same discipline
+ *  USAGE_MARK already follows for estimates. */
+const USAGE_BASIS_MARK = "x_apiplan_usage_basis";
+const basisMark = (n: Norm) => (n.basis === "exclusive" ? {} : { [USAGE_BASIS_MARK]: n.basis });
+/**
+ * Provider cache counters translated into each caller dialect's own spelling. Preserve
+ * explicit zeroes: zero is measured evidence of a miss; absence means unavailable.
+ *
+ * Counters the backend contradicted itself about are WITHHELD (basis source-inconsistent):
+ * on either dialect they would be added to a total that already contains them, and a
+ * knowing double count is worse than a missing breakdown. The marker says why they are gone,
+ * and the input total beside them is still the measured one.
+ *
+ * ── A SUB-DIVISION IS RENDERED ONLY IN A DIALECT THAT REALLY HAS THE FIELD ──
+ *
+ * The backend and the front are independent here, so a counter routinely arrives from a
+ * vendor whose spelling the caller's dialect does not share. There are exactly three
+ * honest endings for such a counter, and inventing a fourth is how a fabricated field
+ * enters a vendor's namespace and gets read as vendor-stated by the next person:
+ *   · the dialect documents the field  → render it in the vendor's own spelling;
+ *   · it does not, but a reader would lose real information
+ *                                      → render it under this server's `x_apiplan_` prefix,
+ *                                        which says plainly who is speaking;
+ *   · it does not, and a consumer of that dialect has no use for it
+ *                                      → drop it, and say so here rather than nowhere.
+ */
+const publishable = (n: Norm) => n.basis !== "source-inconsistent";
+/** This server's own name for a count no dialect field fits — the same discipline as
+ *  USAGE_MARK and USAGE_BASIS_MARK: a prefixed field is honestly ours, not the vendor's. */
+const REASONING_MARK = "x_apiplan_reasoning_tokens";
+const cacheUsageAnthropic = (n: Norm) => (!publishable(n) ? {} : {
+  ...(n.cacheWrite !== undefined ? { cache_creation_input_tokens: n.cacheWrite } : {}),
+  ...(n.cacheRead !== undefined ? { cache_read_input_tokens: n.cacheRead } : {}),
+  // The TTL split of that write, in this vendor's own object — the ONE dialect that has it.
+  // A consumer prices the 1h component at 2x input and the 5m component at 1.25x, and
+  // prices any unattributed remainder at the flat rate, so a partial split degrades safely.
+  // Emitted only when the backend stated it: an all-zero object is read downstream as a
+  // command to CLEAR a split an earlier snapshot of the same turn established.
+  ...(n.cacheWriteTtl && ((n.cacheWriteTtl.m5 ?? 0) > 0 || (n.cacheWriteTtl.h1 ?? 0) > 0) ? {
+    cache_creation: {
+      ...(n.cacheWriteTtl.m5 ? { ephemeral_5m_input_tokens: n.cacheWriteTtl.m5 } : {}),
+      ...(n.cacheWriteTtl.h1 ? { ephemeral_1h_input_tokens: n.cacheWriteTtl.h1 } : {}),
     },
   } : {}),
+  // Per-REQUEST vendor tool invocations, again this dialect's own object. Not tokens, so
+  // they sit beside the buckets and never enter the partition.
+  ...(n.serverTools ? {
+    server_tool_use: {
+      ...(n.serverTools.webSearch !== undefined ? { web_search_requests: n.serverTools.webSearch } : {}),
+      ...(n.serverTools.webFetch !== undefined ? { web_fetch_requests: n.serverTools.webFetch } : {}),
+    },
+  } : {}),
+  // Anthropic's usage object has NO thinking-token counter, so a reasoning share measured on
+  // another backend (Gemini's thoughtsTokenCount, a Responses reasoning_tokens) has no
+  // vendor spelling to arrive in on this front. Dropping it silently would re-create on the
+  // cross-dialect path exactly the loss this whole change removes, so it is published under
+  // this server's own prefix. It remains a share OF output_tokens — never an addition to it.
+  ...(n.reasoning !== undefined ? { [REASONING_MARK]: n.reasoning } : {}),
+});
+const cacheUsageOpenAI = (n: Norm) => (!publishable(n) ? {} : {
+  ...(n.cacheRead !== undefined || n.cacheWrite !== undefined ? {
+    prompt_tokens_details: {
+      ...(n.cacheRead !== undefined ? { cached_tokens: n.cacheRead } : {}),
+      ...(n.cacheWrite !== undefined ? { cache_write_tokens: n.cacheWrite } : {}),
+    },
+  } : {}),
+  // The reasoning share of the completion, in the spelling THIS front's dialect documents.
+  // This endpoint is Chat Completions, whose usage object nests it as
+  // `completion_tokens_details.reasoning_tokens` (the Responses API's
+  // `output_tokens_details` is a different shape and does not appear on a chat.completion),
+  // and it is already inside completion_tokens — a share, never an addend.
+  ...(n.reasoning !== undefined ? { completion_tokens_details: { reasoning_tokens: n.reasoning } } : {}),
+  // NOT rendered here, deliberately: the cache-write TTL split and `server_tool_use`.
+  // `prompt_tokens_details` has a cached/written dimension and no LIFETIME dimension, and
+  // this dialect defines no per-request tool counter at all, so either would be a field
+  // invented inside a vendor's namespace — which a reader would take as vendor-stated. The
+  // information is legitimately unavailable on this front rather than lost by accident:
+  // a consumer that needs the TTL split reads the Anthropic front, which has the real field.
 });
 /** Anthropic's stop vocabulary → OpenAI's finish_reason. */
 const finishFor = (stop?: string) => (stop === "max_tokens" ? "length" : stop === "tool_use" ? "tool_calls" : "stop");
@@ -964,6 +1365,7 @@ function streamFault(dialect: "openai" | "anthropic", e: any): string {
   const status = e instanceof HttpError ? e.status : 502;
   const message = e?.message ?? String(e);
   const upstream = typeof e?.upstreamType === "string" ? e.upstreamType : undefined;
+  const metadata = e instanceof HttpError && e.requestFailure ? { x_apiplan_failure: e.requestFailure } : {};
   if (dialect === "anthropic") {
     const type = upstream && ANTHROPIC_ERROR_TYPES.has(upstream) ? upstream
       : status === 401 ? "authentication_error"
@@ -977,10 +1379,10 @@ function streamFault(dialect: "openai" | "anthropic", e: any): string {
       : status === 429 ? "rate_limit_error"
       : status === 529 ? "overloaded_error"
       : "api_error";
-    return sse({ type: "error", error: { type, message } }, "error")
+    return sse({ type: "error", error: { type, message, ...metadata } }, "error")
          + sse({ type: "message_stop" }, "message_stop");
   }
-  return sse({ error: { message, type: status === 401 ? "authentication_error" : status === TRUNCATED_TERMINAL_STATUS ? "invalid_request_error" : "upstream_error", param: null, code: status === 401 ? "invalid_api_key" : (upstream ?? null) } })
+  return sse({ error: { message, type: status === 401 ? "authentication_error" : status === TRUNCATED_TERMINAL_STATUS ? "invalid_request_error" : "upstream_error", param: null, code: status === 401 ? "invalid_api_key" : (upstream ?? null), ...metadata } })
        + "data: [DONE]\n\n";
 }
 
@@ -1026,24 +1428,50 @@ async function* replay<T>(p: Primed<T>): AsyncGenerator<T> {
   }
 }
 
+/**
+ * How long a streaming response's BODY is still real work.
+ *
+ * `serve()` counts a request from handler entry to handler exit, but a streaming answer is handed
+ * back as a `Response` wrapping a `ReadableStream` whose `start()` keeps pumping the upstream
+ * generator long AFTER the handler's promise resolves. Counting only the handler therefore reports
+ * `activeRequests: 0` during precisely the long-lived case that matters — a client mid-turn — and the
+ * drain gate (`bin/apiplan.ts:683-687`) reads that zero as "nothing in flight" and SIGTERMs the
+ * process. `serve()` installs no signal handler, so that kill is immediate and the turn dies.
+ *
+ * So a streaming response publishes when its body is DONE. Keyed on the `Response` object itself: the
+ * handler's caller looks the promise up by the value it is about to return, which needs no signature
+ * change anywhere and cannot be forgotten by a future streaming route. Weak, so a response nobody
+ * kept is collectable.
+ */
+const BODY_SETTLED = new WeakMap<Response, Promise<void>>();
+
 function streamResponse(dialect: "openai" | "anthropic", gen: () => AsyncGenerator<string>, onCancel?: () => void): Response {
+  let settle!: () => void;
+  // Resolve-only, and resolved exactly once by whichever end arrives first — a completed body, a
+  // client that walked away, or a throw inside start(). A body that can never settle would pin the
+  // drain gate above zero forever, which is the opposite failure and just as bad.
+  const settled = new Promise<void>(resolve => { settle = resolve; });
   const stream = new ReadableStream({
     async start(c) {
       const enc = new TextEncoder();
-      try { for await (const chunk of gen()) c.enqueue(enc.encode(chunk)); }
-      catch (e: any) {
-        // A client that hung up is NOT a fault to report — there is nobody to tell, and
-        // both enqueue() and close() throw on a controller the runtime already tore down.
-        if (e?.name !== "AbortError") {
-          try { c.enqueue(enc.encode(streamFault(dialect, e))); } catch {}
+      try {
+        try { for await (const chunk of gen()) c.enqueue(enc.encode(chunk)); }
+        catch (e: unknown) {
+          // A client that hung up is NOT a fault to report — there is nobody to tell, and
+          // both enqueue() and close() throw on a controller the runtime already tore down.
+          if (!(e instanceof Error) || e.name !== "AbortError") {
+            try { c.enqueue(enc.encode(streamFault(dialect, e))); } catch {}
+          }
         }
-      }
-      try { c.close(); } catch {}
+        try { c.close(); } catch {}
+      } finally { settle(); }
     },
     // Fires when the consumer walks away; the upstream fetch has to walk away too.
-    cancel() { onCancel?.(); },
+    cancel() { settle(); onCancel?.(); },
   });
-  return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+  const response = new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+  BODY_SETTLED.set(response, settled);
+  return response;
 }
 
 async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
@@ -1052,8 +1480,9 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
   const { turns, system } = fromOpenAI(body);
   const o = optsFrom(body, system);
   Object.assign(o, toolsFrom(body, "openai"));
+  if (m) clampEffort(m, o);
   const ac = linkAbort(signal);
-  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : run(m!, turns, o, ac.signal));
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
   const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = rid("chatcmpl"), created = now();
   let auto = 0;
@@ -1068,8 +1497,9 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
       tally(t, d);
       for (const ev of toolEvents(d, mint)) foldCall(byRef, order, ev);
     }
-    const inTok = t.input ?? estimateTokens(turns, system);
-    const outTok = t.output ?? estimateOut(text);
+    const n = normalizeTally(t, m?.provider);
+    const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(turns, system), n.input !== undefined);
+    const outTok = n.output ?? estimateOut(text);
     // OpenAI's shape: content is null when the turn IS the tool call.
     const message: any = { role: "assistant", content: order.length && !text ? null : text };
     if (order.length) {
@@ -1078,8 +1508,9 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
     return json({
       id, object: "chat.completion", created, model: id0,
       choices: [{ index: 0, message, logprobs: null, finish_reason: finishFor(stopWith(t.stopReason, order.length > 0)) }],
-      usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok, ...cacheUsageOpenAI(t) },
-      ...(t.input === undefined || t.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok, ...cacheUsageOpenAI(n) },
+      ...(n.input === undefined || n.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      ...basisMark(n),
     });
   }
   // Commit the head only once the upstream has actually answered — see preflight().
@@ -1108,10 +1539,12 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
     // OpenAI only sends usage on a stream when the caller asked for it; honour that rather
     // than inventing a field a strict client is not expecting.
     if (body?.stream_options?.include_usage) {
-      const inTok = t.input ?? estimateTokens(turns, system);
-      const outTok = t.output ?? estimateOut(text);
-      last.usage = { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok, ...cacheUsageOpenAI(t) };
-      if (t.input === undefined || t.output === undefined) last[USAGE_MARK] = "estimated";
+      const n = normalizeTally(t, m?.provider);
+      const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(turns, system), n.input !== undefined);
+      const outTok = n.output ?? estimateOut(text);
+      last.usage = { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok, ...cacheUsageOpenAI(n) };
+      if (n.input === undefined || n.output === undefined) last[USAGE_MARK] = "estimated";
+      Object.assign(last, basisMark(n));
     }
     yield sse(last);
     yield "data: [DONE]\n\n";
@@ -1121,12 +1554,17 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
 async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Response> {
   const jimmy = isJimmy(body?.model);
   const m = jimmy ? null : pick(body?.model);
-  const { turns, system, systemBlocks } = fromAnthropic(body);
+  const { turns, system, systemBlocks } = fromAnthropic(body, m?.provider);
   const o = optsFrom(body, system);
   if (systemBlocks) o.systemBlocks = systemBlocks;
   Object.assign(o, toolsFrom(body, "anthropic"));
+  if (m) clampEffort(m, o);
+  // A4 + OM's thinking pane: on the Codex backend the reasoning summary and the encrypted
+  // item come back as a signed thinking block (APIPLAN_REASONING_REPLAY=0 turns it all off).
+  const emitThinking = m?.provider === "openai" && reasoningReplayOn();
+  if (emitThinking && process.env.APIPLAN_OPENAI_SUMMARY !== "0" && body?.thinking && body.thinking.type !== "disabled") o.showThinking = true;
   const ac = linkAbort(signal);
-  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : run(m!, turns, o, ac.signal));
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
   const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = rid("msg");
   let auto = 0;
@@ -1136,24 +1574,56 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
     let text = "";
     const t: Tally = {};
     const byRef = new Map<string, Call>(), order: Call[] = [];
-    for await (const d of gen()) {
+    // Blocks IN ORDER (thinking → text → tool_use …), so a replayed turn keeps its shape.
+    // Without emitThinking this is exactly the old [text, ...tool_use] layout.
+    const blocks: any[] = [];
+    let pendingThink: any = null;
+    const seen = new Set<Call>();
+    const syncCalls = () => { for (const c of order) if (!seen.has(c)) { seen.add(c); blocks.push({ __call: c }); } };
+    for await (const d of gen() as AsyncGenerator<DeltaX>) {
       text += d.text ?? "";
       tally(t, d);
+      if (emitThinking && d.reasoning) {
+        if (!pendingThink) { pendingThink = { type: "thinking", thinking: "" }; blocks.push(pendingThink); }
+        pendingThink.thinking += d.reasoning;
+      }
+      if (emitThinking && d.reasoningItem) {
+        const sig = encodeReasoningSig(d.reasoningItem, d.reasoningItem.model);
+        if (pendingThink) pendingThink.signature = sig; else blocks.push({ type: "thinking", thinking: "", signature: sig });
+        pendingThink = null;
+      }
+      if (d.text) {
+        pendingThink = null;
+        const last = blocks.at(-1);
+        if (last?.type === "text") last.text += d.text; else blocks.push({ type: "text", text: d.text });
+      }
       for (const ev of toolEvents(d, mint)) foldCall(byRef, order, ev);
+      if (d.toolStart || d.toolCallDone || d.toolArgs) { pendingThink = null; syncCalls(); }
     }
+    syncCalls();
     const content: any[] = [];
-    if (text) content.push({ type: "text", text });
-    for (const c of order) content.push({ type: "tool_use", id: c.id, name: c.name, input: parseArgs(c.json) });
+    if (emitThinking) {
+      for (const b of blocks) {
+        if (b.__call) content.push({ type: "tool_use", id: b.__call.id, name: b.__call.name, input: parseArgs(b.__call.json) });
+        else if (b.type === "thinking") { if (b.signature) content.push(b); }   // unsigned summary text: nothing to replay, not shown
+        else content.push(b);
+      }
+    } else {
+      if (text) content.push({ type: "text", text });
+      for (const c of order) content.push({ type: "tool_use", id: c.id, name: c.name, input: parseArgs(c.json) });
+    }
     // A reply that carried nothing at all still answers in the old shape.
     if (!content.length) content.push({ type: "text", text });
+    const n = normalizeTally(t, m?.provider);
     return json({
       id, type: "message", role: "assistant", model: id0,
       content,
       // A reply cut off at max_tokens used to be reported as a finished turn, so the client
       // never continued it and the human silently lost the tail.
       stop_reason: stopWith(t.stopReason, order.length > 0), stop_sequence: null,
-      usage: { input_tokens: t.input ?? estimateTokens(turns, system), output_tokens: t.output ?? estimateOut(text), ...cacheUsageAnthropic(t) },
-      ...(t.input === undefined || t.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      usage: { input_tokens: n.input ?? estimateTokens(turns, system), output_tokens: n.output ?? estimateOut(text), ...cacheUsageAnthropic(n) },
+      ...(n.input === undefined || n.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      ...basisMark(n),
     });
   }
   // Commit the head only once the upstream has actually answered — see preflight().
@@ -1172,15 +1642,29 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
     // has exactly ONE block open at a time and no gaps in the indices, so text closes
     // before a call opens and every index is handed out by this one cursor.
     let next = 0, textIdx: number | null = null, sawTool = false;
+    let thinkIdx: number | null = null;
     let text = "";
     const t: Tally = {};
     const byRef = new Map<string, Call>(), order: Call[] = [];
     const idxOf = new Map<string, number>();
-    for await (const d of withPings(replay(primed))) {
-      if (d === PING) { yield sse({ type: "ping" }, "ping"); continue; }
+    for await (const d0 of withPings(replay(primed))) {
+      if (d0 === PING) { yield sse({ type: "ping" }, "ping"); continue; }
+      const d = d0 as DeltaX;
       tally(t, d);
+      // A4: reasoning summary → thinking_delta; the encrypted item → signature_delta, which
+      // closes the block. One block open at a time, indices from the same cursor.
+      if (emitThinking && (d.reasoning || d.reasoningItem)) {
+        if (textIdx !== null) { yield sse({ type: "content_block_stop", index: textIdx }, "content_block_stop"); textIdx = null; }
+        if (thinkIdx === null) { thinkIdx = next++; yield sse({ type: "content_block_start", index: thinkIdx, content_block: { type: "thinking", thinking: "" } }, "content_block_start"); }
+        if (d.reasoning) yield sse({ type: "content_block_delta", index: thinkIdx, delta: { type: "thinking_delta", thinking: d.reasoning } }, "content_block_delta");
+        if (d.reasoningItem) {
+          yield sse({ type: "content_block_delta", index: thinkIdx, delta: { type: "signature_delta", signature: encodeReasoningSig(d.reasoningItem, d.reasoningItem.model) } }, "content_block_delta");
+          yield sse({ type: "content_block_stop", index: thinkIdx }, "content_block_stop"); thinkIdx = null;
+        }
+      }
       if (d.text) {
         text += d.text;
+        if (thinkIdx !== null) { yield sse({ type: "content_block_stop", index: thinkIdx }, "content_block_stop"); thinkIdx = null; }
         if (textIdx === null) {
           textIdx = next++;
           yield sse({ type: "content_block_start", index: textIdx, content_block: { type: "text", text: "" } }, "content_block_start");
@@ -1192,6 +1676,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
         if (r.opened && r.call) {
           // A tool call cannot open inside a text block: close text first.
           if (textIdx !== null) { yield sse({ type: "content_block_stop", index: textIdx }, "content_block_stop"); textIdx = null; }
+          if (thinkIdx !== null) { yield sse({ type: "content_block_stop", index: thinkIdx }, "content_block_stop"); thinkIdx = null; }
           const i = next++; idxOf.set(r.call.ref, i); sawTool = true;
           yield sse({ type: "content_block_start", index: i, content_block: { type: "tool_use", id: r.call.id, name: r.call.name, input: {} } }, "content_block_start");
         }
@@ -1206,17 +1691,20 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
       }
     }
     if (textIdx !== null) yield sse({ type: "content_block_stop", index: textIdx }, "content_block_stop");
+    if (thinkIdx !== null) yield sse({ type: "content_block_stop", index: thinkIdx }, "content_block_stop");
     for (const i of idxOf.values()) yield sse({ type: "content_block_stop", index: i }, "content_block_stop");
     // An empty reply still gets the one empty text block clients saw before this patch.
     if (next === 0) {
       yield sse({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, "content_block_start");
       yield sse({ type: "content_block_stop", index: 0 }, "content_block_stop");
     }
+    const n = normalizeTally(t, m?.provider);
     yield sse({
       type: "message_delta",
       delta: { stop_reason: stopWith(t.stopReason, sawTool), stop_sequence: null },
-      usage: { input_tokens: t.input ?? estIn, output_tokens: t.output ?? estimateOut(text), ...cacheUsageAnthropic(t) },
-      ...(t.input === undefined || t.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      usage: { input_tokens: n.input ?? estIn, output_tokens: n.output ?? estimateOut(text), ...cacheUsageAnthropic(n) },
+      ...(n.input === undefined || n.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+      ...basisMark(n),
     }, "message_delta");
     yield sse({ type: "message_stop" }, "message_stop");
   }, () => ac.abort());
@@ -1404,7 +1892,7 @@ function linkAbort(signal?: AbortSignal): AbortController {
 }
 
 /** Error bodies must match the dialect too, or the SDKs won't parse them. */
-function errorFor(dialect: "openai" | "anthropic", status: number, message: string, upstream?: string): Response {
+function errorFor(dialect: "openai" | "anthropic", status: number, message: string, upstream?: string, requestFailure?: RequestFailure): Response {
   // 401 must be labelled an AUTH failure in both dialects: SDKs retry api_error with
   // backoff (forever, on a dead token) and stop dead on authentication_error. When the
   // vendor named the fault itself, that name outranks anything derived from the status.
@@ -1412,7 +1900,16 @@ function errorFor(dialect: "openai" | "anthropic", status: number, message: stri
   // `x-should-retry: false` is the header both vendors' SDKs honour ahead of their own
   // status rules, so a fault this server has already decided is terminal says so in the
   // place a client looks first — belt to the 424's braces.
-  const extra = status === TRUNCATED_TERMINAL_STATUS ? { "x-should-retry": "false" } : {};
+  const extra: Record<string, string> = status === TRUNCATED_TERMINAL_STATUS ? { "x-should-retry": "false" } : {};
+  if (requestFailure) extra["x-apiplan-failure"] = JSON.stringify(requestFailure);
+  // A capacity refusal with a KNOWN reset (read from the vendor's own headers/body, never
+  // guessed — capacity-signal.ts leaves resetAt undefined otherwise) says so in the header
+  // every SDK reads first. Before this a Codex usage-limit 429 reached OM as a bare
+  // rate_limit_error and its client backed off blind against a window hours away.
+  const resetAt = requestFailure?.resetAt;
+  if ((status === 429 || status === 529) && typeof resetAt === "number" && resetAt > Date.now()) {
+    extra["retry-after"] = String(Math.ceil((resetAt - Date.now()) / 1000));
+  }
   return dialect === "anthropic"
     ? json({ type: "error", error: { type: known ?? (status === 404 ? "not_found_error" : status === TRUNCATED_TERMINAL_STATUS ? "invalid_request_error" : status === 400 ? "invalid_request_error" : status === 401 ? "authentication_error" : status === 429 ? "rate_limit_error" : status === 529 ? "overloaded_error" : "api_error"), message } }, status, extra)
     // OpenAI's own vocabulary: a 4xx the caller can fix is invalid_request_error, anything
@@ -1479,7 +1976,15 @@ export function serve(opts: ServeOpts = {}) {
       }
       if (!accepting) return errorFor(dialect, 503, "APIPlan instance is draining; retry on the active instance");
       activeRequests++;
-      try {
+      // Exactly one release per accepted request, whichever way it ends.
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        activeRequests--;
+        completedRequests++;
+      };
+      const handle = async (): Promise<Response> => {
         // Register whatever the local daemon holds before anything reads the registry —
         // /v1/models, /health and every call resolve against the same live truth.
         await ensureOllama();
@@ -1493,7 +1998,8 @@ export function serve(opts: ServeOpts = {}) {
         if (req.method === "GET" && (path === "/health" || path === "/")) return health();
         if (req.method !== "POST") throw new HttpError(405, `${req.method} ${path} is not supported`);
 
-        let body: any;
+        // Only `model` is inspected here; each route parses the rest in its own dialect.
+        let body: { model?: unknown } | undefined;
         try { body = await req.json(); } catch { throw new HttpError(400, "body must be JSON") }
         // A name we cannot resolve may be a model pulled since this process started; ask the
         // daemon once more before telling the caller it does not exist.
@@ -1506,13 +2012,23 @@ export function serve(opts: ServeOpts = {}) {
           case "/v1/images/generations": case "/images/generations": return await images(body, req.signal);
           default: throw new HttpError(404, `no route for POST ${path}`);
         }
-      } catch (e: any) {
+      };
+      let response: Response;
+      try {
+        response = await handle();
+      } catch (e: unknown) {
         const status = e instanceof HttpError ? e.status : 500;
-        return errorFor(dialect, status, e?.message ?? String(e), e instanceof HttpError ? e.upstreamType : undefined);
-      } finally {
-        activeRequests--;
-        completedRequests++;
+        response = errorFor(dialect, status, e instanceof Error ? e.message : String(e), e instanceof HttpError ? e.upstreamType : undefined, e instanceof HttpError ? e.requestFailure : undefined);
       }
+      // A STREAMING answer is not finished when the handler returns: its body keeps pumping the
+      // upstream generator inside the ReadableStream (see BODY_SETTLED). Releasing here would report
+      // zero in flight while a client is mid-turn, and the drain gate at `bin/apiplan.ts:683-687`
+      // reads that zero as "safe to SIGTERM" — with no signal handler in this process, that kill is
+      // immediate and the turn dies. So a streaming request stays counted until its body settles.
+      const settled = BODY_SETTLED.get(response);
+      if (settled) void settled.then(release, release);
+      else release();
+      return response;
     },
   });
   // server.port, not the requested one: port 0 means "any free port", and only the

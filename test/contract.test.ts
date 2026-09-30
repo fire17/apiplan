@@ -101,6 +101,26 @@ describe("anthropic request", () => {
     const b = build("opus", { systemBlocks: blocks });
     expect(b.body.system.slice(1)).toEqual(blocks);
   });
+  // api.anthropic.com states TWO constraints for a wire `system` message (observed live
+  // 2026-08-31 against claude-opus-5): it must FOLLOW a `user` turn, AND it must precede
+  // an `assistant` turn or end the array. Omitting the second one forwarded a shape the
+  // API rejects: "role 'system' must precede an 'assistant' message or end the array".
+  test("a mid-conversation system turn keeps its role only where the API accepts it", () => {
+    const sys = (text: string) => ({ role: "user", text, isSystem: true });
+    const roles = (turns: any[]) => build("opus", {}, turns).body.messages.map((m: any) => m.role).join(",");
+    const U = (text: string) => ({ role: "user", text });
+    const A = (text: string) => ({ role: "assistant", text });
+
+    // Legal: follows a user turn AND ends the array / precedes an assistant turn.
+    expect(roles([U("a"), sys("OP")])).toBe("user,system");
+    expect(roles([U("a"), sys("OP"), A("ok"), U("b")])).toBe("user,system,assistant,user");
+
+    // Illegal placements are downgraded to `user`, keeping position.
+    expect(roles([U("a"), sys("OP"), U("b")])).toBe("user,user,user");
+    expect(roles([sys("OP"), U("a")])).toBe("user,user");
+    expect(roles([U("a"), A("ok"), sys("OP"), U("b")])).toBe("user,assistant,user,user");
+    expect(roles([U("a"), sys("O1"), sys("O2"), U("b")])).toBe("user,user,user,user");
+  });
 });
 
 describe("openai request", () => {

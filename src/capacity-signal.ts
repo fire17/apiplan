@@ -54,6 +54,10 @@ export interface CapacitySignal {
   provider?: string;
   /** Non-secret scoped identity, e.g. "g:9f2c1ab34de5". Never a token. */
   accountFingerprint?: string;
+  /** Unknown or absent scope never implies account-wide capacity. */
+  scope?: "account" | "model" | "org" | "unknown";
+  model?: string;
+  orgFingerprint?: string;
 }
 
 // ─── the observation ────────────────────────────────────────────────────────────────────────
@@ -111,6 +115,56 @@ export function fingerprintAccount(secret: string, prefix = "a"): string {
   return `${prefix}:${createHash("sha256").update(secret).digest("hex").slice(0, 12)}`;
 }
 
+/**
+ * Whether an `ident` from `src/providers.ts`'s `credFp()` names a REAL, CREDENTIAL-BACKED account.
+ *
+ * Two distinct kinds of non-identity arrive in this field, and both must be rejected.
+ *
+ * PLACEHOLDERS. `credFp()` does not return `undefined` when it cannot read the well — it returns a
+ * placeholder in the same string a real fingerprint uses: `"absent"` when the token is missing
+ * (`src/providers.ts:593`, `:799`, `:1624`) and `"unusable:<state>"` when the well could not be read
+ * (`src/providers.ts:1622`, states `absent`/`unreadable`). `credOf()` in `src/api.ts:204` adds the
+ * empty string on a throw. Admitting one breaks capacity in both directions:
+ *   · CAPACITY. A refusal recorded against `"absent"` and a later acceptance recorded against
+ *     `"absent"` land on the SAME snapshot line although they concern different accounts — or none at
+ *     all. That is exactly the `exhausted → open` edge, so an unreadable well that later reads fine
+ *     announces a `window-reset` nobody observed, and every run parked on that provider resumes into
+ *     an unchanged limit.
+ *   · IDENTITY, worse: two DIFFERENT accounts both momentarily unreadable both read `"absent"`, so a
+ *     real switch straddling a read failure reads as unchanged and the `account-changed` that should
+ *     wake parked work is LOST. A placeholder also flaps with the WELL rather than the account, so
+ *     `A → "absent" → A` would report two changes where nothing changed.
+ *
+ * NO-ACCOUNT PROVIDERS. `credOf()` falls back to `probe().detail` for a provider with no credential
+ * at all — ollama (`src/api.ts:200`), whose live ledger entry reads
+ * `"http://127.0.0.1:11434 · ollama 0.33.0 · no account, no token, no quota"`. That string is stable,
+ * so it never fabricates an `account-changed`; but it is a HUMAN-READABLE SERVICE DESCRIPTION, not an
+ * account. It moves when the local server's version or port moves, and it is published verbatim by
+ * `/health`, which is precisely the forgeable-legacy shape `src/api.ts:245-250` removed for credential
+ * verdicts. A local model server has no quota to exhaust and no window to reopen, so there is nothing
+ * here for capacity to be right about: it is `unknown`, not an identity.
+ *
+ * A real identity is a `sha256(...).slice(0, 12)` digest (`src/providers.ts:43`), optionally carrying
+ * one `<prefix>:` from {@link fingerprintAccount} (`a:`, `g:`), or — for Google alone — a plain
+ * account id (`src/providers.ts:1626`). So this rejects the placeholder vocabulary, anything blank,
+ * and anything carrying the shape of a probe line (a URL, whitespace-separated prose, or the
+ * `no account` disclaimer itself), and accepts the rest. It fails CLOSED on vocabulary rather than on
+ * a digest whitelist, so a future placeholder spelling is still rejected while a legitimately new
+ * identity shape is still accepted.
+ */
+export function isRealAccountIdent(ident: string | undefined): boolean {
+  if (typeof ident !== "string") return false;
+  const t = ident.trim();
+  if (!t) return false;
+  if (t === "absent" || t === "unknown") return false;
+  // `unusable:<state>` for any present or future state, and a defensive `absent:<detail>`.
+  if (/^(?:unusable|absent)\b/i.test(t)) return false;
+  // A probe line, never an account: an endpoint URL, prose (a real ident has no whitespace), or the
+  // explicit no-account disclaimer a credential-free provider reports.
+  if (/\s/.test(t) || /^[a-z][a-z0-9+.-]*:\/\//i.test(t) || /no account/i.test(t)) return false;
+  return true;
+}
+
 /** Anything credential-shaped in a value. Used by `assertNoSecrets` and safe to call on signals. */
 const SECRET_RE = [
   /\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}/,
@@ -141,6 +195,8 @@ export interface DiffOptions {
 
 /**
  * The whole contract: what changed between two observations of ONE provider/account line.
+ * Legacy observation-diff utility, not the production OM recovery producer. It lacks scope-bound
+ * request evidence; use capacity-events.ts recordCapacity and its scoped snapshots for recovery.
  *
  *  · ACCOUNT-CHANGED when the fingerprint differs (and both are known). Emitted whether or not the
  *    old account was limited: a different account is a different token window, which is precisely the
@@ -236,8 +292,10 @@ export interface CapacityRecord {
   limited: boolean;
   /** Epoch ms when the window is expected to reopen, when the upstream said so. */
   resetsAt?: number;
-  /** What is limited. Defaults to "account" — the only scope apiplan can currently distinguish. */
-  scope: "account" | "model" | "org";
+  /** What is limited. Unspecified upstream scope remains unknown. */
+  scope: "account" | "model" | "org" | "unknown";
+  model?: string;
+  orgFingerprint?: string;
   /** Which header (or status) the reset time came from, so a stale record is diagnosable. */
   source: string;
   detail?: string;
@@ -306,6 +364,8 @@ export function capacityRecordFromResponse(input: {
   errorType?: string;
   headers?: HeadersLike;
   scope?: CapacityRecord["scope"];
+  model?: string;
+  orgFingerprint?: string;
   detail?: string;
 }): CapacityRecord {
   const { provider, at, account, status, errorType, headers } = input;
@@ -327,7 +387,9 @@ export function capacityRecordFromResponse(input: {
   return {
     provider, account, observedAt: at, limited,
     resetsAt: limited ? resetsAt : undefined,
-    scope: input.scope ?? "account",
+    scope: input.scope ?? "unknown",
+    model: input.model,
+    orgFingerprint: input.orgFingerprint,
     source,
     detail: scrubDetail(input.detail),
   };

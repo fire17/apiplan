@@ -128,8 +128,10 @@ export function shadowsExisting(name: string, binDir: string): string | null {
 /** True when this file is a shim written by any version of apiplan. */
 export function isOurShim(file: string): boolean {
   try {
+    // Size gate BEFORE the read: a 172 MB `grok` binary on PATH was being read and UTF-8
+    // decoded (~850 ms) just to learn it is not a 4 KB shim. stat is free.
+    if (statSync(file).size > 4096) return false; // shims are tiny; a real binary is not
     const s = readFileSync(file, "utf8");
-    if (s.length > 4096) return false; // shims are tiny; a real binary is not
     return /apiplan|APIPlan|\bask\.ts\b|\bapi\.ts\b|\bcodex\.ts\b/.test(s);
   } catch { return false; }
 }
@@ -165,31 +167,62 @@ export function ipcTarget(i: Ipc, path: string): { url: string; opts: any } | nu
 }
 
 // ---- clipboard images, per OS ----
+/** Spawn without throwing: Bun.spawnSync THROWS when the binary is missing (pngpaste
+ *  on a stock Mac), which used to abort before the built-in macOS fallbacks ran. */
+function trySpawn(cmd: string[]): { exitCode: number; stdout: Uint8Array } | null {
+  try {
+    const r = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "ignore" });
+    return { exitCode: r.exitCode ?? 1, stdout: r.stdout ? new Uint8Array(r.stdout) : new Uint8Array() };
+  } catch { return null; }
+}
+/** Consume a file a tool wrote: its bytes (if it looks like an image) and delete it. */
+function takeFile(out: string): Uint8Array | null {
+  if (!existsSync(out)) return null;
+  try { const b = new Uint8Array(readFileSync(out)); unlinkSync(out); return b.length > 8 ? b : null; } catch { return null; }
+}
+/** macOS, no extra installs: AppleScript PNGf first (screenshots), then AppKit via JXA,
+ *  which converts any image type NSImage can read (TIFF from Preview/Safari, JPEG…) to PNG. */
+export function macClipboardScripts(out: string): string[][] {
+  const esc = out.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return [
+    ["osascript", "-e", `try
+set png to (the clipboard as «class PNGf»)
+set f to open for access POSIX file "${esc}" with write permission
+set eof f to 0
+write png to f
+close access f
+end try`],
+    ["osascript", "-l", "JavaScript", "-e", `ObjC.import('AppKit');
+var pb = $.NSPasteboard.generalPasteboard;
+var img = $.NSImage.alloc.initWithPasteboard(pb);
+if (img && !img.isNil()) {
+  var tiff = img.TIFFRepresentation;
+  if (tiff && !tiff.isNil()) {
+    var rep = $.NSBitmapImageRep.imageRepWithData(tiff);
+    var png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+    png.writeToFileAtomically("${esc}", true);
+  }
+}
+''`],
+  ];
+}
 /** Raw bytes of the clipboard image, or null. Tries every mechanism the OS offers. */
 export function clipboardImageBytes(): Uint8Array | null {
   const out = join(TMP, `apiplan-clip-${process.pid}.png`);
   const tries: string[][] = IS_MAC
-    ? [["pngpaste", out]]
+    ? [["pngpaste", out], ...macClipboardScripts(out)]
     : IS_WIN || IS_WSL
       ? [["powershell.exe", "-NoProfile", "-Command",
           `Add-Type -Assembly System.Windows.Forms; $i=[Windows.Forms.Clipboard]::GetImage(); if($i){$i.Save('${out.replace(/\\/g, "\\\\")}',[System.Drawing.Imaging.ImageFormat]::Png)}`]]
       : [["wl-paste", "-t", "image/png", "-o"], ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]];
+  try { unlinkSync(out); } catch {}          // never return a stale file from an earlier run
   for (const cmd of tries) {
-    // stdout-producing tools (wl-paste/xclip/pngpaste -) vs file-writing tools
-    const r = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "ignore" });
-    if (r.exitCode === 0 && r.stdout?.length > 8) return new Uint8Array(r.stdout);
-    if (existsSync(out)) {
-      try { const b = new Uint8Array(readFileSync(out)); unlinkSync(out); if (b.length > 8) return b; } catch {}
-    }
-  }
-  if (IS_MAC) { // AppleScript fallback when pngpaste isn't installed
-    Bun.spawnSync(["osascript", "-e", `try
-set png to (the clipboard as «class PNGf»)
-set f to open for access POSIX file "${out}" with write permission
-write png to f
-close access f
-end try`], { stderr: "ignore" });
-    if (existsSync(out)) { try { const b = new Uint8Array(readFileSync(out)); unlinkSync(out); if (b.length > 8) return b; } catch {} }
+    const r = trySpawn(cmd);
+    // stdout-producing tools (wl-paste/xclip) vs file-writing tools (pngpaste/osascript/powershell)
+    const pipesImage = cmd[0] === "wl-paste" || cmd[0] === "xclip";
+    if (r && pipesImage && r.exitCode === 0 && r.stdout.length > 8) { try { unlinkSync(out); } catch {} return r.stdout; }
+    const b = takeFile(out);
+    if (b) return b;
   }
   return null;
 }

@@ -9,16 +9,12 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { STATE_DIR, TMP, ensureDir, ipc, ipcTarget, readJson, writeJson, clipboardImageBytes, speakLocally, playAudio, openFile, IS_WIN } from "./platform.ts";
 import { models, resolve, type Model } from "./registry.ts";
-import { PROVIDERS, providerFor, providerRuntime, warmCreds, type CallOpts, type ImageRef, type Provider, type Turn } from "./providers.ts";
+import { PROVIDERS, providerFor, providerRuntime, warmCreds, type CallOpts, type Creds, type ImageRef, type Provider, type Turn } from "./providers.ts";
+import { openProviderRequest } from "./provider-transport.ts";
 import { frameSep, framePayload, deltasOf, watchTerminal } from "./stream-shape.ts";
-
-// Does this vendor accept the engine's `stream: true` body flag? providers.ts declares it
-// (wantsStreamFlag, set false for Google's strict proto-JSON endpoint) and src/api.ts has
-// always honoured it -- this file did not, so the SAME vendor fact was consumed on the
-// serve path and ignored on the command path. Google answered
-// 400 `Unknown name "stream"` to every command. build() cannot fix it: the flag is spread
-// in AFTER build() returns, which is exactly why the fact lives on the provider.
-const wantsStream = (prov: Provider): boolean => prov.wantsStreamFlag !== false;
+import { recordCapacity } from "./capacity-events.ts";
+import { isRealAccountIdent } from "./capacity-signal.ts";
+import { resolveLiveModel } from "./live-models.ts";
 
 export const START = performance.now();
 export const VERSION = "0.8.0";
@@ -52,7 +48,7 @@ export type Opts = CallOpts & {
   publicGemini: boolean;
   thinking?: number; systemFile?: string;
   /** non-text jobs */
-  out?: string; speak: boolean; voice?: string; audioFormat?: string; play: boolean; local: boolean;
+  out?: string; speak: boolean; voice?: string; liveModel?: string; audioFormat?: string; play: boolean; local: boolean;
   genVideo: boolean; genSong: boolean; duration?: number;
   aloud: boolean; conversation?: string; message?: string; last: boolean; open: boolean;
   direction?: string; directionFile?: string;
@@ -64,7 +60,8 @@ const VALUED = new Set(["-m", "--model", "-e", "--effort", "-s", "--system", "--
   "--max-tokens", "-t", "--temp", "--temperature", "--thinking", "--loop", "-i", "--image", "-f", "--file", "--media",
   "-o", "--out", "--voice", "--format", "--size", "--quality", "--conversation", "--message",
   "--as", "--style", "--emotion", "--direction", "--as-file", "--lang", "--silence-stop", "--duration",
-  "--session", "--cache-key"]);
+  "--session", "--cache-key", "--live-model", "--realtime-model", "--mode",
+  "--service-tier", "--detail", "--image-detail"]);
 
 /**
  * Everything that isn't a recognised flag becomes prompt text, so
@@ -77,6 +74,15 @@ export function parseArgs(argv: string[], model0?: string): Opts {
     dryRun: false, verbose: false, help: false, version: false,
     daemon: false, daemonStop: false, noDaemon: false, publicGemini: false,
     speak: false, genVideo: false, genSong: false, play: false, local: false, aloud: false, last: false, open: false, dictate: false,
+  };
+  // Which spelling asked for the mode, so a contradiction can name BOTH sides. Repeating
+  // one mode is not a contradiction; asking for two is, and it is never resolved by
+  // argument order — the last flag winning silently is exactly how someone ends up billed
+  // for the surface they did not choose.
+  let modeFlag: string | undefined;
+  const setMode = (m: "chat" | "work", flag: string) => {
+    if (o.mode && o.mode !== m) throw new Error(`choose one mode: ${modeFlag} and ${flag} contradict each other.`);
+    o.mode = m; modeFlag = flag;
   };
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
@@ -110,6 +116,11 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--as": case "--style": case "--emotion": case "--direction": o.direction = val(); o.speak = true; break;
       case "--as-file": o.directionFile = val(); o.speak = true; break;
       case "--voice": o.voice = val(); break;
+      case "--live-model": case "--realtime-model": {
+        const value = val();
+        if (!value || value.startsWith("--")) throw new Error(`${a} needs a model ID (see apiplan live-models).`);
+        o.liveModel = value; break;
+      }
       case "--format": o.audioFormat = val(); break;
       case "--play": o.play = true; break;
       case "--open": o.open = true; break;
@@ -124,6 +135,18 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--stream": o.stream = true; break;
       case "--no-stream": o.stream = false; break;
       case "--chat": o.chat = true; break;
+      // MODE — which chatgpt.com composer answers. Deliberately NOT spelled `--chat`:
+      // that flag has meant "read a JSON messages array from stdin" since long before
+      // modes existed, and quietly re-pointing it would break every script that pipes a
+      // transcript in. `--work` is the behaviour every subscription command already has.
+      case "--chatmode": case "--chat-mode": setMode("chat", a); break;
+      case "--work": case "--workmode": case "--work-mode": setMode("work", a); break;
+      case "--mode": {
+        const v = String(val() ?? "").toLowerCase();
+        if (v !== "chat" && v !== "work") throw new Error(`--mode takes chat or work, not '${v}'.`);
+        setMode(v, `--mode ${v}`);
+        break;
+      }
       // A stable conversation identity for the provider's prompt cache: the same key on
       // every turn of one `--chat` transcript is what turns a re-read of the whole history
       // into a cache hit (Codex routes on it too — see providers.ts session_id).
@@ -131,6 +154,10 @@ export function parseArgs(argv: string[], model0?: string): Opts {
       case "--json": o.json = true; break;
       case "--show-thinking": o.showThinking = true; break;
       case "--fast": o.fast = true; break;
+      // OpenAI Responses only (providers.ts openaiServiceTier / withImageDetail): the Codex
+      // Fast tier (`priority`; `--fast` implies it there) and per-request image detail.
+      case "--service-tier": o.serviceTier = val(); break;
+      case "--detail": case "--image-detail": o.imageDetail = val(); break;
       case "--1m": o.oneM = true; break;
       case "--dry-run": o.dryRun = true; break;
       case "--daemon": o.daemon = true; break;
@@ -347,7 +374,7 @@ export async function streamReply(
 ): Promise<string> {
   const p = providerFor(m);
   const b = p.build(m, turns, o, p.creds());
-  const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body), signal });
+  const res = await openProviderRequest(p, b, signal);
   if (!res.ok || !res.body) {
     let detail = (await res.text()).slice(0, 300);
     try { const j = JSON.parse(detail); detail = j?.error?.message ?? detail; } catch {}
@@ -383,7 +410,9 @@ export async function streamReply(
 
 export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void> {
   const p = providerFor(m);
-  const creds = o.dryRun ? { token: "<token>", account: "<account>", source: "dry-run" } : p.creds();
+  // The online route's account identity is request routing, not a bearer secret. Read the
+  // configured account for dry-run so build() can validate and bind it without opening a browser.
+  const creds = o.dryRun && m.provider !== "online" ? { token: "<token>", account: "<account>", source: "dry-run" } : p.creds();
   const built = p.build(m, turns, o, creds);
   if (o.dryRun) {
     process.stdout.write(JSON.stringify(redact({ method: "POST", url: built.url, headers: built.headers, body: built.body }), null, 2) + "\n");
@@ -394,7 +423,7 @@ export async function callDirect(m: Model, turns: Turn[], o: Opts): Promise<void
     if (pass > 0) convo = [...convo, { role: "user", text: REFINE }];
     const b = p.build(m, convo, o, creds);
     markDispatch();
-    const res = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body) });
+    const res = await openProviderRequest(p, b);
     const last = pass === o.loop - 1;
     const r = await consume(p, res.body, res.status, res.headers.get("retry-after"), { ...o, stream: o.stream && last, verbose: o.verbose && last });
     if (!last) convo = [...convo, { role: "assistant", text: r.text }];
@@ -444,11 +473,20 @@ export async function runImage(m: Model, prompt: string, o: Opts): Promise<void>
 
 /** The speech path: one request, binary back — no SSE, no daemon. */
 export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> {
+  if (o.liveModel && (o.aloud || o.local || m.provider !== "openai")) throw new Error("--live-model applies to OpenAI subscription --speak, not local speech or stored read-aloud.");
   // Read-aloud speaks a message that already exists in the account, so unlike every
   // other speech path it needs no prompt — the text comes from the conversation.
   if (o.aloud) return runAloud(m, o);
   if (!text.trim()) die("nothing to say — give me some text, or pipe it in.");
   const p = providerFor(m);
+  if (m.provider === "openai" && !o.local && resolveLiveModel(o.liveModel).transport === "codex-webrtc") {
+    if (process.env.APIPLAN_TTS_BASE) throw new Error("Unset APIPLAN_TTS_BASE to use Codex live subscription speech.");
+    if (!o.play || o.out || o.audioFormat) throw new Error("Codex live speech is playback-only: use --speak --play --live-model codex-live without --out or --format. Use gpt-realtime for audio files.");
+    const { speakCodexLive } = await import("./codex-live.ts");
+    const report = await speakCodexLive(text, { voice: o.voice, direction: o.direction });
+    if (o.verbose) process.stderr.write(`[apiplan] gpt-live-1-codex via ${report.authSource}: ${report.outputFrames} output frames, ${report.elapsedMs}ms\n`);
+    return;
+  }
   const sayItHere = (why?: string) => {
     const tool = speakLocally(text);
     if (!tool) die(why ? `${why}\n  and no local voice is available either (macOS \`say\`, Linux \`spd-say\`/\`espeak\`, Windows SAPI).`
@@ -468,8 +506,11 @@ export async function runSpeech(m: Model, text: string, o: Opts): Promise<void> 
   // The subscription path returns wav whatever was asked for — it hands back raw PCM
   // and we add the header — so report the format actually produced, never a guess.
   let out: { bytes: Uint8Array; contentType: string };
-  try { out = await p.speak({ text, voice, format: fmt, direction: o.direction }); }
-  catch (e: any) { sayItHere(e?.message ?? String(e)); return; }
+  try { out = await p.speak({ text, voice, format: fmt, direction: o.direction, liveModel: o.liveModel }); }
+  catch (e: any) {
+    if (o.liveModel || process.env.APIPLAN_LIVE_MODEL || process.env.APIPLAN_REALTIME_MODEL) throw e;
+    sayItHere(e?.message ?? String(e)); return;
+  }
   const ext = out.contentType.includes("wav") ? "wav" : fmt;
   const how = o.direction ? `voice ${voice}, as “${o.direction.replace(/\s+/g, " ").slice(0, 48)}”` : `voice ${voice}`;
   deliverAudio(out.bytes, ext, `${how} via ${live.backend}`, o);
@@ -498,6 +539,18 @@ async function runAloud(m: Model, o: Opts): Promise<void> {
  * `dictation | pbcopy` and `msg=$(dictation)` behave like any Unix tool.
  */
 export async function runDictation(m: Model, o: Opts): Promise<void> {
+  // A live model is meaningful for dictation on any transport that can transcribe, and
+  // there are now two: OpenAI's Realtime socket and Google's Bidi socket. The check is
+  // therefore on the TRANSPORT rather than on the text model's provider — the old rule
+  // ("--live-model only applies to OpenAI dictation") would have rejected
+  // `--dictate --live-model gemini-transcribe-live`, which is a working path.
+  if (o.liveModel) {
+    const transport = resolveLiveModel(o.liveModel).transport;
+    if (transport === "codex-webrtc") throw new Error("codex-live is a speech transport, not a dictation one. See apiplan live-models.");
+    if (transport === "realtime-websocket" && m.provider !== "openai") {
+      throw new Error("a Realtime --live-model applies to OpenAI dictation. For Gemini use --live-model gemini-transcribe-live.");
+    }
+  }
   const { dictate } = await import("./dictation.ts");
   const tty = process.stderr.isTTY;
   const width = () => (process.stderr.columns ?? 80) - 2;
@@ -508,7 +561,7 @@ export async function runDictation(m: Model, o: Opts): Promise<void> {
     process.stderr.write(`\r\x1b[2K${dim ? "\x1b[2m" : ""}${t}\x1b[0m`);
   };
   const text = await dictate({
-    provider: m.provider, lang: o.lang, silenceStop: o.silenceStop,
+    provider: m.provider, model: o.liveModel, lang: o.lang, silenceStop: o.silenceStop,
     onEvent: (kind, t) => {
       if (kind === "info") { if (tty) process.stderr.write(`\r\x1b[2K\x1b[2m[${t}]\x1b[0m\n`); }
       else paint(t, kind === "interim");
@@ -603,17 +656,29 @@ export async function runDaemon(): Promise<void> {
   warmCreds();
 
   // credential cache, refreshed a few minutes before expiry
-  const cache = new Map<string, { c: any; exp: number }>();
+  const cache = new Map<string, { c: Creds; exp: number; account?: string }>();
   const creds = async (pid: keyof typeof PROVIDERS) => {
     const hit = cache.get(pid);
-    if (hit && hit.exp - Date.now() > 300_000) return hit.c;
+    // Website account selection is mutable local routing state. Never pin it in the warm
+    // daemon's credential TTL after `chatgpt accounts select` changes the active account.
+    if (pid !== "online" && hit && hit.exp - Date.now() > 300_000) return hit;
     // Off the request path by construction: prepare() either returns at once (serving the
     // token already in hand while a mint runs in the background) or awaits a bounded async
     // mint. Never throws by contract; a provider with nothing to prepare has no hook.
     try { await PROVIDERS[pid].prepare?.(); } catch {}
     const c = PROVIDERS[pid].creds();
-    cache.set(pid, { c, exp: c.expiresAt ?? Date.now() + 3_300_000 });
-    return c;
+    // Keep identity with the cached credential, never re-label it after a later account swap.
+    // A placeholder ident ("absent", "unusable:<state>") is NOT an identity: recording capacity
+    // against it merges distinct accounts onto one line and manufactures a window-reset when the
+    // well becomes readable again. Undefined here means this daemon records no capacity for the call.
+    let account: string | undefined;
+    try {
+      const ident = PROVIDERS[pid].credFp?.().ident;
+      account = isRealAccountIdent(ident) ? ident : undefined;
+    } catch {}
+    const entry = { c, exp: c.expiresAt ?? Date.now() + 3_300_000, account };
+    if (pid !== "online") cache.set(pid, entry);
+    return entry;
   };
 
   let lastReq = Date.now();
@@ -646,8 +711,13 @@ export async function runDaemon(): Promise<void> {
         const s: any = await req.json();
         const m: Model = s.model;
         const p = PROVIDERS[m.provider as keyof typeof PROVIDERS];
-        const b = p.build(m, s.turns, s.opts, await creds(m.provider));
-        const up = await fetch(b.url, { method: "POST", headers: b.headers, body: JSON.stringify(wantsStream(p) ? { ...b.body, stream: true } : b.body) });
+        const credential = await creds(m.provider);
+        const b = p.build(m, s.turns, s.opts, credential.c);
+        const up = await openProviderRequest(p, b, req.signal);
+        // Observe the original vendor headers before rebuilding the IPC response, without reading its stream.
+        if (credential.account && ((up.ok && up.body) || up.status === 429 || up.status === 402)) {
+          try { recordCapacity({ provider: m.provider, account: credential.account, model: m.id, at: Date.now(), status: up.status, headers: up.headers, scope: "unknown" }); } catch {}
+        }
         return new Response(up.body, {
           status: up.status,
           headers: { "content-type": up.headers.get("content-type") || "text/event-stream", "x-retry-after": up.headers.get("retry-after") || "" },
@@ -741,12 +811,18 @@ function spawnDaemonDetached(entry: string) {
  */
 const OVERRIDE_ENV = ["APIPLAN_ANTHROPIC_BASE", "APIPLAN_OPENAI_BASE", "APIPLAN_IDENTITY",
   "APIPLAN_OAUTH_BETA", "APIPLAN_API_VERSION", "APIPLAN_ORIGINATOR", "APIPLAN_RESPONSES_PATH",
-  "APIPLAN_CODEX_AUTH", "APIPLAN_ANTHROPIC_CRED_FILE", "APIPLAN_KEYCHAIN_SERVICE"];
+  "APIPLAN_CODEX_AUTH", "APIPLAN_ANTHROPIC_CRED_FILE", "APIPLAN_KEYCHAIN_SERVICE",
+  "CHATGPT_ACCOUNT", "CHATGPT_HOME",
+  // Read inside openai.build(), so a warm daemon started without them would silently drop them.
+  "APIPLAN_SERVICE_TIER", "APIPLAN_IMAGE_DETAIL"];
 export const hasRequestOverrides = () => OVERRIDE_ENV.some((k) => process.env[k]?.length);
+
+/** Website-backed calls stay in this process until daemon replacement can drain active streams. */
+export const providerCanUseWarmDaemon = (m: Pick<Model, "provider">): boolean => m.provider !== "online";
 
 /** Serve the call through the daemon; false means "fall back to in-process". */
 export async function callViaDaemon(m: Model, turns: Turn[], o: Opts, entry: string): Promise<boolean> {
-  if (hasRequestOverrides()) return false;
+  if (!providerCanUseWarmDaemon(m) || hasRequestOverrides()) return false;
   const p = providerFor(m);
   const spec = JSON.stringify({ model: m, turns, opts: o });
   const post = () => (markDispatch(), ipcFetch("/call", {
