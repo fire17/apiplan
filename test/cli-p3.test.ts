@@ -94,7 +94,7 @@ test("install --dry-run and sync --dry-run write nothing and show the diff", () 
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 test("doctor --json names the GPT-6 rows", () => {
-  const b = sandbox({ meta: { client_version: "0.155.0", live: true, fetched_at: Date.now() } });
+  const b = sandbox({ meta: { client_version: "0.159.0", live: true, fetched_at: Date.now() } });
   const { code, j } = doctorJson(b);
   expect(code).toBe(0);
   expect(row(j, "catalog openai").state).toBe("ok");

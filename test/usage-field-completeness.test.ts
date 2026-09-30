@@ -861,7 +861,7 @@ describe("a provider's recover() is consulted on an upstream refusal", () => {
     // Called exactly once — a hook called twice per refusal would double any repair.
     expect(seen.length).toBe(1);
     expect(seen[0].status).toBe(403);
-    expect(seen[0].model).toBe("claude-opus-5");
+    expect(seen[0].model).toBe("claude-opus-5-5");
     // THE RAW-BODY GUARANTEE, checked positively.
     expect(seen[0].body).toContain("x_apiplan_probe");
     expect(seen[0].body).toContain("PERMISSION_DENIED");
