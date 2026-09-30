@@ -194,3 +194,96 @@ export function totalsByKey(lines: LedgerLine[], only?: (keyId: string) => boole
   }
   return [...by.values()].sort((a, b) => b.cost_usd - a.cost_usd || b.requests - a.requests);
 }
+
+// ─────────────────────────── breakdowns (the dashboard's pies) ───────────────────────────
+//
+// Owner's ask (fire17, 2026-10-01 02:07): "see the overall, but also understand from it — like a
+// pie chart — how it was used in terms of tokens". One aggregation over the same (already
+// visibility-filtered) ledger lines, keyed three ways. Every line lands in exactly one bucket of
+// each grouping, so each grouping's rows sum to `overall` — the tests hold that.
+
+export type Tally = {
+  requests: number; errors: number;
+  input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number;
+  total_tokens: number; cost_usd: number; unpriced_requests: number;
+};
+export type ModelTally = Tally & { model: string; provider: string | null };
+export type DayTally = Tally & { day: string };
+export type Breakdown = { overall: Tally; by_model?: ModelTally[]; by_day?: DayTally[]; by_key?: KeyTotals[]; tz_offset_min: number };
+export type Group = "model" | "day" | "key";
+export const GROUPS: Group[] = ["model", "day", "key"];
+
+const zero = (): Tally => ({ requests: 0, errors: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+  total_tokens: 0, cost_usd: 0, unpriced_requests: 0 });
+function add(t: Tally, l: LedgerLine) {
+  t.requests++;
+  if (l.status >= 400) t.errors++;
+  t.input_tokens += l.input_tokens || 0; t.output_tokens += l.output_tokens || 0;
+  t.cache_read_tokens += l.cache_read_tokens || 0; t.cache_write_tokens += l.cache_write_tokens || 0;
+  if (typeof l.cost_usd === "number") t.cost_usd += l.cost_usd;
+  else if ((l.input_tokens || l.output_tokens) && l.status < 400) t.unpriced_requests++;
+}
+function seal<T extends Tally>(t: T): T {
+  t.total_tokens = t.input_tokens + t.output_tokens + t.cache_read_tokens + t.cache_write_tokens;
+  t.cost_usd = Math.round(t.cost_usd * 1e6) / 1e6;
+  return t;
+}
+/** `group=model,day` / `model` / `all` → the groupings asked for; unknown names are an error. */
+export function parseGroups(s: string | null | undefined): Group[] {
+  if (!s) return [];
+  const out = new Set<Group>();
+  for (const g of s.split(",").map((x) => x.trim()).filter(Boolean)) {
+    if (g === "all") GROUPS.forEach((x) => out.add(x));
+    else if ((GROUPS as string[]).includes(g)) out.add(g as Group);
+    else throw new Error(`group must be model, day or key (comma-separated), got '${g}'`);
+  }
+  return [...out];
+}
+/** The calendar day of `ts` at a fixed offset (minutes EAST of UTC — Israel summer is 180). */
+export const dayOf = (ts: string, tzOffsetMin = 0) => new Date(Date.parse(ts) + tzOffsetMin * 6e4).toISOString().slice(0, 10);
+
+/**
+ * Totals plus the requested groupings over `lines` (filter them for visibility FIRST — or pass
+ * `only`). by_day is contiguous: every calendar day from the window start (or the first line) to
+ * `now` appears, zero-filled, so a bar strip has no silent gaps.
+ */
+export function breakdown(lines: LedgerLine[], groups: Group[], opts: { only?: (keyId: string) => boolean; tzOffsetMin?: number; sinceMs?: number; now?: number } = {}): Breakdown {
+  const tz = opts.tzOffsetMin ?? 0;
+  const mine = opts.only ? lines.filter((l) => opts.only!(l.key_id)) : lines;
+  const overall = zero();
+  const models = new Map<string, ModelTally>(), days = new Map<string, DayTally>();
+  for (const l of mine) {
+    add(overall, l);
+    if (groups.includes("model")) {
+      const name = l.model || "(no model)";
+      let m = models.get(name);
+      if (!m) models.set(name, m = { model: name, provider: l.provider ?? null, ...zero() });
+      if (l.provider) m.provider = l.provider;
+      add(m, l);
+    }
+    if (groups.includes("day")) {
+      const d = dayOf(l.ts, tz);
+      let t = days.get(d);
+      if (!t) days.set(d, t = { day: d, ...zero() });
+      add(t, l);
+    }
+  }
+  const out: Breakdown = { overall: seal(overall), tz_offset_min: tz };
+  if (groups.includes("model")) out.by_model = [...models.values()].map(seal).sort((a, b) => b.cost_usd - a.cost_usd || b.total_tokens - a.total_tokens);
+  if (groups.includes("day")) {
+    const now = opts.now ?? Date.now();
+    const firstTs = mine.reduce((m, l) => (l.ts < m ? l.ts : m), new Date(now).toISOString());
+    const start = opts.sinceMs ? new Date(opts.sinceMs).toISOString() : firstTs;
+    const all: DayTally[] = [];
+    // Walk calendar days at the offset; capped so a garbage ts cannot allocate forever.
+    for (let d = dayOf(start, tz), end = dayOf(new Date(now).toISOString(), tz), n = 0; d <= end && n < 800; n++) {
+      all.push(days.get(d) ? seal(days.get(d)!) : { day: d, ...zero() });
+      d = new Date(Date.parse(d + "T00:00:00Z") + 8.64e7).toISOString().slice(0, 10);
+    }
+    // Lines stamped after `now` (clock skew) still count: append any day the walk did not reach.
+    for (const [d, t] of days) if (!all.some((x) => x.day === d)) all.push(seal(t));
+    out.by_day = all.sort((a, b) => a.day.localeCompare(b.day));
+  }
+  if (groups.includes("key")) out.by_key = totalsByKey(mine);
+  return out;
+}

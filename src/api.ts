@@ -18,7 +18,8 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
-import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
+import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
+import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -2357,6 +2358,9 @@ export function serve(opts: ServeOpts = {}) {
       const dialect: "openai" | "anthropic" = path.includes("/messages") || req.headers.has("x-api-key") ? "anthropic" : "openai";
       // A browser preflight carries no credentials by design; it only learns the CORS policy.
       if (cors && req.method === "OPTIONS") return new Response(null, { status: 204 });
+      // The usage dashboard is static HTML with no data in it: public, like liveness. Its data
+      // calls (/v1/usage/keys, /v1/usage) carry the key and go through the gate below.
+      if (req.method === "GET" && path === "/dashboard") return new Response(DASHBOARD_HTML, { headers: DASHBOARD_HEADERS });
       // Liveness is public so a remote caller (or a monitor) can tell "down" from "wrong key";
       // the full verdict — provider list, expiries, account detail — stays behind the key.
       if (req.method === "GET" && path === "/health" && !authed(req)) {
@@ -2405,19 +2409,28 @@ export function serve(opts: ServeOpts = {}) {
         // other keyless caller (open mode) sees only the anonymous bucket.
         if (req.method === "GET" && (path === "/v1/usage/keys" || path === "/usage/keys")) {
           const since = url.searchParams.get("since") ?? "all";
-          let windowMs: number;
-          try { windowMs = parseWindow(since); } catch (e: any) { throw new HttpError(400, e.message); }
+          let windowMs: number, groups: ReturnType<typeof parseGroups>;
+          try { windowMs = parseWindow(since); groups = parseGroups(url.searchParams.get("group")); } catch (e: any) { throw new HttpError(400, e.message); }
+          // by_day buckets at the caller's clock: tz = minutes EAST of UTC (Israel summer = 180).
+          const tzRaw = url.searchParams.get("tz");
+          const tz = tzRaw === null || tzRaw === "" ? 0 : Number(tzRaw);
+          if (!Number.isInteger(tz) || tz < -840 || tz > 840) throw new HttpError(400, "tz must be whole minutes east of UTC, -840..840");
           const peer = srv.requestIP(req)?.address ?? "";
           const local = (isLoopbackHost(peer) || peer === "::ffff:127.0.0.1")
             && !(req.headers.has("x-forwarded-for") || req.headers.has("forwarded") || req.headers.has("x-real-ip"));
           const me = who;
           const all = me.id === LEGACY.id || (me.id === ANONYMOUS.id && local);
           const now = Date.now();
-          const rows = totalsByKey(readLedger(windowMs ? now - windowMs : 0), all ? undefined : (k) => k === me.id);
+          const only = all ? undefined : (k: string) => k === me.id;
+          const lines = readLedger(windowMs ? now - windowMs : 0);
+          const rows = totalsByKey(lines, only);
           if (!all && !rows.length) rows.push({ key_id: me.id, label: me.label, requests: 0, errors: 0, input_tokens: 0, output_tokens: 0,
             cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0, cost_usd: 0, unpriced_requests: 0, last_used: null });
+          // The default body is byte-for-byte what it was; `breakdown` appears only when asked for,
+          // computed over the SAME visibility-filtered lines (a store key's pies are only its own).
           return json({ object: "usage.keys", scope: all ? "all" : "own", since: windowMs ? new Date(now - windowMs).toISOString() : null,
-            until: new Date(now).toISOString(), keys: rows });
+            until: new Date(now).toISOString(), keys: rows,
+            ...(groups.length ? { breakdown: breakdown(lines, groups, { only, tzOffsetMin: tz, sinceMs: windowMs ? now - windowMs : undefined, now }) } : {}) });
         }
         await ensureOllama();
         if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return listModels(dialect);

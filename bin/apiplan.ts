@@ -533,7 +533,9 @@ USAGE
   apiplan keys new <label>       mint a per-device/project key for serve (shown ONCE; only its hash is kept)
   apiplan keys list              every key: id, label, created, revoked, requests, tokens, cost to date
   apiplan keys revoke <id>       refuse that key from now on (a running server picks it up live)
-  apiplan keys usage [--since 24h|7d] [--json]   per-key totals from the usage ledger
+  apiplan keys usage [--since 24h|7d|30d] [--by model|day|key] [--json]
+                                 per-key totals from the usage ledger; --by adds breakdowns with bars
+                                 (the same data as http://<serve>/dashboard)
   apiplan hotswap <status|upgrade> [--wait-seconds N]
                                  drain + replace the live 8787 server without breaking clients
   apiplan talk [--voice v] [--live-model m]  speak with the model out loud, both ways
@@ -990,7 +992,43 @@ switch (sub) {
       const since = valOf("--since") ?? "all";
       let windowMs = 0;
       try { windowMs = K.parseWindow(since); } catch (e: any) { die(e.message); }
-      const rows = K.totalsByKey(K.readLedger(windowMs ? Date.now() - windowMs : 0));
+      const now = Date.now();
+      const lines = K.readLedger(windowMs ? now - windowMs : 0);
+      const rows = K.totalsByKey(lines);
+      const by = valOf("--by");
+      if (by !== undefined) {
+        // Parity with GET /v1/usage/keys?group=…: the same breakdown(), days at this machine's clock.
+        let groups: ReturnType<typeof K.parseGroups>;
+        try { groups = K.parseGroups(by); } catch (e: any) { die(e.message); }
+        if (!groups!.length) die("usage: apiplan keys usage --by model|day|key [--since 24h|7d|30d] [--json]");
+        const tz = -new Date().getTimezoneOffset();
+        const b = K.breakdown(lines, groups!, { tzOffsetMin: tz, sinceMs: windowMs ? now - windowMs : undefined, now });
+        if (has("--json")) { process.stdout.write(JSON.stringify({ since: windowMs ? new Date(now - windowMs).toISOString() : null, ledger: K.ledgerFile(), breakdown: b }, null, 2) + "\n"); break; }
+        const o = b.overall;
+        process.stdout.write(`${head("usage")} ${dim(since === "all" ? "· all time" : `· last ${since}`)} ${dim("· " + K.ledgerFile().replace(HOME, "~"))}\n`);
+        process.stdout.write(`  ${bold(num(o.requests))} requests${o.errors ? bad(` (${o.errors} errors)`) : ""} · ${bold(num(o.total_tokens))} tokens · ${bold(usd(o.cost_usd))} API value\n`);
+        const tt = o.total_tokens || 1;
+        const types: [string, number][] = [["input", o.input_tokens], ["output", o.output_tokens], ["cache read", o.cache_read_tokens], ["cache write", o.cache_write_tokens]];
+        process.stdout.write(`  ${dim("tokens by type")}  ${types.map(([n, v]) => `${n} ${num(v)} ${dim(`(${Math.round((v / tt) * 100)}%)`)}`).join(" · ")}\n`);
+        const W = 24;
+        const barOf = (v: number, max: number) => { const f = max > 0 ? v / max : 0; const n = Math.round(f * W); return (n ? "█".repeat(n) : v > 0 ? "▏" : "") + " ".repeat(Math.max(0, W - Math.max(n, v > 0 ? 1 : 0))); };
+        type Row = { name: string; t: typeof o };
+        const section = (title: string, list: Row[]) => {
+          process.stdout.write(`\n${head(title)}\n`);
+          if (!list.length) { process.stdout.write(dim("  no requests in this window\n")); return; }
+          // Bars by cost when anything is priced, else by tokens — say which.
+          const byCost = list.some((r) => r.t.cost_usd > 0);
+          const val = (r: Row) => (byCost ? r.t.cost_usd : r.t.total_tokens);
+          const max = Math.max(...list.map(val)), sum = list.reduce((a, r) => a + val(r), 0) || 1;
+          process.stdout.write(dim(`  bars: ${byCost ? "cost" : "tokens"}\n`));
+          const lp = (v: string, n: number) => " ".repeat(Math.max(0, n - v.length)) + v;
+          for (const r of list) process.stdout.write(`  ${pad(r.name, 22)} ${key(barOf(val(r), max))} ${lp(Math.round((val(r) / sum) * 100) + "%", 4)} ${lp(num(r.t.requests), 6)} req ${lp(num(r.t.total_tokens), 11)} tok  ${usd(r.t.cost_usd)}\n`);
+        };
+        if (b.by_model) section("by model", b.by_model.map((m) => ({ name: m.model, t: m })));
+        if (b.by_day) section("by day", b.by_day.map((d) => ({ name: d.day, t: d })));
+        if (b.by_key) section("by key", b.by_key.map((k) => ({ name: `${k.key_id} ${k.label}`.slice(0, 22), t: k })));
+        break;
+      }
       if (has("--json")) { process.stdout.write(JSON.stringify({ since: windowMs ? new Date(Date.now() - windowMs).toISOString() : null, ledger: K.ledgerFile(), keys: rows }, null, 2) + "\n"); break; }
       process.stdout.write(`${head("usage by key")} ${dim(since === "all" ? "· all time" : `· last ${since}`)} ${dim("· " + K.ledgerFile().replace(HOME, "~"))}\n`);
       if (!rows.length) { process.stdout.write(dim("  no requests in this window\n")); break; }
@@ -998,7 +1036,7 @@ switch (sub) {
       for (const t of rows) process.stdout.write(`  ${pad(key(t.key_id), 10)} ${pad(t.label, 18)} ${pad(num(t.requests), 5)} ${pad(t.errors ? bad(num(t.errors)) : "0", 4)} ${pad(num(t.input_tokens), 9)} ${pad(num(t.output_tokens), 9)} ${pad(num(t.cache_read_tokens), 9)} ${pad(num(t.cache_write_tokens), 9)} ${pad(usd(t.cost_usd), 11)} ${dim(day(t.last_used))}${t.unpriced_requests ? warn(` (${t.unpriced_requests} unpriced)`) : ""}\n`);
       break;
     }
-    die("usage: apiplan keys new <label> | list | revoke <id> | usage [--since 24h|7d] [--json]");
+    die("usage: apiplan keys new <label> | list | revoke <id> | usage [--since 24h|7d|30d] [--by model|day|key] [--json]");
     break;
   }
   case "serve": {
@@ -1017,7 +1055,7 @@ switch (sub) {
     process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
     process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
     process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
-    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /v1/usage/keys · /health\n`));
+    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /v1/usage/keys[?group=model,day,key] · /health · /dashboard\n`));
     process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
     if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_SERVE_KEY_FILE (or --key-file) to require a key\n`));
     else process.stdout.write(dim(`  key required: Authorization: Bearer <key> or x-api-key: <key> · GET /health is public liveness only\n`));

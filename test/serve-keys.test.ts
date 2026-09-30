@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createKey, revokeKey, readStore, keyCache, costUsd, parseWindow, totalsByKey, readLedger, type LedgerLine } from "../src/serve-keys.ts";
+import { createKey, revokeKey, readStore, keyCache, costUsd, parseWindow, totalsByKey, readLedger, breakdown, parseGroups, dayOf, type LedgerLine, type Tally } from "../src/serve-keys.ts";
 import { serve } from "../src/api.ts";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -83,6 +83,58 @@ describe("cost and totals", () => {
   });
 });
 
+describe("breakdowns (the dashboard's pies)", () => {
+  const L = (key_id: string, extra: Partial<LedgerLine> = {}): LedgerLine => ({ ts: "2026-09-30T12:00:00.000Z", key_id, label: key_id, route: "/v1/messages",
+    provider: "anthropic", model: "claude-sonnet-5-5", stream: false, status: 200, input_tokens: 10, output_tokens: 5, cache_read_tokens: 100, cache_write_tokens: 20,
+    cost_usd: 0.001, latency_ms: 5, ...extra });
+  const lines: LedgerLine[] = [
+    L("a"), L("a", { model: "gpt-6.1-sol", provider: "openai", ts: "2026-09-29T23:30:00.000Z", cost_usd: 0.0025, input_tokens: 7, cache_write_tokens: 0 }),
+    L("b", { model: "gpt-6.1-sol", provider: "openai", output_tokens: 50, cost_usd: 0.004 }),
+    L("anonymous", { ts: "2026-09-28T08:00:00.000Z", cost_usd: 0.0001 }),
+    L("b", { status: 502, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0, model: "gpt-6.1-sol", provider: "openai" }),
+    L("a", { model: "mystery-model", cost_usd: null }),
+  ];
+  const FIELDS: (keyof Tally)[] = ["requests", "errors", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens", "unpriced_requests"];
+  const sumOf = (rows: Tally[]) => Object.fromEntries(FIELDS.map((f) => [f, rows.reduce((a, r) => a + (r[f] as number), 0)]));
+  const costSum = (rows: Tally[]) => rows.reduce((a, r) => a + r.cost_usd, 0);
+
+  test("every grouping sums to overall; anonymous is in the all-keys overall; keys do not overlap", () => {
+    const now = Date.parse("2026-10-01T00:00:00.000Z");
+    const b = breakdown(lines, parseGroups("model,day,key"), { now, sinceMs: now - 7 * 86_400_000 });
+    const all = totalsByKey(lines);
+    expect(b.overall.requests).toBe(lines.length);
+    expect(b.overall).toMatchObject(sumOf(all));
+    for (const rows of [b.by_model!, b.by_day!, b.by_key!]) {
+      expect(sumOf(rows)).toEqual(sumOf([b.overall]));
+      expect(costSum(rows)).toBeCloseTo(b.overall.cost_usd, 9);
+    }
+    expect(b.overall.cost_usd).toBeCloseTo(0.001 + 0.0025 + 0.004 + 0.0001, 9);
+    expect(b.overall.unpriced_requests).toBe(1);
+    expect(b.by_key!.map((k) => k.key_id).sort()).toEqual(["a", "anonymous", "b"]);
+    // model rows: one per model, provider carried, sorted by cost
+    expect(b.by_model!.map((m) => m.model)).toEqual(["gpt-6.1-sol", "claude-sonnet-5-5", "mystery-model"]);
+    expect(b.by_model![0]).toMatchObject({ provider: "openai", requests: 3, errors: 1 });
+    // by_day: contiguous 7-day window + today, zero-filled
+    expect(b.by_day!.length).toBe(8);
+    expect(b.by_day!.filter((d) => d.requests).map((d) => d.day)).toEqual(["2026-09-28", "2026-09-29", "2026-09-30"]);
+    // per-key sets are disjoint: the sum of each key's own breakdown is the whole
+    const own = ["a", "b", "anonymous"].map((k) => breakdown(lines, ["model"], { only: (x) => x === k }).overall);
+    expect(sumOf(own)).toEqual(sumOf([b.overall]));
+  });
+
+  test("day bucketing honours the caller's offset; groups parse strictly", () => {
+    expect(dayOf("2026-09-29T23:30:00.000Z", 0)).toBe("2026-09-29");
+    expect(dayOf("2026-09-29T23:30:00.000Z", 180)).toBe("2026-09-30");
+    const b = breakdown(lines, ["day"], { tzOffsetMin: 180, now: Date.parse("2026-10-01T00:00:00.000Z") });
+    expect(b.by_day!.find((d) => d.day === "2026-09-30")!.requests).toBe(5);
+    expect(b.by_day![0].day).toBe("2026-09-28"); // no window → from the first line
+    expect(parseGroups(undefined)).toEqual([]);
+    expect(parseGroups("all")).toEqual(["model", "day", "key"]);
+    expect(() => parseGroups("model,colour")).toThrow(/group/);
+    expect(breakdown(lines, []).by_model).toBeUndefined();
+  });
+});
+
 describe("the gate (in-process serve)", () => {
   const keysFile = join(DIR, "gate", "keys.json");
   const ledger = join(DIR, "gate", "ledger.jsonl");
@@ -133,6 +185,28 @@ describe("the gate (in-process serve)", () => {
         body: JSON.stringify({ model: "no-such-model-xyz", messages: [{ role: "user", content: "x" }] }) });
       expect(readLedger(0, ledger).at(-1)).toMatchObject({ key_id: "anonymous", label: "anonymous", route: "/v1/chat/completions", status: 404 });
     } finally { s.stop(); delete process.env.APIPLAN_SERVE_OPEN; }
+  });
+
+  test("GET /dashboard: public static HTML, no key material, no external requests, locked-down headers", async () => {
+    const s = serve({ port: 0, host: "127.0.0.1", keysFile });
+    try {
+      const r = await fetch(`${s.url}/dashboard`); // no key at all, on a keyed server
+      expect(r.status).toBe(200);
+      expect(r.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(r.headers.get("cache-control")).toBe("no-store");
+      expect(r.headers.get("content-security-policy")).toContain("connect-src 'self'");
+      const html = await r.text();
+      expect(html).toStartWith("<!doctype html>");
+      for (const secret of [k1, k2, k1.slice(-32), k2.slice(-32), "legacy-secret"]) expect(html).not.toContain(secret);
+      expect(html).not.toMatch(/apk_[a-z0-9]{8}_[A-Za-z0-9_-]{32}/);
+      // self-contained: no script/style/font fetched from anywhere; the only URL is the SVG namespace
+      expect(html).not.toMatch(/<script[^>]+src=|<link[^>]+href=|@import|url\(/);
+      expect(html.match(/https?:\/\/[^\s"']+/g)).toEqual(["http://www.w3.org/2000/svg"]);
+      expect(html).toContain("v1/usage/keys?since=");
+      expect((await fetch(`${s.url}/dashboard/`)).status).toBe(200);
+      // the data behind it still needs a key
+      expect((await fetch(`${s.url}/v1/usage/keys?group=model`)).status).toBe(401);
+    } finally { s.stop(); }
   });
 
   test("nothing configured: the gate is unchanged — any placeholder passes, ledgered anonymous", async () => {
@@ -282,7 +356,38 @@ describe("metered calls → one ledger line each, per key", () => {
     expect(all.keys.map((k: any) => k.key_id).sort()).toEqual([A.record.id, B.record.id].sort());
     expect((await fetch(`${API}/v1/usage/keys`)).status).toBe(401);
     expect((await fetch(`${API}/v1/usage/keys?since=soon`, { headers: { authorization: `Bearer ${A.key}` } })).status).toBe(400);
+    // the default body is unchanged: no breakdown unless asked for
+    expect(a.breakdown).toBeUndefined();
+    expect(Object.keys(a).sort()).toEqual(["keys", "object", "scope", "since", "until"]);
     // a client key cannot drain the server; the legacy owner key and this machine can
     expect((await fetch(`${API}/_apiplan/control`, { headers: { authorization: `Bearer ${A.key}`, "x-forwarded-for": "1.2.3.4" } })).status).toBe(401);
+  });
+  test("GET /v1/usage/keys?group=…: breakdowns obey the same visibility; sums match; the owner's overall is every key", async () => {
+    const get = async (key: string, q: string) => (await fetch(`${API}/v1/usage/keys${q}`, { headers: { authorization: `Bearer ${key}` } })).json() as any;
+    const sum = (rows: any[], f: string) => rows.reduce((x, r) => x + r[f], 0);
+    const a = await get(A.key, "?since=24h&group=model,day,key&tz=180");
+    expect(a.scope).toBe("own");
+    expect(a.breakdown.tz_offset_min).toBe(180);
+    expect(a.breakdown.overall).toMatchObject({ requests: 2, input_tokens: 400, output_tokens: 60, cache_read_tokens: 2000 });
+    expect(a.breakdown.by_key.map((k: any) => k.key_id)).toEqual([A.record.id]);
+    expect(a.breakdown.by_model).toHaveLength(1);
+    expect(a.breakdown.by_model[0]).toMatchObject({ model: "gpt-6.1-sol", provider: "openai", requests: 2 });
+    expect(sum(a.breakdown.by_day, "requests")).toBe(2);
+    const b = await get(B.key, "?group=model");
+    expect(b.breakdown.overall.requests).toBe(4);
+    expect(b.breakdown.by_day).toBeUndefined();
+    const all = await get(LEGACY_KEY, "?since=30d&group=model,day,key");
+    expect(all.scope).toBe("all");
+    const o = all.breakdown.overall;
+    expect(o.requests).toBe(a.breakdown.overall.requests + b.breakdown.overall.requests);
+    for (const f of ["requests", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"]) {
+      expect(sum(all.breakdown.by_model, f)).toBe(o[f]);
+      expect(sum(all.breakdown.by_day, f)).toBe(o[f]);
+      expect(sum(all.keys, f)).toBe(o[f]);
+    }
+    expect(sum(all.breakdown.by_model, "cost_usd")).toBeCloseTo(o.cost_usd, 9);
+    expect(all.breakdown.by_day.length).toBeGreaterThanOrEqual(30);
+    expect((await fetch(`${API}/v1/usage/keys?group=colour`, { headers: { authorization: `Bearer ${A.key}` } })).status).toBe(400);
+    expect((await fetch(`${API}/v1/usage/keys?group=day&tz=9999`, { headers: { authorization: `Bearer ${A.key}` } })).status).toBe(400);
   });
 });
