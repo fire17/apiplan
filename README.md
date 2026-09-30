@@ -27,7 +27,7 @@ APIPlan only reads an API key when you explicitly select a public-provider featu
 Gemini `--public` vision, Veo video, or Lyria music. Those calls may be billed by Google.
 
 - **Text** — `opus`, `sonnet`, `haiku`, `fable`, `astra`, `sol`, `luna`, `terra`. The alias is
-  checked against the API's own served-model field, so `opus → claude-opus-5` is
+  checked against the API's own served-model field, so `opus → claude-opus-5-5` is
   observed, not assumed.
 - **Images** — `imagine a lighthouse at dusk` draws on the same Codex endpoint as chat,
   via the built-in `image_generation` tool. No key, no separate service.
@@ -155,7 +155,7 @@ Then `apiplan` shows you everything:
 
 ```console
 $ apiplan status
-apiplan v0.7.1  ·  macOS  ·  daemon warm
+apiplan v0.9.0  ·  macOS  ·  daemon warm
 
 PROVIDERS
   ● anthropic    Claude Code subscription · 10 models
@@ -169,7 +169,7 @@ COMMANDS 37 configured in ~/.bun/bin
 
 ## A family name always means the newest model
 
-`opus` is whichever Opus is current — today `claude-opus-5`. When Opus 6 ships, `opus`
+`opus` is whichever Opus is current — today `claude-opus-5-5`. When Opus 6 ships, `opus`
 follows it, because the list comes from the provider's own model endpoint rather than a
 table someone has to remember to edit. Explicit versions never stop working:
 
@@ -187,12 +187,15 @@ table someone has to remember to edit. Explicit versions never stop working:
 
 | you type | you get |
 |---|---|
-| `opus` | newest Opus (`claude-opus-5`) |
-| `opus5` · `opus48` · `opus47` · `opus45` | that exact version |
+| `opus` | newest Opus (`claude-opus-5-5`, Opus 5.5) |
+| `opus55` · `opus5` · `opus48` · `opus47` · `opus45` | that exact version |
 | `opus4.8` · `Opus-4-8` · `OPUS_4_8` | same thing — separators and case are folded |
-| `sonnet` · `haiku` · `fable` | newest of each family |
-| `astra` | GPT-6 Astra (`gpt-6-astra`) — the newest `gpt`, so `gpt`/`codex` follow it |
-| `sol` · `luna` · `terra` | the GPT-5.6 variants, still served and still commands |
+| `sonnet` · `haiku` · `fable` | newest of each family (`sonnet` → `claude-sonnet-5-5`; `sonnet55` · `sonnet5` pin) |
+| `gpt` · `codex` · `sol` · `gpt61sol` · `sol61` | GPT-6.1 Sol (`gpt-6.1-sol`) — the newest `gpt` since 2026-09-30 |
+| `astra` · `gpt6` | GPT-6 Astra (`gpt-6-astra`) |
+| `sol6` · `luna` | GPT-6 Sol / Luna (`gpt-6-sol`, `gpt-6-luna`) |
+| `gemini` · `gemini38` | Gemini 3.8 Flash (`gemini-3.8-flash`) |
+| `gpt56sol` · `terra` | the GPT-5.6 variants, still served and still commands |
 | `gpt55` · `gpt54mini` | that exact OpenAI model |
 | `claude-opus-4-8` | a full id passes straight through |
 
@@ -200,7 +203,8 @@ table someone has to remember to edit. Explicit versions never stop working:
 $ apiplan models
 ANTHROPIC connected · just now
   MODEL                       ALIASES         EFFORT
-  claude-opus-5               opus opus5      low/medium/high/xhigh/max
+  claude-opus-5-5             opus opus55     low/medium/high/xhigh/max
+  claude-opus-5               opus5           low/medium/high/xhigh/max
   claude-opus-4-8             opus48          low/medium/high/xhigh/max
   …
 ```
@@ -499,8 +503,8 @@ for Opus 4.6.
 | `POST /v1/images/generations` | OpenAI images, `b64_json` |
 | `GET /v1/models` | 32 live models across Anthropic, OpenAI, Google, Ollama and jimmy |
 
-Verified live across all four provider families: `opus → claude-opus-5`,
-`astra → gpt-6-astra`, `sol → gpt-5.6-sol`, `gemini → gemini-3.8-flash`, and `heretic → heretic:latest`.
+Verified live across all four provider families: `opus → claude-opus-5-5`,
+`astra → gpt-6-astra`, `sol → gpt-6.1-sol`, `gemini → gemini-3.8-flash`, and `heretic → heretic:latest`.
 Official OpenAI and Anthropic SDK contracts remain covered in the test suite.
 
 It binds `127.0.0.1` only, because it hands out your subscription to anything that can

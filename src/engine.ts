@@ -17,7 +17,7 @@ import { isRealAccountIdent } from "./capacity-signal.ts";
 import { resolveLiveModel } from "./live-models.ts";
 
 export const START = performance.now();
-export const VERSION = "0.8.0";
+export const VERSION = "0.9.0";
 
 /**
  * Self-instrumentation for the perf harness. Our own cost is everything before the
