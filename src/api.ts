@@ -1552,6 +1552,258 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
   }, () => ac.abort());
 }
 
+// ─────────────────────────── OpenAI Responses (/v1/responses) ───────────────────────────
+//
+// The third front door. The Responses dialect is what the OpenAI SDK's `responses.create`,
+// the Agents SDK and Codex-style clients speak; before this route a remote caller holding
+// only that dialect got a 404. It is served by TRANSLATION, never a second pipeline: the
+// request is restated as the Chat Completions body it is equivalent to, so turns, tools,
+// effort, cache identity and the backend call all go through the path the rest of this
+// file already proves. Only the reply is rendered in Responses' own item/event shape.
+//
+// Stateless on purpose: nothing is stored, so `previous_response_id` is refused with a
+// message saying what to send instead (the whole conversation in `input`, as `store:false`
+// clients already do). Built-in tools (web_search, file_search, computer) and reasoning
+// items have no equivalent on every backend and are not forwarded.
+
+/** One Responses content part → the Chat Completions part it means, or null to drop. */
+function responsesPart(p: any): any {
+  if (typeof p === "string") return { type: "text", text: p };
+  if (!p || typeof p !== "object") return null;
+  if (p.type === "input_text" || p.type === "output_text" || p.type === "text") return typeof p.text === "string" ? { type: "text", text: p.text } : null;
+  if (p.type === "refusal") return typeof p.refusal === "string" ? { type: "text", text: p.refusal } : null;
+  if (p.type === "input_image") {
+    const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url;
+    return typeof u === "string" ? { type: "image_url", image_url: { url: u, ...(p.detail ? { detail: p.detail } : {}) } } : null;
+  }
+  if (p.type === "image_url") return p;
+  return null;
+}
+
+/**
+ * A Responses request restated as the Chat Completions body it is equivalent to.
+ * `instructions` leads as the system turn; `input` is a string or a list of items —
+ * messages, function_call and function_call_output — which map one-for-one onto chat
+ * messages, assistant tool_calls and tool messages.
+ */
+export function responsesToChat(body: any): any {
+  if (body?.previous_response_id) {
+    throw new HttpError(400, "`previous_response_id` is not supported: this server stores no responses — send the whole conversation in `input`");
+  }
+  const messages: any[] = [];
+  if (typeof body?.instructions === "string" && body.instructions) messages.push({ role: "system", content: body.instructions });
+  const content = (c: any) => (typeof c === "string" ? c : Array.isArray(c) ? c.map(responsesPart).filter(Boolean) : "");
+  const input = body?.input;
+  if (typeof input === "string") messages.push({ role: "user", content: input });
+  else if (Array.isArray(input)) {
+    for (const it of input) {
+      if (!it || typeof it !== "object") continue;
+      const type = it.type ?? (it.role ? "message" : undefined);
+      if (type === "message") {
+        if (!["user", "assistant", "system", "developer"].includes(it.role)) continue;
+        messages.push({ role: it.role, content: content(it.content) });
+      } else if (type === "function_call") {
+        const call = {
+          id: String(it.call_id ?? it.id ?? ""), type: "function",
+          function: { name: String(it.name ?? ""), arguments: typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? {}) },
+        };
+        // Parallel calls arrive as consecutive items; they belong to ONE assistant turn.
+        const last = messages.at(-1);
+        if (last?.role === "assistant") (last.tool_calls ??= []).push(call);
+        else messages.push({ role: "assistant", content: "", tool_calls: [call] });
+      } else if (type === "function_call_output") {
+        const out = it.output;
+        messages.push({
+          role: "tool", tool_call_id: String(it.call_id ?? ""),
+          content: typeof out === "string" ? out : Array.isArray(out) ? out.map(responsesPart).filter(Boolean) : JSON.stringify(out ?? ""),
+        });
+      }
+      // reasoning, item_reference and built-in tool items: nothing any backend can take.
+    }
+  } else throw new HttpError(400, "`input` is required (a string or a list of input items)");
+  const tools = (Array.isArray(body?.tools) ? body.tools : [])
+    .filter((t: any) => t?.type === "function" && typeof t.name === "string")
+    .map((t: any) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
+  const chat: any = { model: body?.model, messages, stream: !!body?.stream };
+  if (tools.length) chat.tools = tools;
+  if (tools.length && body?.tool_choice !== undefined) chat.tool_choice = body.tool_choice;
+  for (const k of ["max_output_tokens", "temperature", "reasoning", "prompt_cache_key", "service_tier", "metadata", "image_detail"]) {
+    if (body?.[k] !== undefined) chat[k] = body[k];
+  }
+  return chat;
+}
+
+/** Responses' usage object: inclusive input (OpenAI's convention), breakdowns only when measured. */
+function usageResponses(n: Norm, inTok: number, outTok: number) {
+  const pub = publishable(n);
+  return {
+    input_tokens: inTok,
+    ...(pub && n.cacheRead !== undefined ? { input_tokens_details: { cached_tokens: n.cacheRead } } : {}),
+    output_tokens: outTok,
+    ...(n.reasoning !== undefined ? { output_tokens_details: { reasoning_tokens: n.reasoning } } : {}),
+    total_tokens: inTok + outTok,
+  };
+}
+
+const respId = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "")}`;
+
+/**
+ * Render one backend call as a Responses reply. Exported with the Delta source injected so
+ * the event grammar can be tested without a provider. `stream` false → one Response object;
+ * true → the documented event sequence (created → in_progress → output_item/content_part/
+ * delta … → completed|incomplete|failed), each frame carrying `type` and `sequence_number`.
+ */
+export function renderResponses(
+  gen: () => AsyncGenerator<Delta>,
+  meta: { model: string; body: any; turns: Turn[]; system?: string; effort?: string; provider?: ProviderId },
+): { collect: () => Promise<any>; events: () => AsyncGenerator<string> } {
+  const id = respId("resp"), created = now();
+  const { body } = meta;
+  let auto = 0;
+  const mint = () => `auto:${auto++}`;
+  const shell = (status: string, output: any[], extra: Record<string, unknown> = {}) => ({
+    id, object: "response", created_at: created, status, error: null, incomplete_details: null,
+    instructions: typeof body?.instructions === "string" ? body.instructions : null,
+    max_output_tokens: typeof body?.max_output_tokens === "number" ? body.max_output_tokens : null,
+    model: meta.model, output, parallel_tool_calls: body?.parallel_tool_calls ?? true, previous_response_id: null,
+    reasoning: { effort: meta.effort ?? null, summary: null }, store: false,
+    temperature: typeof body?.temperature === "number" ? body.temperature : null,
+    text: { format: { type: "text" } }, tool_choice: body?.tool_choice ?? "auto",
+    tools: Array.isArray(body?.tools) ? body.tools : [], top_p: null, truncation: "disabled", usage: null,
+    metadata: body?.metadata ?? {}, ...extra,
+  });
+  const finish = (t: Tally, text: string, sawTool: boolean) => {
+    const n = normalizeTally(t, meta.provider);
+    const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(meta.turns, meta.system), n.input !== undefined);
+    const outTok = n.output ?? estimateOut(text);
+    const stop = stopWith(t.stopReason, sawTool);
+    const incomplete = stop === "max_tokens";
+    return {
+      status: incomplete ? "incomplete" : "completed",
+      extra: {
+        usage: usageResponses(n, inTok, outTok),
+        ...(incomplete ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+        ...(n.input === undefined || n.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
+        ...basisMark(n),
+      },
+    };
+  };
+  const msgItem = (itemId: string, text: string, status = "completed") =>
+    ({ id: itemId, type: "message", status, role: "assistant", content: [{ type: "output_text", text, annotations: [] }] });
+  const fcItem = (itemId: string, c: Call, status = "completed") =>
+    ({ id: itemId, type: "function_call", status, call_id: c.id, name: c.name, arguments: c.json || "{}" });
+
+  async function collect() {
+    let text = "";
+    const t: Tally = {};
+    const byRef = new Map<string, Call>(), order: Call[] = [];
+    for await (const d of gen()) {
+      text += d.text ?? "";
+      tally(t, d);
+      for (const ev of toolEvents(d, mint)) foldCall(byRef, order, ev);
+    }
+    const output: any[] = [];
+    if (text) output.push(msgItem(respId("msg"), text));
+    for (const c of order) output.push(fcItem(respId("fc"), c));
+    const f = finish(t, text, order.length > 0);
+    return shell(f.status, output, f.extra);
+  }
+
+  async function* events(): AsyncGenerator<string> {
+    let seq = 0;
+    const ev = (type: string, data: Record<string, unknown>) => sse({ type, sequence_number: seq++, ...data }, type);
+    yield ev("response.created", { response: shell("in_progress", []) });
+    yield ev("response.in_progress", { response: shell("in_progress", []) });
+    const output: any[] = [];
+    const t: Tally = {};
+    const byRef = new Map<string, Call>(), order: Call[] = [];
+    const callIdx = new Map<Call, { idx: number; itemId: string; done: boolean }>();
+    let all = "";
+    // The open text item, if any: text that follows a tool call opens a NEW message item.
+    let msg: { idx: number; itemId: string; text: string } | null = null;
+    function* closeMsg() {
+      if (!msg) return;
+      const item = msgItem(msg.itemId, msg.text);
+      yield ev("response.output_text.done", { item_id: msg.itemId, output_index: msg.idx, content_index: 0, text: msg.text, logprobs: [] });
+      yield ev("response.content_part.done", { item_id: msg.itemId, output_index: msg.idx, content_index: 0, part: item.content[0] });
+      yield ev("response.output_item.done", { output_index: msg.idx, item });
+      output[msg.idx] = item;
+      msg = null;
+    }
+    function* closeCall(c: Call) {
+      const s = callIdx.get(c);
+      if (!s || s.done) return;
+      s.done = true;
+      const item = fcItem(s.itemId, c);
+      yield ev("response.function_call_arguments.done", { item_id: s.itemId, output_index: s.idx, arguments: item.arguments });
+      yield ev("response.output_item.done", { output_index: s.idx, item });
+      output[s.idx] = item;
+    }
+    try {
+      for await (const d of gen()) {
+        tally(t, d);
+        if (d.text) {
+          all += d.text;
+          if (!msg) {
+            msg = { idx: output.length, itemId: respId("msg"), text: "" };
+            output.push(null);
+            yield ev("response.output_item.added", { output_index: msg.idx, item: { id: msg.itemId, type: "message", status: "in_progress", role: "assistant", content: [] } });
+            yield ev("response.content_part.added", { item_id: msg.itemId, output_index: msg.idx, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+          }
+          msg.text += d.text;
+          yield ev("response.output_text.delta", { item_id: msg.itemId, output_index: msg.idx, content_index: 0, delta: d.text, logprobs: [] });
+        }
+        for (const e of toolEvents(d, mint)) {
+          const r = foldCall(byRef, order, e);
+          if (!r.call) continue;
+          if (r.opened) {
+            yield* closeMsg();
+            const s = { idx: output.length, itemId: respId("fc"), done: false };
+            callIdx.set(r.call, s);
+            output.push(null);
+            yield ev("response.output_item.added", { output_index: s.idx, item: { ...fcItem(s.itemId, r.call, "in_progress"), arguments: "" } });
+          }
+          const s = callIdx.get(r.call);
+          if (s && r.frag) yield ev("response.function_call_arguments.delta", { item_id: s.itemId, output_index: s.idx, delta: r.frag });
+          if (e.stop) yield* closeCall(r.call);
+        }
+      }
+    } catch (e: any) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      const status = e instanceof HttpError ? e.status : 502;
+      yield ev("response.failed", { response: shell("failed", output.filter(Boolean), {
+        error: { code: status === 401 ? "invalid_api_key" : (typeof e?.upstreamType === "string" ? e.upstreamType : "server_error"), message: e?.message ?? String(e) },
+      }) });
+      return;
+    }
+    yield* closeMsg();
+    for (const c of order) yield* closeCall(c);
+    const f = finish(t, all, order.length > 0);
+    const done = shell(f.status, output.filter(Boolean), f.extra);
+    yield ev(f.status === "incomplete" ? "response.incomplete" : "response.completed", { response: done });
+  }
+  return { collect, events };
+}
+
+async function openaiResponses(body: any, signal?: AbortSignal): Promise<Response> {
+  const chat = responsesToChat(body);
+  const jimmy = isJimmy(chat.model);
+  const m = jimmy ? null : pick(chat.model);
+  const { turns, system } = fromOpenAI(chat);
+  const o = optsFrom(chat, system);
+  Object.assign(o, toolsFrom(chat, "openai"));
+  if (m) clampEffort(m, o);
+  const ac = linkAbort(signal);
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
+  const meta = { model: jimmy ? JIMMY_MODEL : m!.id, body, turns, system, effort: o.effort, provider: m?.provider };
+  if (!chat.stream) return json(await renderResponses(gen, meta).collect());
+  // Commit the head only once the upstream has actually answered — see preflight().
+  const pre = await preflight(gen());
+  if (pre.error) { ac.abort(); throw pre.error; }
+  const primed = pre.primed!;
+  return streamResponse("openai", () => renderResponses(() => replay(primed), meta).events(), () => ac.abort());
+}
+
 async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Response> {
   const jimmy = isJimmy(body?.model);
   const m = jimmy ? null : pick(body?.model);
@@ -2086,6 +2338,7 @@ export function serve(opts: ServeOpts = {}) {
         if (typeof body?.model === "string" && body.model && !isJimmy(body.model) && !resolve(body.model)) await ensureOllama(true);
         switch (path) {
           case "/v1/chat/completions": case "/chat/completions": return await openaiChat(body, req.signal);
+          case "/v1/responses": case "/responses": return await openaiResponses(body, req.signal);
           case "/v1/messages": case "/messages": return await anthropicMessages(body, req.signal);
           case "/v1/messages/count_tokens": case "/messages/count_tokens": return countTokens(body);
           case "/v1/audio/speech": case "/audio/speech": return await speech(body);

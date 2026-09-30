@@ -499,6 +499,7 @@ for Opus 4.6.
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat, streaming and not |
 | `POST /v1/messages` | Anthropic messages, streaming and not |
+| `POST /v1/responses` | OpenAI Responses, streaming and not — function tools, stateless (no `previous_response_id`); Codex CLI works with `wire_api = "responses"` |
 | `POST /v1/audio/speech` | OpenAI speech — `instructions` steers delivery, like `--as` |
 | `POST /v1/images/generations` | OpenAI images, `b64_json` |
 | `GET /v1/models` | 32 live models across Anthropic, OpenAI, Google, Ollama and jimmy |
