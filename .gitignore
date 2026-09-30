@@ -12,3 +12,7 @@ node_modules/
 dist/
 *.log
 .apiplan/
+
+# python bytecode (tests regenerate it)
+__pycache__/
+*.pyc
