@@ -2232,8 +2232,14 @@ export function serve(opts: ServeOpts = {}) {
   const token = inboundKey(opts);
   // A public bind with no key would hand every subscription on this machine to anyone who
   // can reach the port. Refuse to start rather than serve that.
-  if (!isLoopbackHost(hostname) && !token) {
-    throw new Error(`apiplan serve: refusing to bind ${hostname} without a key — set APIPLAN_SERVE_KEY_FILE (or --key-file) / APIPLAN_SERVE_KEY`);
+  // Owner opt-in only (fire17, 2026-10-01 01:05: "תאפשר לי פשוט לקרוא לו בלי שום מפתח"):
+  // APIPLAN_SERVE_OPEN=1 serves a public bind with NO key, until per-client keys exist.
+  const openOptIn = process.env.APIPLAN_SERVE_OPEN === "1";
+  if (!isLoopbackHost(hostname) && !token && !openOptIn) {
+    throw new Error(`apiplan serve: refusing to bind ${hostname} without a key — set APIPLAN_SERVE_KEY_FILE (or --key-file) / APIPLAN_SERVE_KEY, or APIPLAN_SERVE_OPEN=1 to serve it open on purpose`);
+  }
+  if (!isLoopbackHost(hostname) && !token && openOptIn) {
+    process.stderr.write(`apiplan serve: WARNING — ${hostname} is OPEN (APIPLAN_SERVE_OPEN=1): anyone who reaches this port spends these subscriptions\n`);
   }
   const cors = opts.cors ?? process.env.APIPLAN_CORS_ORIGIN ?? "";
   const corsHeaders: Record<string, string> = cors ? {
