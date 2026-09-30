@@ -251,9 +251,11 @@ export function localVoiceFor(text: string): string | null {
   ];
   let want: string[] | null = null;
   for (const [re, names] of script) if (re.test(text)) { want = names; break; }
+  if (!want) return null;                 // Latin text: the system default is right — no voice list needed
   const have = new Set<string>();
   try {
-    const r = Bun.spawnSync(["say", "-v", "?"], { stderr: "ignore" });
+    // A wedged macOS speech daemon makes `say -v ?` block forever; bound it so --speak and tests never hang.
+    const r = Bun.spawnSync(["say", "-v", "?"], { stderr: "ignore", timeout: 2000 });
     for (const line of (r.stdout?.toString() ?? "").split("\n")) {
       const m = line.match(/^([^\s]+(?: [^\s]+)?)\s{2,}/);
       if (m) have.add(m[1].trim());
