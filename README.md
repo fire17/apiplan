@@ -110,6 +110,47 @@ The global `gemini` command can also use an existing Gemini API key from
 `APIPLAN_GEMINI_API_KEY`, `GEMINI_API_KEY`, or `~/.config/gemini/api_key`. That key is
 only sent to Google's Gemini API and is required for `--public`, `--video`, and `--song`.
 
+### OpenCode Zen — `spark` → Muse Spark 1.3
+
+The `zen` provider talks to OpenCode Zen (`https://opencode.ai/zen/v1`) with an API key,
+and it is the one provider here that is not a subscription you already have. Connect it
+either way:
+
+```console
+$ opencode auth login          # choose "opencode"; the key lands in ~/.local/share/opencode/auth.json
+$ export OPENCODE_API_KEY=…    # or just put it in the environment
+```
+
+Then `spark` is Muse Spark 1.3 — `/model spark` in any harness pointed at `apiplan serve`,
+or `apiplan models` to see the rest. With no key, apiplan says so and dials nothing:
+
+```console
+$ apiplan status
+  ○ zen          not connected · no OpenCode Zen key (OPENCODE_API_KEY or opencode auth login)
+```
+
+**The free tier is not portable, and apiplan does not pretend otherwise.** OpenCode's
+zero-cost ids (`muse-spark-1.3-contributor-free` and friends) are deliberately NOT listed,
+because the vendor refuses them outside its own client — a call without an OpenCode session
+header answers `400 MissingSessionID`: *"Error from provider (Console): OpenCode's free tier
+can only be used in OpenCode"*. apiplan sends no `x-opencode-*` header of any kind, and a
+test asserts it never starts (`test/zen.test.ts`), so the only zen route here is the paid,
+documented one.
+
+**What is ported, said plainly.** OpenCode Zen serves 102 model ids across four wire
+dialects; this provider speaks the Responses dialect, which is 28 of them — 26 paid ids
+(the muse-spark pair, the gpt-5.x / 5.6 / 6 family, grok-4.5/4.6, grok-build) plus the 2
+free ones it hides. The other 74 — 46 openai-compatible chat, 20 anthropic-dialect, 8
+google-dialect — are **not addressable yet**; `apiplan models --refresh` prints those
+counts rather than leaving the gap invisible. Prices and context windows come from
+opencode's own catalog (`~/.cache/opencode/models.json`) and `test/roster.test.ts` re-reads
+that file, so a vendor price change becomes a red test instead of a stale estimate.
+
+> **Status, honestly:** the wire is proven against a recorded stub, not against
+> opencode.ai — this machine has no zen key, so no live turn has been billed or measured.
+> See `docs/ZEN.md` for everything that was read out of opencode itself, and for the one
+> question a key settles.
+
 Then `apiplan` shows you everything:
 
 ```console
@@ -277,6 +318,14 @@ over OpenAI's **realtime** socket (`gpt-realtime`), which accepts the ChatGPT lo
 streams back PCM16 that needs a 44-byte wav header and no codec at all. Ten voices:
 `alloy ash ballad coral echo sage shimmer verse marin cedar`.
 
+Choose a voice model independently of the text model with `--live-model` (or
+`--realtime-model`): `tts --live-model gpt-realtime-2.1 --play 'Hello'` or
+`apiplan talk --live-model gpt-realtime-mini`. `apiplan live-models` lists transports
+and capabilities; `apiplan live-check --live-model <id>` checks subscription audio.
+The default remains `gpt-realtime`. The experimental `codex-live` WebRTC adapter is
+implemented but the local subscription smoke test was denied with HTTP 403; it is
+not yet verified usable. See [voice models and verification](VOICE_MODELS.md).
+
 ### Direct the performance, not just the words
 
 `gpt-realtime` is a conversational speech model, so **how** a line is said is a second
@@ -403,6 +452,44 @@ back into.
 to the current build, and keeps clients on the same URL. The cache rollout used that exact
 path: 40/40 parallel continuity probes returned 200 after the swap; repeat live calls
 reported **16,226 Anthropic cache-read tokens** and **4,864 OpenAI cached tokens**.
+
+### Adding a provider: declare `usageBasis` + `cache` or the contract suite fails
+
+The two vendors mean **opposite** things by "input tokens". Anthropic's `input_tokens`
+*excludes* the cached prefix (`total = cache_read + cache_creation + input`); OpenAI's
+*includes* it (its own cost sample computes `input - cached - cache_write`). Since the
+dialect and the backend are independent here, every counter crosses from one convention
+into the other — and copying a number straight through the other's field name is a real
+accounting fault worth the size of the cached prefix, which on an agent turn is most of
+the prompt.
+
+So each `Provider` in `src/providers.ts` declares its own two facts, beside the adapter
+that reads that vendor's wire and quotes the doc sentence it came from:
+
+```ts
+usageBasis: "inclusive" | "exclusive";
+cache: {
+  kind: "implicit-prefix" | "explicit-breakpoint" | "cached-content-resource" | "none";
+  minTokens?: number;   // lowest floor across active models — omit if undocumented
+  ttlMs?: number;       // documented default lifetime — omit if undocumented
+  identity: "prompt_cache_key" | "cache_control" | "cachedContent" | "none";
+};
+```
+
+Both are **required**, which is the whole point. They replaced a lookup table inside the
+server, where a forgotten provider was not a compile error — it silently defaulted to
+`exclusive` and double-counted every cached prefix that vendor served. Now a new provider
+that omits them does not typecheck, and `test/provider-cache-contract.test.ts` asserts
+every entry declares both, that a `kind` and its `identity` agree, that any number present
+is a real one, and that **each basis round-trips through both fronts with disjoint
+buckets** — proven against a live loopback server, not just inspected.
+
+Two rules for the optional numbers: **documented-or-absent** (an undocumented value would
+read as measured, so it is omitted — absent means "the vendor does not say", never zero or
+forever), and `minTokens` is the *lowest* floor across a vendor's active models, a
+necessary-not-sufficient gate. Below it nothing caches; at or above it the threshold is
+per-model, and non-monotonic in version — Anthropic asks 512 tokens for Opus 5 but 4,096
+for Opus 4.6.
 
 | endpoint | shape |
 |---|---|
@@ -575,3 +662,25 @@ MIT · built with [Claude Code](https://claude.com/claude-code)
 <sub><i>Measured, not assumed — see DARWIN.md for the rounds that failed first.</i></sub>
 
 </div>
+
+## Standalone ChatGPT website client
+
+`chatgpt` opens a terminal workspace for your signed-in ChatGPT website account; `apiplan chatgpt …` runs the same CLI. It includes resumable local takeout, media export, invoices and website controls, with explicit coverage receipts. See the [ChatGPT quickstart](docs/CHATGPT-QUICKSTART.md) for setup, commands and current verification limits.
+
+### Website conversation harness
+
+The harness lets the actual ChatGPT website model coordinate bounded child conversations through framed local tools. It uses a dedicated browser surface and conversation for every agent, defaults to Chat / Latest / Instant, saves private receipts, and refuses to replay an uncertain website submission.
+
+```console
+# Staged integration: echo, create/list/send/wait agents, then verify the run
+chatgpt harness test --turns 6 --jsonl
+
+# Run your own bounded objective (1–20 parent turns)
+chatgpt harness run --text "Have two agents compare approaches and report their evidence" --turns 8 --jsonl
+
+# Inspect durable runs without submitting another turn
+chatgpt harness list --json
+chatgpt harness status --run-id RUN_ID --json
+```
+
+`harness test` requires 5–20 parent turns. The attached ChatGPT account and user identity must already be verified; the harness never launches or restarts the browser. Tool calls are strict framed JSON, deduplicated by call ID and canonical payload. The available tools are `echo`, `agents.create`, `agents.list`, `agents.send`, and bounded `agents.wait`.

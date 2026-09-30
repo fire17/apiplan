@@ -6,6 +6,9 @@
 
 **Why.** fire17 wanted the frontier models as ordinary Unix commands on the plan he
 already pays for. `VISION.md` is the verbatim founding brief and governs everything here.
+**Before touching cache/usage/provider code:** read `ORACLE.md` (symptom-keyed playbooks,
+ADRs, invariants, escalation contract) and `UNKNOWNS.md`. If reality diverges from the
+oracle, log it in the oracle's field log — do not improvise past a broken map.
 
 ## Current state (v0.8.0, honest)
 
