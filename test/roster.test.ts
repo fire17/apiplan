@@ -1,7 +1,7 @@
 // The harness roster: one `apiplan` provider, in apiplan's default order, labels that
 // steer people and agents away from the models fire17 does not want picked.
 import { expect, test, describe } from "bun:test";
-import { harnessRoster, rosterYaml, applyRoster, HARNESS_ORDER, DUMB_LABEL, JIMMY_ID, DOCUMENTED, entryFor, harnessEfforts, OM_EFFORTS } from "../src/roster.ts";
+import { harnessRoster, rosterYaml, applyRoster, HARNESS_ORDER, DUMB_LABEL, NOT_DUMB, JIMMY_ID, DOCUMENTED, entryFor, harnessEfforts, OM_EFFORTS } from "../src/roster.ts";
 import { resolve, ANTHROPIC_EFFORTS } from "../src/registry.ts";
 import type { Model } from "../src/registry.ts";
 // The zen parity test reads opencode's own catalog file — the one external input in this
@@ -16,7 +16,7 @@ describe("harness roster", () => {
     // ~/.apiplan catalog cache (gpt-6-sol/luna appear only after a refresh at client_version
     // >= 0.155.0), so the assertion is "the ids that ARE present open the roster, in
     // HARNESS_ORDER's order" rather than a fixed slice.
-    const present = HARNESS_ORDER.filter((x) => !x.endsWith("*") && ids.includes(x));
+    const present = HARNESS_ORDER.slice(0, HARNESS_ORDER.findIndex((x) => x.endsWith("*"))).filter((x) => ids.includes(x)); // head = everything before the first wildcard block
     expect(present.length).toBeGreaterThanOrEqual(8);
     expect(ids.slice(0, present.length)).toEqual(present);
     expect(ids.indexOf("claude-opus-5-5")).toBe(ids.indexOf("claude-opus-5") - 1); // Opus 5.5 leads the Opus block
@@ -24,13 +24,14 @@ describe("harness roster", () => {
     const gem = ids.filter((i) => i.startsWith("gemini-"));
     expect(gem.length).toBeGreaterThanOrEqual(4);
     expect(ids.indexOf(gem[0])).toBe(head);                        // gemini block right after jimmy
-    expect(ids.indexOf(`claude-sonnet-5-5 ${DUMB_LABEL}`)).toBe(head + gem.length);
+    expect(ids.indexOf("claude-sonnet-5-5")).toBe(head + gem.length);             // Sonnet 5.5: exempt from the label
     expect(ids.indexOf(`claude-sonnet-5 ${DUMB_LABEL}`)).toBe(head + 1 + gem.length);
     expect(ids[head + 2 + gem.length].startsWith("claude-haiku-") && ids[head + 2 + gem.length].endsWith(DUMB_LABEL)).toBe(true);
   });
-  test("sonnet and haiku carry the warning in id AND name, nothing else does", () => {
+  test("sonnet and haiku carry the warning in id AND name, nothing else does (Sonnet 5.5 exempt)", () => {
+    expect(NOT_DUMB.has("claude-sonnet-5-5")).toBe(true);
     for (const e of harnessRoster()) {
-      const dumb = /claude-(sonnet|haiku)/.test(e.id);
+      const dumb = /claude-(sonnet|haiku)/.test(e.id) && !e.id.startsWith("claude-sonnet-5-5");
       expect(e.id.endsWith(DUMB_LABEL)).toBe(dumb);
       expect(e.name.endsWith(DUMB_LABEL)).toBe(dumb);
     }
@@ -118,7 +119,7 @@ describe("harness roster", () => {
     expect(by[`claude-sonnet-5 ${DUMB_LABEL}`].cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
     // 2026-09-30 pricing page: Opus 5.5 $4/$20, cache hits 0.05x; Sonnet 5.5 $2/$10
     expect(by["claude-opus-5-5"].cost).toEqual({ input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 });
-    expect(by[`claude-sonnet-5-5 ${DUMB_LABEL}`].cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
+    expect(by["claude-sonnet-5-5"].cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
     expect(by[`claude-haiku-4-5-20251001 ${DUMB_LABEL}`]).toMatchObject({ contextWindow: 200000, maxTokens: 64000, cost: { input: 1, output: 5 } });
     expect(by[JIMMY_ID].cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     expect(rosterYaml()).toContain("cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5,");

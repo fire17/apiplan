@@ -31,7 +31,9 @@ export const HARNESS_ORDER = [
 ];
 /** Labelled so nobody — human or agent — picks them for real work. */
 export const DUMB_LABEL = "(dumb - do not use)";
-const isDumb = (m: Model) => m.provider === "anthropic" && (m.family === "sonnet" || m.family === "haiku");
+/** Exempt by the owner's word (WhatsApp 2026-10-01 00:28, "כן תעשה 1,2,3"): Sonnet 5.5 is a real pick. */
+export const NOT_DUMB = new Set(["claude-sonnet-5-5"]);
+const isDumb = (m: Model) => m.provider === "anthropic" && (m.family === "sonnet" || m.family === "haiku") && !NOT_DUMB.has(m.id);
 
 /**
  * Rates that replace the base card for the WHOLE request once the prompt crosses
