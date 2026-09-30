@@ -8,10 +8,13 @@ import { join, basename as basenameOf } from "node:path";
 import { PROVIDERS, providerFor, refreshGoogleCatalog } from "../src/providers.ts";
 import { models, aliasesFor, cacheAge, cacheStale, saveModels, resolve, unparseable, type Model, type ProviderId } from "../src/registry.ts";
 import * as C from "../src/commands.ts";
+import * as R from "../src/registry.ts";
 import { osLabel, onPath, defaultBinDir, whichSync, IS_WIN, STATE_DIR, HOME, readJson, writeJson } from "../src/platform.ts";
 import { OLLAMA_BASE, OLLAMA_META_FILE, refreshOllama } from "../src/providers-ollama.ts";
+import { refreshZenCatalog, zenModelsFile } from "../src/providers-zen.ts";
 import { VERSION, daemonAlive, daemonStop, runDaemon, die } from "../src/engine.ts";
 import { rosterYaml, applyRoster } from "../src/roster.ts";
+import { LIVE_MODELS, DEFAULT_LIVE_MODEL, resolveLiveModel, requireLiveCapability, liveModelArgument } from "../src/live-models.ts";
 
 // ── presentation ──────────────────────────────────────────────────────────────
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -33,7 +36,7 @@ function providerViews(): ProvView[] {
     return { id, label: p.label, connected: pr.connected, detail: pr.detail, hint: pr.loginHint, count: models(id).length, age: cacheAge(id) };
   });
 }
-const ageLabel = (ms: number | null) => (ms === null ? "never refreshed" : ms < 60_000 ? "just now" : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m ago` : `${Math.round(ms / 3_600_000)}h ago`);
+const ageLabel = (ms: number | null, provider?: ProviderId) => (provider === "online" ? "built-in catalog" : ms === null ? "never refreshed" : ms < 60_000 ? "just now" : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m ago` : `${Math.round(ms / 3_600_000)}h ago`);
 
 /** Name anything the provider serves that we can't address, so nothing vanishes quietly. */
 function dropNote(id: ProviderId, list: { id: string }[]): string {
@@ -53,10 +56,15 @@ function dropNote(id: ProviderId, list: { id: string }[]): string {
  * this floor (the newest Codex release when this was written), the installed Codex's own
  * cache stamp, its update-check stamp, and APIPLAN_CODEX_CLIENT_VERSION. The floor only
  * ever moves UP with the user's Codex, never down. The file stays as the offline fallback.
+ * GPT-6 Sol and Luna need 0.155.0 (observed live 2026-09-29: absent at 0.153.4/0.154.9,
+ * listed from 0.155.0 up to 99.0.0). P1 owns the single constant (CODEX_CLIENT_VERSION_FLOOR
+ * in src/registry.ts); until it lands the literal below is the same number.
  */
-const CODEX_CLIENT_VERSION = "0.153.4";
+const CODEX_CLIENT_VERSION: string = (R as any).CODEX_CLIENT_VERSION_FLOOR ?? "0.155.0";
 const semverMax = (...vs: (string | undefined)[]) => vs.filter((v): v is string => !!v && /^\d+\.\d+\.\d+$/.test(v))
   .sort((a, b) => { const x = a.split(".").map(Number), y = b.split(".").map(Number); return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]); }).at(-1) ?? CODEX_CLIENT_VERSION;
+/** a < b, both x.y.z (a malformed a counts as below). */
+const semverLt = (a: string | undefined, b: string) => !a || !/^\d+\.\d+\.\d+$/.test(a) || (semverMax(a, b) === b && a !== b);
 type CatalogEntry = { id: string; label: string; efforts?: string[]; contextWindow?: number };
 /**
  * The catalog's `ultra` ("maximum reasoning with automatic task delegation") is a Codex
@@ -66,31 +74,48 @@ type CatalogEntry = { id: string; label: string; efforts?: string[]; contextWind
  * Advertising it would make `-e ultra` fail on the models that list it, so it is dropped.
  */
 const RESPONSES_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const fromCodexCatalog = (raw: any): CatalogEntry[] => (raw?.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
+// P1's registry version also keeps rank (same-version tie-break), input modalities and the
+// default effort; prefer it, keep this one as the fallback for a registry without it.
+const fromCodexCatalogLocal = (raw: any): CatalogEntry[] => (raw?.models ?? []).filter((m: any) => m.supported_in_api !== false).map((m: any) => ({
   id: m.slug ?? m.id, label: m.display_name ?? m.slug,
   efforts: (m.supported_reasoning_levels ?? []).map((e: any) => e.effort).filter((e: any) => typeof e === "string" && RESPONSES_EFFORTS.has(e)),
   ...(typeof m.context_window === "number" ? { contextWindow: m.context_window } : {}),
 })).filter((m: any) => m.id);
-async function refreshOpenaiCatalog(p = PROVIDERS.openai): Promise<{ list: CatalogEntry[]; source: string }> {
+const fromCodexCatalog = (raw: any): CatalogEntry[] => (typeof (R as any).fromCodexCatalog === "function" ? (R as any).fromCodexCatalog(raw) : fromCodexCatalogLocal(raw));
+async function refreshOpenaiCatalog(p = PROVIDERS.openai): Promise<{ list: CatalogEntry[]; source: string; clientVersion: string; live: boolean }> {
   const file = join(HOME, ".codex", "models_cache.json");
   const cached = readJson<any>(file, {});
-  const version = semverMax(CODEX_CLIENT_VERSION, cached.client_version, readJson<any>(join(HOME, ".codex", "version.json"), {}).latest_version, process.env.APIPLAN_CODEX_CLIENT_VERSION);
+  let version = semverMax(CODEX_CLIENT_VERSION, cached.client_version, readJson<any>(join(HOME, ".codex", "version.json"), {}).latest_version, process.env.APIPLAN_CODEX_CLIENT_VERSION);
   try {
     const c = p.creds();
     const base = process.env.APIPLAN_OPENAI_BASE || "https://chatgpt.com";
-    const r = await fetch(`${base}/backend-api/codex/models?client_version=${encodeURIComponent(version)}`, {
-      headers: { authorization: `Bearer ${c.token}`, "chatgpt-account-id": c.account ?? "", originator: process.env.APIPLAN_ORIGINATOR || "codex_cli_rs" },
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const list = fromCodexCatalog(await r.json());
+    const get = async (v: string) => {
+      const r = await fetch(`${base}/backend-api/codex/models?client_version=${encodeURIComponent(v)}`, {
+        headers: { authorization: `Bearer ${c.token}`, "chatgpt-account-id": c.account ?? "", originator: process.env.APIPLAN_ORIGINATOR || "codex_cli_rs" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    };
+    // Probe (P1, src/registry.ts): read once as a far-future client only to LEARN the version the
+    // catalog needs, then ask as max(floor, that, stamps, env) — the next model shows up with no
+    // code edit. Never stored: the server varies metadata by version. Best-effort; APIPLAN_CODEX_CATALOG_PROBE=0 disables.
+    let hidden = "";
+    let probeIds: string[] = [];
+    const PROBE = (R as any).CODEX_CATALOG_PROBE_VERSION, needed = (R as any).neededClientVersion;
+    if (PROBE && typeof needed === "function" && process.env.APIPLAN_CODEX_CATALOG_PROBE !== "0") {
+      try { const raw = await get(PROBE); version = semverMax(version, needed(raw) ?? undefined); probeIds = fromCodexCatalog(raw).map((m) => m.id); } catch {}
+    }
+    const list = fromCodexCatalog(await get(version));
     if (!list.length) throw new Error("empty catalog");
-    return { list, source: `the live Codex catalog (as client ${version})` };
+    const missing = probeIds.filter((id) => !list.some((m) => m.id === id));
+    if (missing.length) hidden = ` · hidden at ${version}: ${missing.join(", ")}`;
+    return { list, source: `the live Codex catalog (as client ${version})${hidden}`, clientVersion: version, live: true };
   } catch (e: any) {
     // Offline, or the endpoint moved: Codex's own file is still the truth as of its stamp.
     const list = fromCodexCatalog(cached);
     if (!list.length) throw new Error(`catalog fetch failed (${e?.message ?? e}) and no models in ${file.replace(HOME, "~")}`);
-    return { list, source: `codex cache (fetched ${cached.fetched_at ?? "?"}; live fetch failed: ${e?.message ?? e})` };
+    return { list, source: `codex cache (fetched ${cached.fetched_at ?? "?"}; live fetch failed: ${e?.message ?? e})`, clientVersion: String(cached.client_version ?? "unknown"), live: false };
   }
 }
 
@@ -99,7 +124,14 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
   const notes: string[] = [];
   for (const id of (only ? [only] : (Object.keys(PROVIDERS) as ProviderId[]))) {
     const p = PROVIDERS[id];
-    if (!p.probe().connected) { notes.push(`${id}: not connected — kept previous list`); continue; }
+    const connected = p.probe().connected;
+    // A CATALOG READ THAT NEEDS NO CREDENTIAL MUST NOT BE SKIPPED FOR WANT OF ONE. `zen`'s
+    // model list comes from a local file opencode wrote, not from an authenticated endpoint,
+    // so an operator without a Zen key can still see what the gateway serves — and, more to
+    // the point, still sees the counts of what this port does NOT serve. Behind the gate, that
+    // note would be reachable only by someone who already has a key, i.e. never printed for
+    // the person most likely to be puzzled by a partial list.
+    if (!connected && id !== "zen") { notes.push(`${id}: not connected — kept previous list`); continue; }
     try {
       if (id === "anthropic") {
         const c = p.creds();
@@ -120,9 +152,31 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
         // server calls the SAME code to register itself at startup — see ensureOllama().
         const r = await refreshOllama();
         notes.push(`${id}: ${r.count} local models from ${r.base}/api/tags · ${r.withTools} with tool support${dropNote(id, models(id).map((m) => ({ id: m.id })))}`);
+      } else if (id === "zen") {
+        // A LOCAL re-read, not a fetch: opencode writes its catalog to
+        // ~/.cache/opencode/models.json and its own upstream is models.dev, which this gateway
+        // has never spoken to — see refreshZenCatalog(). The counts are printed because the
+        // port is a SUBSET: Zen publishes four wire dialects and this adapter serves one, so a
+        // silent list would read as "these are all the zen models", which is false.
+        const r = await refreshZenCatalog();
+        saveModels(id, r.list);
+        const d = r.dropped;
+        const scanned = r.source === "file"
+          ? `${r.count} Responses-dialect models from ${zenModelsFile().replace(HOME, "~")}`
+          : `${r.count} Responses-dialect models from the built-in 2026-09-12 snapshot (no readable ${zenModelsFile().replace(HOME, "~")} — nothing scanned, so the counts below are not measured)`;
+        const hidden = r.source === "file"
+          ? ` · ${d.free.length} free-tier ids hidden — opencode-only (vendor: "OpenCode's free tier can only be used in OpenCode") · ${d.chat.length} chat-completions / ${d.anthropic.length} anthropic / ${d.google.length} google dialect ids not yet ported`
+          : "";
+        // The list is real either way; whether a CALL would work is a separate fact, and
+        // saying so here stops "26 models" reading as "26 models you can use".
+        const keyless = connected ? "" : " · no key yet, so this is the catalog only — `opencode auth login` or OPENCODE_API_KEY before a call";
+        notes.push(`${id}: ${scanned}${hidden}${dropNote(id, r.list)}${keyless}`);
       } else {
         const r = await refreshOpenaiCatalog(p);
         saveModels(id, r.list);
+        // Provenance sidecar: WHICH client version produced this list — `doctor` reads it to say
+        // whether newer models may be hidden (a list fetched below the floor lacks GPT-6 Sol/Luna).
+        writeJson(join(STATE_DIR, "models.openai.meta.json"), { fetched_at: Date.now(), client_version: r.clientVersion, live: r.live, source: r.source });
         notes.push(`${id}: ${r.list.length} models from ${r.source}${dropNote(id, r.list)}`);
       }
     } catch (e: any) { notes.push(`${id}: refresh failed — ${e?.message ?? e} (kept previous list)`); }
@@ -132,8 +186,7 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
 
 /**
  * Speech has two distinct voice sets and the difference matters: read-aloud runs on
- * the subscription with ChatGPT's product voices, free-text speech needs a billed key
- * and uses OpenAI's API voices. Showing them together is what stops the confusion.
+ * the subscription with ChatGPT's product voices; fresh text uses a separate live model.
  */
 async function cmdVoices() {
   for (const p of Object.values(PROVIDERS)) {
@@ -162,7 +215,7 @@ async function cmdStatus() {
   process.stdout.write(head("PROVIDERS") + "\n");
   for (const p of providerViews()) {
     process.stdout.write(`  ${p.connected ? DOT_OK : DOT_BAD} ${pad(bold(p.id), 22)} ${p.detail}\n`);
-    process.stdout.write(`    ${dim(p.label)} ${dim("·")} ${dim(`${p.count} models, ${ageLabel(p.age)}`)}\n`);
+    process.stdout.write(`    ${dim(p.label)} ${dim("·")} ${dim(`${p.count} models, ${ageLabel(p.age, p.id)}`)}\n`);
     if (!p.connected && p.hint) process.stdout.write(`    ${warn("→ " + p.hint)}\n`);
   }
   const cfg = C.load();
@@ -184,7 +237,7 @@ function cmdModels(which?: string) {
   for (const [prov, ms] of byProv) {
     const pv = PROVIDERS[prov as ProviderId];
     const conn = pv.probe().connected;
-    process.stdout.write(`\n${head(prov.toUpperCase())} ${conn ? ok("connected") : bad("not connected")} ${dim(`· ${ageLabel(cacheAge(prov as ProviderId))}${cacheStale(prov as ProviderId) ? " (stale — apiplan models --refresh)" : ""}`)}\n`);
+    process.stdout.write(`\n${head(prov.toUpperCase())} ${conn ? ok("connected") : bad("not connected")} ${dim(`· ${ageLabel(cacheAge(prov as ProviderId), prov as ProviderId)}${cacheStale(prov as ProviderId) ? " (stale — apiplan models --refresh)" : ""}`)}\n`);
     const wId = Math.max(5, ...ms.map((m) => m.id.length)) + 2;
     const wAl = Math.max(7, ...ms.map((m) => aliasesFor(m).join(" ").length)) + 2;
     process.stdout.write(dim(`  ${pad("MODEL", wId)}${pad("ALIASES", wAl)}EFFORT\n`));
@@ -218,8 +271,9 @@ function cmdCommands() {
 async function cmdDoctor() {
   const cfg = C.load();
   const bd = C.binDirOf(cfg);
-  process.stdout.write(`${head("DOCTOR")}\n`);
-  const rows: [string, boolean | "warn", string][] = [];
+  const json = has("--json");
+  // state: true = ok · "warn" · false = bad · "info" = a fact worth showing, never a problem
+  const rows: [string, boolean | "warn" | "info", string][] = [];
   rows.push(["runtime", true, `${process.execPath} (bun ${Bun.version})`]);
   rows.push(["platform", true, `${osLabel()} ${process.arch}`]);
   rows.push(["state dir", true, STATE_DIR.replace(HOME, "~")]);
@@ -230,15 +284,63 @@ async function cmdDoctor() {
   rows.push(["bin dir", true, bd.replace(HOME, "~")]);
   rows.push(["bin dir on PATH", onPath(bd) ? true : "warn", onPath(bd) ? "yes" : `no — add it: export PATH="${bd.replace(HOME, "$HOME")}:$PATH"`]);
   for (const p of providerViews()) rows.push([`provider ${p.id}`, p.connected, p.connected ? p.detail : `${p.detail} → ${p.hint}`]);
-  rows.push(["daemon", (await daemonAlive()) ? true : "warn", (await daemonAlive()) ? "warm" : "cold (starts on first call)"]);
+  // The Codex catalog hides models newer than the client that asks (see CODEX_CLIENT_VERSION):
+  // a list fetched below the floor silently lacks GPT-6 Sol/Luna, and `luna` quietly means 5.6.
+  const meta = readJson<{ client_version?: string; fetched_at?: number; live?: boolean }>(join(STATE_DIR, "models.openai.meta.json"), {});
+  const refreshHint = "apiplan models --refresh --provider openai";
+  if (!meta.client_version) rows.push(["catalog openai", "warn", `fetched by an older apiplan (client version unknown) — ${refreshHint}`]);
+  else if (semverLt(meta.client_version, CODEX_CLIENT_VERSION)) rows.push(["catalog openai", "warn", `fetched as client ${meta.client_version}, below floor ${CODEX_CLIENT_VERSION} — newer models hidden · ${refreshHint}`]);
+  else if (meta.live === false) rows.push(["catalog openai", "warn", `from codex's own cache (live fetch failed) as ${meta.client_version} — ${refreshHint}`]);
+  else rows.push(["catalog openai", true, `client ${meta.client_version} · ${ageLabel(cacheAge("openai"))}`]);
+  const six = models("openai").filter((m) => m.version[0] === 6).map((m) => m.id);
+  const fb = typeof (R as any).fallbackIds === "function" ? ((R as any).fallbackIds("openai") as string[]).filter((id) => /^gpt-\d/.test(id)) : [];
+  const missing = fb.filter((id) => !models("openai").some((m) => m.id === id));
+  if (!six.length) rows.push(["gpt-6 lineup", "warn", `no GPT-6 model in the cached catalog — ${refreshHint}`]);
+  else if (missing.length) rows.push(["gpt-6 lineup", "warn", `${six.join(", ")} · cache older than this apiplan: missing ${missing.join(", ")} — ${refreshHint}`]);
+  else rows.push(["gpt-6 lineup", true, six.join(", ")]);
+  const clip = IS_WIN ? "powershell" : process.platform === "darwin" ? (whichSync("pngpaste") ? "pngpaste" : "osascript fallback (pngpaste optional)") : whichSync("wl-paste") ? "wl-paste" : whichSync("xclip") ? "xclip" : "";
+  rows.push(["image input", clip ? true : "warn", clip ? `-i file/URL/data:/- · clipboard via ${clip}` : "-i files work; clipboard needs wl-paste or xclip"]);
+  rows.push(["aliases", "info", ["luna", "sol", "astra", "terra", "gpt", "luna6", "sol6", "luna56", "sol56"].map((a) => `${a}→${resolve(a)?.id ?? "?"}`).join(" ")]);
+  const alive = await daemonAlive();
+  rows.push(["daemon", alive ? true : "warn", alive ? "warm" : "cold (starts on first call)"]);
+  // A warm daemon runs the code it was STARTED with; edits since then are invisible to it.
+  if (!IS_WIN) {
+    try {
+      const ps = Bun.spawnSync(["ps", "-axo", "pid=,lstart=,command="], { stdout: "pipe", stderr: "ignore" }).stdout.toString();
+      const root = join(import.meta.dir, "..");
+      // What a daemon runs: every src module plus its own entry file (ask.ts or apiplan.ts).
+      const fs = require("node:fs");
+      let srcNewest = 0;
+      for (const f of fs.readdirSync(join(root, "src")) as string[]) if (f.endsWith(".ts")) srcNewest = Math.max(srcNewest, fs.statSync(join(root, "src", f)).mtimeMs);
+      const entryMtime = (cmd: string) => { try { return fs.statSync(join(root, "bin", /apiplan\.ts/.test(cmd) ? "apiplan.ts" : "ask.ts")).mtimeMs; } catch { return 0; } };
+      const hhmm = (t: number) => new Date(t).toTimeString().slice(0, 5);
+      const procs = ps.split("\n").map((l) => l.match(/^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/)).filter((m): m is RegExpMatchArray => !!m && /ask\.ts --daemon|apiplan\.ts daemon/.test(m[3]));
+      if (!procs.length) rows.push(["daemon code", "info", "no daemon process"]);
+      for (const m of procs) {
+        const started = Date.parse(m[2]);
+        const newest = Math.max(srcNewest, entryMtime(m[3]));
+        if (started < newest) rows.push(["daemon code", "warn", `pid ${m[1]} started ${hhmm(started)}, code edited ${hhmm(newest)} — restart_needed (apiplan daemon stop; the next call respawns it)`]);
+        else rows.push(["daemon code", true, `pid ${m[1]} started ${hhmm(started)}, newer than the code`]);
+      }
+    } catch {}
+  }
   for (const c of cfg.commands) {
     const h = C.health(cfg, c.name);
-    rows.push([`cmd ${c.name}`, h.onPath ? true : "warn", h.onPath ? String(h.resolves).replace(HOME, "~") : h.installed ? `shadowed by ${h.resolves}` : "not installed"]);
+    const m = resolve(c.model);
+    if (!m) { rows.push([`cmd ${c.name}`, "warn", `model '${c.model}' no longer resolves — apiplan models --refresh, or apiplan rm ${c.name}`]); continue; }
+    const where = h.onPath ? String(h.resolves).replace(HOME, "~") : !h.installed ? "not installed" : h.resolves ? `shadowed by ${h.resolves}` : "installed, but its bin dir is not on PATH";
+    rows.push([`cmd ${c.name}`, h.onPath ? true : "warn", `${where} → ${m.id}`]);
   }
+  const probs = rows.filter(([, s]) => s !== true && s !== "info").length;
+  if (has("--strict")) process.exitCode = rows.some(([, s]) => s === false) ? 1 : 0;
+  if (json) {
+    process.stdout.write(JSON.stringify({ version: VERSION, rows: rows.map(([key, s, detail]) => ({ key, state: s === true ? "ok" : s === false ? "bad" : s, detail })), problems: probs }, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write(`${head("DOCTOR")}\n`);
   for (const [k, state, detail] of rows) {
-    process.stdout.write(`  ${state === true ? DOT_OK : state === "warn" ? DOT_WARN : DOT_BAD} ${pad(k, 22)}${dim(detail)}\n`);
+    process.stdout.write(`  ${state === true ? DOT_OK : state === "warn" ? DOT_WARN : state === "info" ? dim("·") : DOT_BAD} ${pad(k, 22)}${dim(detail)}\n`);
   }
-  const probs = rows.filter(([, s]) => s !== true).length;
   process.stdout.write(`\n  ${probs ? warn(`${probs} thing(s) to look at`) : ok("all clear")}\n`);
 }
 
@@ -254,6 +356,20 @@ function reportSync(r: C.SyncReport) {
     }
   }
   if (!onPath(r.binDir)) process.stdout.write(`${warn("!")} ${r.binDir.replace(HOME, "~")} is not on PATH — add it and reopen your shell\n`);
+}
+
+/** The dry-run twin of reportSync: which shims would be new, changed (with a diff), unchanged. */
+function reportPlan(p: C.SyncPlan) {
+  process.stdout.write(`${bold("sync dry run")} ${dim(`— nothing written · ${p.binDir.replace(HOME, "~")}`)}\n`);
+  process.stdout.write(`  new:       ${p.add.join(" ") || dim("(none)")}\n`);
+  process.stdout.write(`  changed:   ${p.change.map((c) => c.name).join(" ") || dim("(none)")}\n`);
+  process.stdout.write(`  unchanged: ${dim(String(p.same.length))}\n`);
+  for (const c of p.change) {
+    process.stdout.write(`  ${bold(c.name)}\n`);
+    for (const l of c.before.split("\n").filter(Boolean)) process.stdout.write(`    - ${l}\n`);
+    for (const l of c.after.split("\n").filter(Boolean)) process.stdout.write(`    + ${l}\n`);
+  }
+  for (const s of p.skipped) process.stdout.write(`${warn("!")} would skip ${bold(s.name)} — ${s.why}\n`);
 }
 
 // ── the TUI ───────────────────────────────────────────────────────────────────
@@ -399,24 +515,28 @@ USAGE
   apiplan vision <video>         ordered concurrent Gemini frame understanding
   apiplan commands               every global command, and whether PATH finds it
   apiplan voices                 every speech voice available to you, and from where
-  apiplan install                create the default command set and put it on PATH
+  apiplan live-models [--json]    voice models, transports and supported capabilities
+  apiplan live-check [--live-model m] [--text words]  bounded subscription audio check
+  apiplan install [--dry-run]    create the default command set and put it on PATH (--dry-run: show what would change)
   apiplan add <name> --model <m> [--flags "…"]      make a new command
   apiplan rename <old> <new>     rename one
   apiplan rm <name>              remove one
-  apiplan sync [--force]         rebuild every shim from the config
+  apiplan sync [names…] [--force] [--dry-run]  rebuild shims from the config (all, or just these)
   apiplan prune                  remove commands left over from an earlier install
-  apiplan doctor                 diagnose PATH, logins, daemon, shadowed names
+  apiplan doctor [--json] [--strict]  diagnose PATH, logins, catalog, daemon, shadowed names
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
   apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
   apiplan hotswap <status|upgrade> [--wait-seconds N]
                                  drain + replace the live 8787 server without breaking clients
-  apiplan talk [--voice v]       speak with the model out loud, both ways
+  apiplan talk [--voice v] [--live-model m]  speak with the model out loud, both ways
+                                 codex-live also accepts --duration seconds / --input-audio file
                                  ${dim("uses the warm daemon when one is up (~half the latency);")}
                                  ${dim("--direct forces the in-process path · --park pre-warms it")}
   apiplan path                   print the line that puts commands on your PATH
   apiplan shell-init [shell]     shell glue so ? and * in a prompt need no quotes
                                  ${dim(`add to your rc:  eval "$(apiplan shell-init)"`)}
+  apiplan completions [zsh|bash|fish]  tab-completion script (shell-init includes it)
 
 Config: ${C.configPath().replace(HOME, "~")}   ${dim("(plain JSON — safe to edit by hand, then `apiplan sync`)")}
 
@@ -425,6 +545,11 @@ an explicit version is always still reachable (${key("opus48")}, ${key("sonnet46
 }
 
 const argv = process.argv.slice(2);
+// Website sessions are a separate product surface, never provider/Codex credentials.
+if (argv[0] === "chatgpt") {
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "chatgpt.ts"), ...argv.slice(1)], {stdin:"inherit",stdout:"inherit",stderr:"inherit"});
+  process.exit(await child.exited);
+}
 const sub = argv[0];
 const has = (f: string) => argv.includes(f);
 const valOf = (f: string) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
@@ -449,10 +574,10 @@ const optVal = (f: string) => {
  * spawned by `talk` exists precisely to hold one, so it is armed from birth. This call
  * goes direct regardless; the NEXT one finds the socket already connected and configured.
  */
-function spawnTalkDaemon() {
+function spawnTalkDaemon(model?: string, voice?: string) {
   try {
     const p = Bun.spawn([process.execPath, import.meta.path, "daemon"], {
-      env: { ...process.env, APIPLAN_TALK_PARK: "on" },
+      env: { ...process.env, APIPLAN_TALK_PARK: "on", ...(model ? { APIPLAN_LIVE_MODEL: model } : {}), ...(voice ? { APIPLAN_VOICE: voice } : {}) },
       stdin: "ignore", stdout: "ignore", stderr: "ignore",
     });
     p.unref();
@@ -506,6 +631,55 @@ switch (sub) {
   }
   case "commands": case "ls": cmdCommands(); break;
   case "voices": await cmdVoices(); break;
+  case "live-models": {
+    const selected = resolveLiveModel();
+    if (has("--json")) process.stdout.write(JSON.stringify({ default: DEFAULT_LIVE_MODEL, selected: selected.id, models: LIVE_MODELS }, null, 2) + "\n");
+    else {
+      process.stdout.write(`Voice model default: ${DEFAULT_LIVE_MODEL}; selected: ${selected.id}\n\n`);
+      for (const m of LIVE_MODELS) {
+        process.stdout.write(`${m.id}${m.id === selected.id ? " *" : ""}  [${m.transport}]\n`);
+        process.stdout.write(`  ${Object.entries(m.capabilities).filter(([, enabled]) => enabled).map(([name]) => name).join(", ")}\n  ${m.evidence}\n`);
+      }
+      process.stdout.write("\nSelect with --live-model (alias --realtime-model), APIPLAN_LIVE_MODEL, or legacy APIPLAN_REALTIME_MODEL.\nCustom compatible Realtime WebSocket model IDs are accepted. Listing does not verify account access.\n");
+    }
+    break;
+  }
+  case "live-check": {
+    let code = 0;
+    try {
+      const model = resolveLiveModel(liveModelArgument(argv));
+      const text = valOf("--text") ?? "APIPlan voice is connected.";
+      if (model.transport === "gemini-bidi") {
+        // A Gemini live model cannot be "spoken to" the way live-check speaks to a
+        // Realtime model: these ids refuse a TEXT modality outright, so there is no
+        // "read this sentence" path. What CAN be verified end to end is the thing they do
+        // — audio in, audio or transcript out — so the check feeds a short synthesized
+        // clip and reports what came back. `--text` still chooses the words, via `say`.
+        requireLiveCapability(model, model.capabilities.dictation ? "dictation" : "talk");
+        // Dynamic, like every sibling branch here: this one-shot CLI loads exactly the one
+        // transport the caller asked for, so a Realtime call never pays to parse the Bidi
+        // client (or vice versa). The specifier is a literal; the LAZINESS is the point.
+        const { checkGeminiLive } = await import("../src/gemini-live.ts");
+        const report = await checkGeminiLive(model, text, { out: valOf("--out") ?? undefined });
+        process.stdout.write(JSON.stringify({ ok: true, model: model.id, transport: model.transport, ...report }, null, 2) + "\n");
+      } else if (model.transport === "codex-webrtc") {
+        const { speakCodexLive } = await import("../src/codex-live.ts");
+        const report = await speakCodexLive(text, { voice: valOf("--voice") ?? undefined, timeoutMs: 45000 });
+        process.stdout.write(JSON.stringify({ ok: true, model: model.id, transport: model.transport, ...report }, null, 2) + "\n");
+      } else {
+        const { speakRealtime, openai } = await import("../src/providers.ts");
+        const started = Date.now();
+        const result = await speakRealtime(openai.creds(), { text, voice: valOf("--voice") ?? "cedar", format: "wav", liveModel: model.id }, 30000);
+        const view = new DataView(result.bytes.buffer, result.bytes.byteOffset, result.bytes.byteLength);
+        let peak = 0;
+        for (let i = 44; i + 1 < view.byteLength; i += 2) peak = Math.max(peak, Math.abs(view.getInt16(i, true)));
+        if (!peak) throw new Error("The subscription returned only silent audio.");
+        process.stdout.write(JSON.stringify({ ok: true, model: model.id, transport: model.transport, audioBytes: result.bytes.length, peakPcm16: peak, elapsedMs: Date.now() - started }, null, 2) + "\n");
+      }
+    } catch (error: any) { process.stderr.write(JSON.stringify({ ok: false, error: error.message }) + "\n"); code = 1; }
+    // The optional native addon's worker threads outlive the peer; this one-shot CLI owns the process.
+    process.exit(code);
+  }
   case "install": {
     const cfg = C.load();
     // Seed a fresh machine, and top up an existing one with defaults added since it
@@ -513,16 +687,38 @@ switch (sub) {
     const fresh = !cfg.commands.length;
     if (fresh) cfg.commands = C.defaults();
     const gained = fresh ? [] : C.mergeDefaults(cfg);
+    const notes = fresh ? [] : C.refreshNotes(cfg);
+    if (has("--dry-run")) {
+      // Preview only: the config diff this install would make, then the shim diff.
+      const names = fresh ? cfg.commands.map((c) => c.name) : gained;
+      process.stdout.write(`${bold("dry run")} ${dim("— nothing written")}\n  would add: ${names.join(" ") || "(nothing)"}\n`);
+      for (const n of cfg.commands.filter((c) => names.includes(c.name))) process.stdout.write(dim(`    + ${n.name} → ${n.model}${n.flags?.length ? " " + n.flags.join(" ") : ""}${n.note ? `  (${n.note})` : ""}\n`));
+      for (const n of notes) process.stdout.write(`  would re-label ${n}\n`);
+      reportPlan(C.planSync(cfg, { force: has("--force") }));
+      break;
+    }
     C.save(cfg);
     if (gained.length) process.stdout.write(dim(`  new in this version: ${gained.join(" ")}\n`));
+    for (const n of notes) process.stdout.write(dim(`  re-labelled ${n}\n`));
     reportSync(C.sync(cfg, { force: has("--force") }));
     break;
   }
   case "sync": {
     const cfg = C.load();
-    reportSync(C.sync(cfg, { force: has("--force") }));
-    const orph = C.orphans(cfg);
-    if (orph.length) process.stdout.write(`${warn("!")} ${orph.length} leftover command(s) from an earlier install: ${orph.join(" ")}\n    ${dim("remove them:")} ${key("apiplan prune")}\n`);
+    // `apiplan sync luna6 sol6` rebuilds just those shims; bare `sync` rebuilds all.
+    const names = argv.slice(1).filter((a) => !a.startsWith("-"));
+    const unknown = names.filter((n) => !cfg.commands.some((c) => c.name === n));
+    for (const n of unknown) process.stdout.write(`${warn("!")} no command named ${bold(n)} — see ${key("apiplan commands")}\n`);
+    const known = names.filter((n) => !unknown.includes(n));
+    if (names.length && !known.length) { process.exitCode = 1; break; }
+    const opts = { force: has("--force"), ...(names.length ? { only: known } : {}) };
+    if (has("--dry-run")) reportPlan(C.planSync(cfg, opts));
+    else reportSync(C.sync(cfg, opts));
+    if (!names.length) {
+      const orph = C.orphans(cfg);
+      if (orph.length) process.stdout.write(`${warn("!")} ${orph.length} leftover command(s) from an earlier install: ${orph.join(" ")}\n    ${dim("remove them:")} ${key("apiplan prune")}\n`);
+    }
+    if (unknown.length) process.exitCode = 1;
     break;
   }
   case "prune": {
@@ -610,7 +806,9 @@ switch (sub) {
     }
     const req = {
       voice: valOf("--voice") ?? undefined,
-      model: valOf("--model") ?? undefined,
+      model: resolveLiveModel(liveModelArgument(argv)).id,
+      duration: valOf("--duration") ? Number(valOf("--duration")) : undefined,
+      inputFile: valOf("--input-audio") ?? undefined,
       direction: personaFrom(),
       greet: optVal("--greet"),
       barge: has("--barge"),
@@ -619,18 +817,25 @@ switch (sub) {
       tools: toolset.tools,
       onTool: toolset.onTool,
     };
+    const selected = resolveLiveModel(req.model);
+    if (toolsPath && !selected.capabilities.functionTools) die(`${selected.id} does not support Realtime --tools modules.`);
+    if (req.duration !== undefined && (!Number.isFinite(req.duration) || req.duration <= 0)) die("--duration must be a positive number of seconds.");
+    if (req.inputFile && !req.duration) die("--input-audio requires --duration to bound the call.");
+    if (selected.transport !== "codex-webrtc" && (req.duration || req.inputFile)) die("--duration and --input-audio currently apply only to codex-live talk.");
 
     // `--park` arms the warm socket and leaves: it is the "make the NEXT call fast" verb,
     // useful before a demo and as the bench harness's setup step.
     if (has("--park")) {
+      requireLiveCapability(selected, "park");
       const { daemonParkStatus } = await import("../src/talk-daemon.ts");
       // A daemon that answers /health but not /talk/status is a stale-code daemon from
       // before park support — stop it so a fresh, park-capable one takes its place.
       if ((await daemonAlive()) && !(await daemonParkStatus())) { await daemonStop(); await Bun.sleep(300); }
-      if (!(await daemonAlive())) { spawnTalkDaemon(); await Bun.sleep(600); }
+      if (!(await daemonAlive())) { spawnTalkDaemon(req.model, req.voice); await Bun.sleep(600); }
       // The status probe alone does not park; ask the daemon to park by restarting it
       // with parking on, which is what spawnTalkDaemon() already sets.
       let st = await daemonParkStatus();
+      if (st && st.model !== req.model) die(`daemon is configured for ${st.model}, not ${req.model}. A normal talk call selects ${req.model} without reusing that socket; --park requires a matching daemon.`);
       for (let i = 0; i < 20 && st && st.state !== "ready"; i++) { await Bun.sleep(400); st = await daemonParkStatus(); }
       process.stdout.write(st ? JSON.stringify(st, null, 2) + "\n" : "daemon not reachable\n");
       break;
@@ -640,17 +845,19 @@ switch (sub) {
     // ffplay, so the fast path is: hand it the request and render the transcript it
     // streams back. `--direct` forces the in-process path — the original behaviour, and
     // the control arm when measuring what the daemon is actually worth.
-    if (!has("--direct") && (process.env.APIPLAN_DAEMON ?? "auto") !== "off") {
+    if (selected.capabilities.park && !has("--direct") && (process.env.APIPLAN_DAEMON ?? "auto") !== "off") {
       const { talkViaDaemon } = await import("../src/talk-daemon.ts");
       try { if (await talkViaDaemon(req, render)) break; } catch { /* fall through to direct */ }
       // Nothing was listening. Start one for next time — the same rule the text path
       // follows: a cold start must never be SLOWER than having no daemon at all.
-      spawnTalkDaemon();
+      spawnTalkDaemon(req.model, req.voice);
     }
 
     const { talk } = await import("../src/talk.ts");
     try {
-      await talk({ ...req, onEvent: render });
+      const result = await talk({ ...req, onEvent: render });
+      if (result.reason === "error" || result.reason === "mic-lost" || (result.reason === "timeout" && result.detail)) die(result.detail ?? result.reason);
+      if (selected.transport === "codex-webrtc") process.exit(0);
     } catch (e: any) { die(e?.message ?? String(e)); }
     break;
   }
@@ -729,6 +936,19 @@ switch (sub) {
     else await runDaemon();
     break;
   }
+  case "__complete": { // hidden: shells call this on TAB — pure reads, newline list, always exit 0
+    const { candidates } = await import("./completions.ts");
+    const out = candidates(argv[1] ?? "", argv.slice(2));
+    process.stdout.write(out.length ? out.join("\n") + "\n" : "");
+    break;
+  }
+  case "completions": {
+    const { script, SHELLS } = await import("./completions.ts");
+    const sh = (argv[1] || basenameOf(process.env.SHELL || "") || "zsh") as any;
+    if (!SHELLS.includes(sh)) die(`usage: apiplan completions ${SHELLS.join("|")}`);
+    process.stdout.write(script(sh, C.load().commands.map((c) => c.name)));
+    break;
+  }
   case "shell-init": {
     // Why this exists: the SHELL expands `?` and `*` before our process starts, so
     // `opus is this right?` dies in zsh ("no matches found") no matter what we do
@@ -740,12 +960,15 @@ switch (sub) {
     if (/zsh/.test(shell)) {
       process.stdout.write(`# apiplan — keep ? and * literal in prompts (zsh)\n`);
       for (const n of names) process.stdout.write(`alias ${n}='noglob ${n}'\n`);
+      process.stdout.write((await import("./completions.ts")).script("zsh", names.slice(1)));
     } else if (/fish/.test(shell)) {
       process.stdout.write(`# apiplan — fish expands wildcards too; quote a prompt containing ? or *\n`);
       for (const n of names) process.stdout.write(`function ${n}; command ${n} $argv; end\n`);
+      process.stdout.write((await import("./completions.ts")).script("fish", names.slice(1)));
     } else {
       process.stdout.write(`# apiplan — ${shell || "sh"} passes unmatched ? and * through, so no aliases are needed.\n`);
       process.stdout.write(`# (If a file in the cwd happens to match your prompt, quote it or use --.)\n`);
+      if (/bash/.test(shell)) process.stdout.write((await import("./completions.ts")).script("bash", names.slice(1)));
     }
     break;
   }

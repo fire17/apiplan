@@ -1,0 +1,6 @@
+import {test,expect} from 'bun:test';
+import {groupPalette} from '../src/chatgpt/tui-palette';
+import {mockClient} from '../src/chatgpt/tui-mock';
+test('grouping keeps every command searchable and preserves operation handlers',()=>{const run=()=>{},commands=['Invoices · watcher status','Takeout · pause reads','Voice · start microphone','Runtime · status','New conversation'].map(label=>({label,run}));const groups=groupPalette(commands);expect(groups.map(g=>g.label)).toEqual(['Billing','Archive','Voice & dictation','Automation & runtime','Conversation']);expect(groups.flatMap(g=>g.items)).toEqual(commands);});
+test('offline demonstration never reports real side effects as successful',async()=>{const rpc=mockClient();for(const op of ['voice.start','dictation.start','flow.run','media.export','invoices.watch','settings.set','runtime.reload']){await expect(rpc(op)).rejects.toMatchObject({code:'MOCK_UNAVAILABLE'});}expect((await rpc('invoices.watcher')).running).toBe(false);expect((await rpc('gpts.catalog',{scope:'owned'})).globalComplete).toBe(false);});
+test('mock saved transcript has stable IDs for message selection',async()=>{const messages=await mockClient()('conversations.path',{id:'launch'});expect(messages.every((m:any)=>!!m.id)).toBe(true);});

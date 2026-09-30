@@ -7,7 +7,7 @@
   "repository": { "type": "git", "url": "https://github.com/fire17/apiplan" },
   "keywords": ["cli", "claude", "opus", "codex", "gpt", "anthropic", "openai", "subscription", "oauth", "llm", "tui", "cross-platform"],
   "type": "module",
-  "bin": { "apiplan": "bin/apiplan.ts" },
+  "bin": { "apiplan": "bin/apiplan.ts", "chatgpt": "bin/chatgpt.ts" },
   "scripts": {
     "test": "bun test",
     "bench": "bun bench/perf.ts",

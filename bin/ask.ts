@@ -4,7 +4,7 @@
 // thin shims around this file with a different --model (plus any baked-in flags).
 import { basename } from "node:path";
 import { parseArgs, buildTurns, callDirect, callViaDaemon, runDaemon, daemonStop, runImage, runSpeech, runDictation, saveMediaFile, resolveModelOrDie, die, VERSION, type Opts } from "../src/engine.ts";
-import { models, aliasesFor } from "../src/registry.ts";
+import { models, aliasesFor, resolve } from "../src/registry.ts";
 import { providerFor } from "../src/providers.ts";
 import type { Model } from "../src/registry.ts";
 
@@ -25,10 +25,11 @@ USAGE
 MODEL
   -m, --model <name>     family (opus → newest Opus) · explicit (opus48) · variant (sol) · full id
   -e, --effort <level>   ${efforts}   ·   --thinking off|N   no reasoning / token budget
-      --loop <n>         self-refine n times before answering (default 1)
-      --max-tokens <n>   cap the answer length
+      --work | --chatmode | --mode chat|work   subscription surface (default) or the chatgpt.com CHAT composer
+      --loop <n>         self-refine n times (default 1)  ·  --max-tokens <n>  cap the answer length
   -t, --temperature <f>  sampling temperature (legacy models only)
-      --fast             Anthropic Fast Mode (Opus 4.7/4.8 — separate rate limit)
+      --fast             Anthropic Fast Mode (Opus 4.7/4.8) · OpenAI: priority tier (= --service-tier priority)
+      --detail <level>   OpenAI image detail: low | high | auto | original (--image-detail)
       --1m               enable the 1M-context beta for very large inputs
 
 MAKE THINGS
@@ -39,7 +40,7 @@ MAKE THINGS
       --dictate          the mic types: live transcript, final text on stdout · Enter ends it · --lang en|he|… · --silence-stop <secs>
       --as <direction>   HOW to say it: "excited, laughing" · "whisper" · "furious" ·
                          "slowly, heartbroken" · any character (--as-file <f>; --local)
-      --voice <name>     see apiplan voices   --play   --format aac|mp3|wav
+      --voice <name>     apiplan voices; --live-model <id> (apiplan live-models); --play --format aac|mp3|wav
   -o, --out <file>       where the image/audio goes (default ./apiplan-<time>.<ext>)
 
 INPUT
@@ -57,8 +58,7 @@ OUTPUT
 SPEED  the warm daemon caches your login + connection and starts itself
       --no-daemon        one call in-process · --public Gemini API-key route · --daemon / --daemon-stop
 
-  -h, --help             this help          ·  apiplan          manage every command
-  -V, --version          print version      ·  apiplan models   list every model + alias
+  -h, --help · -V, --version    ·  apiplan  manage every command  ·  apiplan models  every model + alias
 
 EXIT CODES  0 ok · 1 error · 3 auth · 4 rate limited`;
 }
@@ -67,7 +67,49 @@ const argv = process.argv.slice(2);
 // A shim may bind the model via --model, or be a symlink named after the alias.
 const invoked = basename(process.argv[1] ?? "ask").replace(/\.(ts|cmd|ps1|exe)$/i, "");
 const fromName = invoked === "ask" || invoked === "apiplan" ? undefined : invoked;
-const o: Opts = parseArgs(argv, fromName);
+let o: Opts;
+try { o = parseArgs(argv, fromName); } catch (e: any) { die(e?.message ?? String(e), 1); }
+
+/**
+ * A mode names the SURFACE that answers, not the model.
+ *
+ * `--work` is what every subscription command already does — the Codex responses backend
+ * (`/backend-api/codex/responses`), which has no mode concept at all — so it re-routes
+ * nothing and exists to let you SAY what you are getting.
+ *
+ * `--chatmode` is a chatgpt.com composer mode, and the only transport that can select one
+ * is the signed-in website route, so it re-points there. That is a different model as well
+ * as a different surface, which is why it is announced rather than performed quietly.
+ * An explicit `-m online/...` is left exactly as typed: the provider then checks that the
+ * mode and the route agree, and fails loudly if they do not.
+ */
+function routeForMode(name: string | undefined, mode: "chat" | "work" | undefined): string | undefined {
+  if (!mode || !name) return name;
+  let m = null; try { m = resolve(name); } catch { m = null; }
+  if (m?.provider === "online") return name;
+  return mode === "chat" ? "online/chat" : name;
+}
+if (o.mode) {
+  // Chat and Work are ChatGPT's OWN composer modes. No other vendor has them, so quietly
+  // re-pointing an Anthropic or Gemini command at chatgpt.com because a mode flag was
+  // passed would be a cross-vendor redirect nobody asked for — the prompt would leave for
+  // a different account than the command names. Refuse instead, and name the provider.
+  const MODED = new Set(["openai", "online"]);
+  let requested = null; try { requested = o.model ? resolve(o.model) : null; } catch { requested = null; }
+  if (requested && !MODED.has(requested.provider)) {
+    const an = /^[aeiou]/i.test(requested.provider) ? "an" : "a";
+    die(`--${o.mode === "chat" ? "chatmode" : "work"} is a ChatGPT composer mode; ${requested.label} is ${an} ${requested.provider} model and has no Chat/Work setting.`, 1);
+  }
+  const routed = routeForMode(o.model, o.mode);
+  // stderr, never stdout: the answer stays pipeable.
+  if (routed !== o.model) {
+    process.stderr.write(`\x1b[2mnote: ${o.mode} mode is a chatgpt.com composer mode and does not offer '${o.model}'. Routing to ${routed} — the website's own row, which is a DIFFERENT model.\x1b[0m\n`);
+  }
+  o.model = routed;
+  // With no model at all there is no route to report, and resolveModelOrDie below is
+  // about to say something far more useful than `route=undefined`.
+  if (o.model) process.stderr.write(`\x1b[2m[apiplan] mode=${o.mode} route=${o.model}\x1b[0m\n`);
+}
 
 if (o.version) { process.stdout.write(`apiplan ${VERSION}\n`); process.exit(0); }
 if (o.daemon) { await runDaemon(); process.exit(0); }
@@ -135,6 +177,7 @@ if (o.dictate) {
 
 // Speech is a different shape of job: no streaming, no daemon, binary out.
 if (o.speak) {
+  if (o.liveModel && model.provider !== "openai") die("--live-model requires an OpenAI subscription command, such as tts or sol --speak.");
   // --aloud reads a message that already exists in the account, so it takes no prompt
   // and must not sit waiting on stdin for one.
   const turns0 = o.aloud ? [] : await buildTurns(o);
