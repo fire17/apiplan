@@ -527,9 +527,13 @@ USAGE
   apiplan doctor [--json] [--strict]  diagnose PATH, logins, catalog, daemon, shadowed names
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
-  apiplan serve [--port N] [--host H] [--key-file F] [--cors ORIGIN]
+  apiplan serve [--port N] [--host H] [--key-file F] [--keys-file F] [--cors ORIGIN]
                                  an OpenAI- and Anthropic-shaped API (loopback by default;
                                  any other --host requires a key: --key-file / APIPLAN_SERVE_KEY)
+  apiplan keys new <label>       mint a per-device/project key for serve (shown ONCE; only its hash is kept)
+  apiplan keys list              every key: id, label, created, revoked, requests, tokens, cost to date
+  apiplan keys revoke <id>       refuse that key from now on (a running server picks it up live)
+  apiplan keys usage [--since 24h|7d] [--json]   per-key totals from the usage ledger
   apiplan hotswap <status|upgrade> [--wait-seconds N]
                                  drain + replace the live 8787 server without breaking clients
   apiplan talk [--voice v] [--live-model m]  speak with the model out loud, both ways
@@ -944,6 +948,59 @@ switch (sub) {
     die(`unknown hotswap action '${action}' (use status or upgrade)`);
     break;
   }
+  case "keys": {
+    const K = await import("../src/serve-keys.ts");
+    const file = valOf("--keys-file") ?? K.keysFile();
+    const action = argv[1];
+    const num = (n: number) => n.toLocaleString("en-US");
+    const usd = (n: number) => `$${n > 0 && n < 0.01 ? n.toFixed(6) : n.toFixed(4)}`;
+    const day = (t?: string | null) => (t ? t.slice(0, 16).replace("T", " ") : "—");
+    if (action === "new") {
+      const label = argv.slice(2).filter((a, i, all) => !a.startsWith("--") && all[i - 1] !== "--keys-file").join(" ");
+      if (!label) die("usage: apiplan keys new <label>   (the device or project this key is for)");
+      const { record, key: k } = K.createKey(label, file);
+      process.stdout.write(`${ok("✓")} key ${bold(record.id)} for ${bold(record.label)}\n\n  ${k}\n\n`);
+      process.stdout.write(dim(`  Shown once — only its sha256 is stored (${file.replace(HOME, "~")}, mode 0600).\n`));
+      process.stdout.write(dim(`  Send as  Authorization: Bearer <key>  or  x-api-key: <key>.\n`));
+      process.stdout.write(warn(`  A serve using this store now requires a valid key from EVERY caller, loopback included\n  (keyless only with APIPLAN_SERVE_OPEN=1). A placeholder key (OM's apiKey: not-needed) gets 401.\n`));
+      break;
+    }
+    if (action === "revoke") {
+      const id = argv[2];
+      if (!id) die("usage: apiplan keys revoke <id>");
+      try { const r = K.revokeKey(id, file); process.stdout.write(`${ok("✓")} key ${bold(r.id)} (${r.label}) revoked at ${r.revoked_at}\n`); }
+      catch (e: any) { die(e?.message ?? String(e)); }
+      break;
+    }
+    if (action === "list" || action === "ls" || action === undefined) {
+      const store = K.readStore(file);
+      const tot = new Map(K.totalsByKey(K.readLedger()).map((t) => [t.key_id, t]));
+      const others = [...tot.values()].filter((t) => !store.keys.some((k) => k.id === t.key_id));
+      const rows = store.keys.map((k) => ({ id: k.id, label: k.label, created_at: k.created_at, revoked_at: k.revoked_at ?? null, ...(tot.get(k.id) ?? {}) })) as any[];
+      if (has("--json")) { process.stdout.write(JSON.stringify({ keys: rows, other: others }, null, 2) + "\n"); break; }
+      if (!store.keys.length) process.stdout.write(dim(`no keys yet — apiplan keys new <label>   (${file.replace(HOME, "~")})\n`));
+      else {
+        process.stdout.write(`${pad(dim("ID"), 10)} ${pad(dim("LABEL"), 20)} ${pad(dim("CREATED"), 17)} ${pad(dim("REVOKED"), 17)} ${pad(dim("REQS"), 6)} ${pad(dim("TOKENS"), 12)} ${dim("COST")}\n`);
+        for (const r of rows) process.stdout.write(`${pad(key(r.id), 10)} ${pad(r.label, 20)} ${pad(day(r.created_at), 17)} ${pad(r.revoked_at ? bad(day(r.revoked_at)) : dim("—"), 17)} ${pad(num(r.requests ?? 0), 6)} ${pad(num(r.total_tokens ?? 0), 12)} ${usd(r.cost_usd ?? 0)}\n`);
+      }
+      for (const t of others) process.stdout.write(dim(`${pad(t.key_id, 10)} ${pad("(not a store key)", 20)} ${pad("", 17)} ${pad("", 17)} ${pad(num(t.requests), 6)} ${pad(num(t.total_tokens), 12)} ${usd(t.cost_usd)}\n`));
+      break;
+    }
+    if (action === "usage") {
+      const since = valOf("--since") ?? "all";
+      let windowMs = 0;
+      try { windowMs = K.parseWindow(since); } catch (e: any) { die(e.message); }
+      const rows = K.totalsByKey(K.readLedger(windowMs ? Date.now() - windowMs : 0));
+      if (has("--json")) { process.stdout.write(JSON.stringify({ since: windowMs ? new Date(Date.now() - windowMs).toISOString() : null, ledger: K.ledgerFile(), keys: rows }, null, 2) + "\n"); break; }
+      process.stdout.write(`${head("usage by key")} ${dim(since === "all" ? "· all time" : `· last ${since}`)} ${dim("· " + K.ledgerFile().replace(HOME, "~"))}\n`);
+      if (!rows.length) { process.stdout.write(dim("  no requests in this window\n")); break; }
+      process.stdout.write(`  ${pad(dim("KEY"), 10)} ${pad(dim("LABEL"), 18)} ${pad(dim("REQS"), 5)} ${pad(dim("ERR"), 4)} ${pad(dim("INPUT"), 9)} ${pad(dim("OUTPUT"), 9)} ${pad(dim("CACHE-R"), 9)} ${pad(dim("CACHE-W"), 9)} ${pad(dim("COST"), 11)} ${dim("LAST USED")}\n`);
+      for (const t of rows) process.stdout.write(`  ${pad(key(t.key_id), 10)} ${pad(t.label, 18)} ${pad(num(t.requests), 5)} ${pad(t.errors ? bad(num(t.errors)) : "0", 4)} ${pad(num(t.input_tokens), 9)} ${pad(num(t.output_tokens), 9)} ${pad(num(t.cache_read_tokens), 9)} ${pad(num(t.cache_write_tokens), 9)} ${pad(usd(t.cost_usd), 11)} ${dim(day(t.last_used))}${t.unpriced_requests ? warn(` (${t.unpriced_requests} unpriced)`) : ""}\n`);
+      break;
+    }
+    die("usage: apiplan keys new <label> | list | revoke <id> | usage [--since 24h|7d] [--json]");
+    break;
+  }
   case "serve": {
     const { serve } = await import("../src/api.ts");
     const explicitPort = valOf("--port");
@@ -952,6 +1009,7 @@ switch (sub) {
       port,
       host: valOf("--host") ?? undefined,
       keyFile: valOf("--key-file") ?? undefined,
+      keysFile: valOf("--keys-file") ?? undefined,
       cors: valOf("--cors") ?? undefined,
       reusePort: has("--reuse-port") || process.env.APIPLAN_REUSE_PORT === "1",
     });
@@ -959,10 +1017,11 @@ switch (sub) {
     process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
     process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
     process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
-    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /health\n`));
+    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /v1/usage/keys · /health\n`));
     process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
     if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_SERVE_KEY_FILE (or --key-file) to require a key\n`));
     else process.stdout.write(dim(`  key required: Authorization: Bearer <key> or x-api-key: <key> · GET /health is public liveness only\n`));
+    process.stdout.write(dim(`  per-key store ${s.keysFile.replace(HOME, "~")} · \`apiplan keys new <label>\` mints one · usage ledgered per key\n`));
     await new Promise(() => {});
     break;
   }

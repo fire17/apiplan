@@ -18,6 +18,7 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
+import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -1229,6 +1230,32 @@ const promptTokensOpenAI = (n: Norm, input: number, measured: boolean) =>
  *  USAGE_MARK already follows for estimates. */
 const USAGE_BASIS_MARK = "x_apiplan_usage_basis";
 const basisMark = (n: Norm) => (n.basis === "exclusive" ? {} : { [USAGE_BASIS_MARK]: n.basis });
+
+/**
+ * Per-request accounting for the per-key usage ledger (serve-keys.ts). Each metered route fills
+ * it at the SAME point it renders usage to the caller, from the same restated counters — so the
+ * ledger and the reply can never disagree. Buckets are disjoint (input excludes cache) whenever
+ * the partition is exact; otherwise the raw counters stand and `basis` says so. An estimated
+ * count is flagged, never passed off as the provider's.
+ */
+export type Meter = {
+  model?: string; provider?: string; stream?: boolean;
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cacheWrite1h?: number; estimated: boolean; basis: Norm["basis"] };
+  /** A fault that arrived inside an already-committed stream (the head said 200). */
+  fault?: number;
+  /** The client walked away before the stream finished. */
+  cancelled?: boolean;
+};
+function meterUsage(meter: Meter | undefined, n: Norm, estIn: () => number, estOut: () => number) {
+  if (!meter) return;
+  const pub = publishable(n);
+  meter.usage = {
+    input: n.input ?? estIn(), output: n.output ?? estOut(),
+    cacheRead: pub ? n.cacheRead ?? 0 : 0, cacheWrite: pub ? n.cacheWrite ?? 0 : 0,
+    ...(pub && n.cacheWriteTtl?.h1 ? { cacheWrite1h: n.cacheWriteTtl.h1 } : {}),
+    estimated: n.input === undefined || n.output === undefined, basis: n.basis,
+  };
+}
 /**
  * Provider cache counters translated into each caller dialect's own spelling. Preserve
  * explicit zeroes: zero is measured evidence of a miss; absence means unavailable.
@@ -1447,7 +1474,7 @@ async function* replay<T>(p: Primed<T>): AsyncGenerator<T> {
  */
 const BODY_SETTLED = new WeakMap<Response, Promise<void>>();
 
-function streamResponse(dialect: "openai" | "anthropic", gen: () => AsyncGenerator<string>, onCancel?: () => void): Response {
+function streamResponse(dialect: "openai" | "anthropic", gen: () => AsyncGenerator<string>, onCancel?: () => void, meter?: Meter): Response {
   let settle!: () => void;
   // Resolve-only, and resolved exactly once by whichever end arrives first — a completed body, a
   // client that walked away, or a throw inside start(). A body that can never settle would pin the
@@ -1462,23 +1489,25 @@ function streamResponse(dialect: "openai" | "anthropic", gen: () => AsyncGenerat
           // A client that hung up is NOT a fault to report — there is nobody to tell, and
           // both enqueue() and close() throw on a controller the runtime already tore down.
           if (!(e instanceof Error) || e.name !== "AbortError") {
+            if (meter && !meter.cancelled) meter.fault = e instanceof HttpError ? e.status : 502;
             try { c.enqueue(enc.encode(streamFault(dialect, e))); } catch {}
-          }
+          } else if (meter) meter.cancelled = true;
         }
         try { c.close(); } catch {}
       } finally { settle(); }
     },
     // Fires when the consumer walks away; the upstream fetch has to walk away too.
-    cancel() { settle(); onCancel?.(); },
+    cancel() { if (meter) meter.cancelled = true; settle(); onCancel?.(); },
   });
   const response = new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
   BODY_SETTLED.set(response, settled);
   return response;
 }
 
-async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
+async function openaiChat(body: any, signal?: AbortSignal, meter?: Meter): Promise<Response> {
   const jimmy = isJimmy(body?.model);
   const m = jimmy ? null : pick(body?.model);
+  if (meter) { meter.model = jimmy ? JIMMY_MODEL : m!.id; meter.provider = jimmy ? "jimmy" : m!.provider; }
   const { turns, system } = fromOpenAI(body);
   const o = optsFrom(body, system);
   Object.assign(o, toolsFrom(body, "openai"));
@@ -1500,6 +1529,7 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
       for (const ev of toolEvents(d, mint)) foldCall(byRef, order, ev);
     }
     const n = normalizeTally(t, m?.provider);
+    meterUsage(meter, n, () => estimateTokens(turns, system), () => estimateOut(text));
     const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(turns, system), n.input !== undefined);
     const outTok = n.output ?? estimateOut(text);
     // OpenAI's shape: content is null when the turn IS the tool call.
@@ -1539,9 +1569,10 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
     }
     const last: any = { ...head, choices: [{ index: 0, delta: {}, finish_reason: finishFor(stopWith(t.stopReason, order.length > 0)) }] };
     // OpenAI only sends usage on a stream when the caller asked for it; honour that rather
-    // than inventing a field a strict client is not expecting.
+    // than inventing a field a strict client is not expecting. The ledger meters it either way.
+    const n = normalizeTally(t, m?.provider);
+    meterUsage(meter, n, () => estimateTokens(turns, system), () => estimateOut(text));
     if (body?.stream_options?.include_usage) {
-      const n = normalizeTally(t, m?.provider);
       const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(turns, system), n.input !== undefined);
       const outTok = n.output ?? estimateOut(text);
       last.usage = { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok, ...cacheUsageOpenAI(n) };
@@ -1550,7 +1581,7 @@ async function openaiChat(body: any, signal?: AbortSignal): Promise<Response> {
     }
     yield sse(last);
     yield "data: [DONE]\n\n";
-  }, () => ac.abort());
+  }, () => ac.abort(), meter);
 }
 
 // ─────────────────────────── OpenAI Responses (/v1/responses) ───────────────────────────
@@ -1656,7 +1687,7 @@ const respId = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "")}`;
  */
 export function renderResponses(
   gen: () => AsyncGenerator<Delta>,
-  meta: { model: string; body: any; turns: Turn[]; system?: string; effort?: string; provider?: ProviderId },
+  meta: { model: string; body: any; turns: Turn[]; system?: string; effort?: string; provider?: ProviderId; meter?: Meter },
 ): { collect: () => Promise<any>; events: () => AsyncGenerator<string> } {
   const id = respId("resp"), created = now();
   const { body } = meta;
@@ -1675,6 +1706,7 @@ export function renderResponses(
   });
   const finish = (t: Tally, text: string, sawTool: boolean) => {
     const n = normalizeTally(t, meta.provider);
+    meterUsage(meta.meter, n, () => estimateTokens(meta.turns, meta.system), () => estimateOut(text));
     const inTok = promptTokensOpenAI(n, n.input ?? estimateTokens(meta.turns, meta.system), n.input !== undefined);
     const outTok = n.output ?? estimateOut(text);
     const stop = stopWith(t.stopReason, sawTool);
@@ -1772,6 +1804,7 @@ export function renderResponses(
     } catch (e: any) {
       if (e instanceof Error && e.name === "AbortError") throw e;
       const status = e instanceof HttpError ? e.status : 502;
+      if (meta.meter) meta.meter.fault = status;
       yield ev("response.failed", { response: shell("failed", output.filter(Boolean), {
         error: { code: status === 401 ? "invalid_api_key" : (typeof e?.upstreamType === "string" ? e.upstreamType : "server_error"), message: e?.message ?? String(e) },
       }) });
@@ -1786,28 +1819,30 @@ export function renderResponses(
   return { collect, events };
 }
 
-async function openaiResponses(body: any, signal?: AbortSignal): Promise<Response> {
+async function openaiResponses(body: any, signal?: AbortSignal, meter?: Meter): Promise<Response> {
   const chat = responsesToChat(body);
   const jimmy = isJimmy(chat.model);
   const m = jimmy ? null : pick(chat.model);
+  if (meter) { meter.model = jimmy ? JIMMY_MODEL : m!.id; meter.provider = jimmy ? "jimmy" : m!.provider; }
   const { turns, system } = fromOpenAI(chat);
   const o = optsFrom(chat, system);
   Object.assign(o, toolsFrom(chat, "openai"));
   if (m) clampEffort(m, o);
   const ac = linkAbort(signal);
   const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
-  const meta = { model: jimmy ? JIMMY_MODEL : m!.id, body, turns, system, effort: o.effort, provider: m?.provider };
+  const meta = { model: jimmy ? JIMMY_MODEL : m!.id, body, turns, system, effort: o.effort, provider: m?.provider, meter };
   if (!chat.stream) return json(await renderResponses(gen, meta).collect());
   // Commit the head only once the upstream has actually answered — see preflight().
   const pre = await preflight(gen());
   if (pre.error) { ac.abort(); throw pre.error; }
   const primed = pre.primed!;
-  return streamResponse("openai", () => renderResponses(() => replay(primed), meta).events(), () => ac.abort());
+  return streamResponse("openai", () => renderResponses(() => replay(primed), meta).events(), () => ac.abort(), meter);
 }
 
-async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Response> {
+async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter): Promise<Response> {
   const jimmy = isJimmy(body?.model);
   const m = jimmy ? null : pick(body?.model);
+  if (meter) { meter.model = jimmy ? JIMMY_MODEL : m!.id; meter.provider = jimmy ? "jimmy" : m!.provider; }
   const { turns, system, systemBlocks } = fromAnthropic(body, m?.provider);
   const o = optsFrom(body, system);
   if (systemBlocks) o.systemBlocks = systemBlocks;
@@ -1869,6 +1904,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
     // A reply that carried nothing at all still answers in the old shape.
     if (!content.length) content.push({ type: "text", text });
     const n = normalizeTally(t, m?.provider);
+    meterUsage(meter, n, () => estimateTokens(turns, system), () => estimateOut(text));
     return json({
       id, type: "message", role: "assistant", model: id0,
       content,
@@ -1953,6 +1989,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
       yield sse({ type: "content_block_stop", index: 0 }, "content_block_stop");
     }
     const n = normalizeTally(t, m?.provider);
+    meterUsage(meter, n, () => estIn, () => estimateOut(text));
     yield sse({
       type: "message_delta",
       delta: { stop_reason: stopWith(t.stopReason, sawTool), stop_sequence: null },
@@ -1961,7 +1998,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal): Promise<Respo
       ...basisMark(n),
     }, "message_delta");
     yield sse({ type: "message_stop" }, "message_stop");
-  }, () => ac.abort());
+  }, () => ac.abort(), meter);
 }
 
 /**
@@ -2172,7 +2209,7 @@ function errorFor(dialect: "openai" | "anthropic", status: number, message: stri
     : json({ error: { message, type: status === 401 ? "authentication_error" : status >= 500 ? "server_error" : "invalid_request_error", param: null, code: status === 401 ? "invalid_api_key" : (upstream ?? null) } }, status, extra);
 }
 
-export type ServeOpts = { port?: number; host?: string; token?: string; keyFile?: string; cors?: string; reusePort?: boolean };
+export type ServeOpts = { port?: number; host?: string; token?: string; keyFile?: string; keysFile?: string; cors?: string; reusePort?: boolean };
 
 /** Hosts that only this machine can reach. Anything else is a public bind. */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -2212,6 +2249,9 @@ export function presentedKeys(h: Headers): string[] {
   return out;
 }
 
+/** A fresh meter: the model the request NAMED (kept for a request refused before it resolved one). */
+const meterFor = (body: any): Meter => ({ model: typeof body?.model === "string" ? body.model.slice(0, 120) : undefined, stream: !!body?.stream });
+
 export function serve(opts: ServeOpts = {}) {
   // R-1: this process has an EVENT LOOP and exactly one thread, so no credential may ever be
   // minted by blocking it — a slow OAuth endpoint would become this service's latency for
@@ -2231,15 +2271,18 @@ export function serve(opts: ServeOpts = {}) {
   // Bind loopback by default: this hands out your subscription to whoever can reach it.
   const hostname = opts.host ?? process.env.APIPLAN_API_HOST ?? "127.0.0.1";
   const token = inboundKey(opts);
+  // Per-device/per-project keys (serve-keys.ts). Consulted on every request and re-read when the
+  // file changes, so `apiplan keys new|revoke` takes effect on a running server.
+  const keys = keyCache(opts.keysFile);
   // A public bind with no key would hand every subscription on this machine to anyone who
   // can reach the port. Refuse to start rather than serve that.
   // Owner opt-in only (fire17, 2026-10-01 01:05: "תאפשר לי פשוט לקרוא לו בלי שום מפתח"):
-  // APIPLAN_SERVE_OPEN=1 serves a public bind with NO key, until per-client keys exist.
+  // APIPLAN_SERVE_OPEN=1 serves a public bind with NO key; keyless callers are ledgered "anonymous".
   const openOptIn = process.env.APIPLAN_SERVE_OPEN === "1";
-  if (!isLoopbackHost(hostname) && !token && !openOptIn) {
+  if (!isLoopbackHost(hostname) && !token && !openOptIn && keys.activeCount() === 0) {
     throw new Error(`apiplan serve: refusing to bind ${hostname} without a key — set APIPLAN_SERVE_KEY_FILE (or --key-file) / APIPLAN_SERVE_KEY, or APIPLAN_SERVE_OPEN=1 to serve it open on purpose`);
   }
-  if (!isLoopbackHost(hostname) && !token && openOptIn) {
+  if (!isLoopbackHost(hostname) && !token && openOptIn && keys.activeCount() === 0) {
     process.stderr.write(`apiplan serve: WARNING — ${hostname} is OPEN (APIPLAN_SERVE_OPEN=1): anyone who reaches this port spends these subscriptions\n`);
   }
   const cors = opts.cors ?? process.env.APIPLAN_CORS_ORIGIN ?? "";
@@ -2251,7 +2294,27 @@ export function serve(opts: ServeOpts = {}) {
     "access-control-max-age": "600",
     ...(cors === "*" ? {} : { vary: "origin" }),
   } : {};
-  const authed = (req: Request) => !token || presentedKeys(req.headers).some((k) => keyMatches(k, token));
+  /**
+   * Who is calling, or null (→ 401). Once ANY key is configured — the legacy single key or ≥1
+   * active store key — a presented key must be valid: a typo'd or revoked key is refused, never
+   * quietly demoted to anonymous (that would misattribute its usage). Keyless callers pass only
+   * in open mode (APIPLAN_SERVE_OPEN=1), as "anonymous". With nothing configured the gate is what
+   * it always was — open, whatever placeholder a client sends (OM's `apiKey: not-needed`).
+   */
+  const identify = (req: Request): Ident | null => {
+    const keyed = !!token || keys.activeCount() > 0;
+    if (!keyed) return ANONYMOUS;
+    const presented = presentedKeys(req.headers);
+    for (const p of presented) {
+      if (token && keyMatches(p, token)) return LEGACY;
+      const k = keys.match(p);
+      if (k) return { id: k.id, label: k.label };
+    }
+    if (presented.length) return null;
+    return openOptIn ? ANONYMOUS : null;
+  };
+  const authed = (req: Request) => identify(req) !== null;
+  const holdsLegacy = (req: Request) => !!token && presentedKeys(req.headers).some((k) => keyMatches(k, token));
   const cachePolicy = "cached" as const;
   const startedAt = Date.now();
   let accepting = true;
@@ -2306,7 +2369,8 @@ export function serve(opts: ServeOpts = {}) {
         const peer = srv.requestIP(req)?.address ?? "";
         const local = isLoopbackHost(peer) || peer === "::ffff:127.0.0.1";
         const proxied = req.headers.has("x-forwarded-for") || req.headers.has("forwarded") || req.headers.has("x-real-ip");
-        if (token && !(local && !proxied) && !authed(req)) return errorFor(dialect, 401, "invalid api key");
+        // A per-client key never drains the server: only this machine or the owner's legacy key.
+        if ((token || keys.activeCount() > 0) && !(local && !proxied) && !holdsLegacy(req)) return errorFor(dialect, 401, "invalid api key");
       }
       if (req.method === "GET" && path === "/_apiplan/control") return json(control());
       if (req.method === "POST" && path === "/_apiplan/drain") {
@@ -2325,13 +2389,36 @@ export function serve(opts: ServeOpts = {}) {
         activeRequests--;
         completedRequests++;
       };
+      const t0 = Date.now();
+      // Filled by handle(): who called, and — on a metered route — what it cost.
+      const acct: { who: Ident | null; meter?: Meter } = { who: null };
       const handle = async (): Promise<Response> => {
         // Register whatever the local daemon holds before anything reads the registry —
         // /v1/models, /health and every call resolve against the same live truth.
         // A key is optional on loopback and mandatory on any other bind; when set it is
         // enforced on both the OpenAI and the Anthropic auth headers, since callers use
         // whichever they know. Checked BEFORE any work, so an unauthenticated caller costs nothing.
-        if (!authed(req)) throw new HttpError(401, "invalid api key");
+        const who = acct.who = identify(req);
+        if (!who) throw new HttpError(401, "invalid api key");
+        // Per-key totals from the usage ledger. A per-client key sees only itself; the legacy
+        // (owner) key and a keyless caller on this machine (not via a proxy) see every key; any
+        // other keyless caller (open mode) sees only the anonymous bucket.
+        if (req.method === "GET" && (path === "/v1/usage/keys" || path === "/usage/keys")) {
+          const since = url.searchParams.get("since") ?? "all";
+          let windowMs: number;
+          try { windowMs = parseWindow(since); } catch (e: any) { throw new HttpError(400, e.message); }
+          const peer = srv.requestIP(req)?.address ?? "";
+          const local = (isLoopbackHost(peer) || peer === "::ffff:127.0.0.1")
+            && !(req.headers.has("x-forwarded-for") || req.headers.has("forwarded") || req.headers.has("x-real-ip"));
+          const me = who;
+          const all = me.id === LEGACY.id || (me.id === ANONYMOUS.id && local);
+          const now = Date.now();
+          const rows = totalsByKey(readLedger(windowMs ? now - windowMs : 0), all ? undefined : (k) => k === me.id);
+          if (!all && !rows.length) rows.push({ key_id: me.id, label: me.label, requests: 0, errors: 0, input_tokens: 0, output_tokens: 0,
+            cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0, cost_usd: 0, unpriced_requests: 0, last_used: null });
+          return json({ object: "usage.keys", scope: all ? "all" : "own", since: windowMs ? new Date(now - windowMs).toISOString() : null,
+            until: new Date(now).toISOString(), keys: rows });
+        }
         await ensureOllama();
         if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return listModels(dialect);
         // Subscription windows (5h + weekly) per provider, for a caller that switches vendors at a
@@ -2351,9 +2438,9 @@ export function serve(opts: ServeOpts = {}) {
         // daemon once more before telling the caller it does not exist.
         if (typeof body?.model === "string" && body.model && !isJimmy(body.model) && !resolve(body.model)) await ensureOllama(true);
         switch (path) {
-          case "/v1/chat/completions": case "/chat/completions": return await openaiChat(body, req.signal);
-          case "/v1/responses": case "/responses": return await openaiResponses(body, req.signal);
-          case "/v1/messages": case "/messages": return await anthropicMessages(body, req.signal);
+          case "/v1/chat/completions": case "/chat/completions": return await openaiChat(body, req.signal, acct.meter = meterFor(body));
+          case "/v1/responses": case "/responses": return await openaiResponses(body, req.signal, acct.meter = meterFor(body));
+          case "/v1/messages": case "/messages": return await anthropicMessages(body, req.signal, acct.meter = meterFor(body));
           case "/v1/messages/count_tokens": case "/messages/count_tokens": return countTokens(body);
           case "/v1/audio/speech": case "/audio/speech": return await speech(body);
           case "/v1/images/generations": case "/images/generations": return await images(body, req.signal);
@@ -2375,9 +2462,27 @@ export function serve(opts: ServeOpts = {}) {
       const settled = BODY_SETTLED.get(response);
       if (settled) void settled.then(release, release);
       else release();
+      // One ledger line per metered request that got past the gate — errors included (tokens 0),
+      // so "who called what" is complete. A stream is ledgered when its body settles, with the
+      // usage from its final event, or the fault/cancel that ended it instead.
+      if (acct.meter && acct.who) {
+        const m = acct.meter, w = acct.who, stream = !!m.stream, status = response.status;
+        const write = () => {
+          const u = m.usage;
+          const st = m.fault ?? (m.cancelled && !u ? 499 : status);
+          const b = { input: u?.input ?? 0, output: u?.output ?? 0, cacheRead: u?.cacheRead ?? 0, cacheWrite: u?.cacheWrite ?? 0, cacheWrite1h: u?.cacheWrite1h };
+          appendLedger({
+            ts: new Date().toISOString(), key_id: w.id, label: w.label, route: path, provider: m.provider ?? null, model: m.model ?? null,
+            stream, status: st, input_tokens: b.input, output_tokens: b.output, cache_read_tokens: b.cacheRead, cache_write_tokens: b.cacheWrite,
+            cost_usd: !u || m.provider === "jimmy" || m.provider === "ollama" ? 0 : costUsd(m.model, b), latency_ms: Date.now() - t0,
+            ...(u?.estimated ? { estimated: true as const } : {}), ...(u && u.basis !== "exclusive" ? { usage_basis: u.basis } : {}),
+          });
+        };
+        if (settled) void settled.then(write, write); else write();
+      }
       return response;
   }
   // server.port, not the requested one: port 0 means "any free port", and only the
   // server knows which it got.
-  return { url: `http://${hostname}:${server.port}`, port: server.port, hostname, tokenRequired: !!token, control, stop: () => server.stop(true) };
+  return { url: `http://${hostname}:${server.port}`, port: server.port, hostname, tokenRequired: !!token || keys.activeCount() > 0, keysFile: keys.file, control, stop: () => server.stop(true) };
 }
