@@ -560,6 +560,14 @@ describe("GPT-6 Sol/Luna rows", () => {
     expect(luna.cost).toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125,
       longContext: { inputThreshold: 272_000, input: 0.2, output: 0.75, cacheRead: 0.02, cacheWrite: 0.25 } });
   });
+  test("gpt-6.1-sol carries its published window and prices — cached input at 5%, not oai()'s 10%", () => {
+    // developers.openai.com/api/docs/models/gpt-6.1-sol, read 2026-10-01.
+    const e = entryFor(mk("gpt-6.1-sol", "sol"));
+    expect(e.contextWindow).toBe(1_050_000);
+    expect(e.maxTokens).toBe(128_000);
+    expect(e.cost).toEqual({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5,
+      longContext: { inputThreshold: 272_000, input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 } });
+  });
   test("each sits at the head of its family slot, the 5.6 id right behind it", () => {
     expect(HARNESS_ORDER.indexOf("gpt-6-sol") + 1).toBe(HARNESS_ORDER.indexOf("gpt-5.6-sol"));
     expect(HARNESS_ORDER.indexOf("gpt-6-luna") + 1).toBe(HARNESS_ORDER.indexOf("gpt-5.6-luna"));

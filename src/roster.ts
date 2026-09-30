@@ -262,6 +262,14 @@ export const DOCUMENTED: Record<string, Documented> = {
   // and 1.5x output for the full request". oai() derives cacheRead = input/10 and
   // cacheWrite = input×1.25, which match both pages exactly.
   "gpt-6-sol": oai(1_050_000, 2, 10, tier(4, 15, 0.4, 5)),
+  // developers.openai.com/api/docs/models/gpt-6.1-sol (read 2026-10-01): 1,050,000 ctx, 922,000
+  // max input, 128,000 out; $2 input / $0.10 cached / $2.50 cache writes / $10 output — "Cached
+  // input tokens are priced at 5% of the uncached input token rate" on THIS model, so oai()'s
+  // input/10 would bill every cache hit 2x; the base cacheRead is overridden. ">272K … 2x input
+  // and cache rates and 1.5x output for the full request" → tier $4 / $0.20 / $5 / $15.
+  // Without this row the roster emitted gpt-6.1-sol with NO cost (OM billed $0) and the Codex
+  // catalog's 272,000 operating default as its window.
+  "gpt-6.1-sol": { ...oai(1_050_000, 2, 10), cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5, longContext: tier(4, 15, 0.2, 5) } },
   "gpt-6-luna": oai(1_050_000, 0.1, 0.5, tier(0.2, 0.75, 0.02, 0.25)),
   "gpt-5.6-sol": oai(1_050_000, 4, 20, tier(8, 30, 0.8, 10)),
   "gpt-5.6-luna": oai(1_050_000, 0.2, 1.2, tier(0.4, 1.8, 0.04, 0.5)),
