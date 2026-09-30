@@ -507,9 +507,19 @@ Verified live across all four provider families: `opus → claude-opus-5-5`,
 `astra → gpt-6-astra`, `sol → gpt-6.1-sol`, `gemini → gemini-3.8-flash`, and `heretic → heretic:latest`.
 Official OpenAI and Anthropic SDK contracts remain covered in the test suite.
 
-It binds `127.0.0.1` only, because it hands out your subscription to anything that can
-reach it. Set `APIPLAN_API_KEY` to require a key (enforced on `Authorization` *and*
-`x-api-key`), `--port` / `--host` to move it.
+It binds `127.0.0.1` by default, because it hands out your subscription to anything that can
+reach it. `--port` / `--host` move it; any non-loopback `--host` **refuses to start without a
+key**. The key comes from `--key-file <path>` (preferred — a value on the command line shows in
+`ps`), `APIPLAN_SERVE_KEY_FILE`, `APIPLAN_SERVE_KEY`, or the older `APIPLAN_API_KEY`. It is
+checked in constant time on `Authorization: Bearer` *and* `x-api-key`, before any work is done.
+With a key set, `GET /health` without it answers public liveness only
+(`{"status":"alive","auth":"required"}`), and `/_apiplan/control|drain` accept only an
+unproxied local caller or the key. `--cors <origin>` (or `APIPLAN_CORS_ORIGIN`) turns on CORS
+for browser callers.
+
+```sh
+apiplan serve --host 0.0.0.0 --port 8787 --key-file ~/.apiplan/serve.key   # remote, keyed
+```
 
 ## Make your own commands
 

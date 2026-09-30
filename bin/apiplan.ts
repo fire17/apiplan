@@ -526,7 +526,9 @@ USAGE
   apiplan doctor [--json] [--strict]  diagnose PATH, logins, catalog, daemon, shadowed names
   apiplan update                 pull the latest apiplan, re-sync commands + models
   apiplan daemon [stop]          run or stop the warm daemon
-  apiplan serve [--port N]       an OpenAI- and Anthropic-shaped API on localhost
+  apiplan serve [--port N] [--host H] [--key-file F] [--cors ORIGIN]
+                                 an OpenAI- and Anthropic-shaped API (loopback by default;
+                                 any other --host requires a key: --key-file / APIPLAN_SERVE_KEY)
   apiplan hotswap <status|upgrade> [--wait-seconds N]
                                  drain + replace the live 8787 server without breaking clients
   apiplan talk [--voice v] [--live-model m]  speak with the model out loud, both ways
@@ -867,9 +869,14 @@ switch (sub) {
     const port = Number(valOf("--port") ?? process.env.APIPLAN_HOTSWAP_PORT ?? "8787");
     const base = `http://127.0.0.1:${port}`;
     const stateFile = `${process.env.HOME}/.apiplan/hotswap-${port}.json`;
+    // A keyed server still opens its control plane to a local, unproxied caller; the key is
+    // sent anyway so hotswap also works where that exemption does not apply.
+    const { inboundKey } = await import("../src/api.ts");
+    const hsKey = (() => { try { return inboundKey({ keyFile: valOf("--key-file") ?? undefined }); } catch { return undefined; } })();
+    const hsHeaders: Record<string, string> = hsKey ? { authorization: `Bearer ${hsKey}` } : {};
     const control = async () => {
       try {
-        const response = await fetch(`${base}/_apiplan/control`);
+        const response = await fetch(`${base}/_apiplan/control`, { headers: hsHeaders });
         if (!response.ok) return null;
         const value = await response.json() as any;
         return typeof value?.pid === "number" && typeof value?.cachePolicy === "string" ? value : null;
@@ -884,7 +891,7 @@ switch (sub) {
       const live = await control();
       if (!live) die("no live APIPlan control endpoint on this port");
       const priorPid = live.pid;
-      const drained = await (await fetch(`${base}/_apiplan/drain`, { method: "POST" })).json() as Record<string, unknown>;
+      const drained = await (await fetch(`${base}/_apiplan/drain`, { method: "POST", headers: hsHeaders })).json() as Record<string, unknown>;
       const deadline = Date.now() + waitSeconds * 1000;
       let last = drained;
       while (Number(last.activeRequests ?? 0) > 0 && Date.now() < deadline) {
@@ -894,7 +901,10 @@ switch (sub) {
       if (Number(last.activeRequests ?? 0) > 0) die(`drain timed out with ${last.activeRequests} active request(s); the old server remains alive`);
       try { process.kill(priorPid, "SIGTERM"); } catch {}
       for (let i = 0; i < 40; i++) { try { process.kill(priorPid, 0); await Bun.sleep(100); } catch { break; } }
-      const child = Bun.spawn([process.execPath, import.meta.path, "serve", "--port", String(port)], {
+      const child = Bun.spawn([process.execPath, import.meta.path, "serve", "--port", String(port),
+        // The replacement binds where the old one did, with the same key source.
+        ...(typeof live.hostname === "string" ? ["--host", live.hostname] : []),
+        ...(valOf("--key-file") ? ["--key-file", valOf("--key-file")!] : [])], {
         env: { ...process.env }, stdin: "ignore", stdout: "ignore", stderr: "ignore",
       });
       child.unref();
@@ -919,6 +929,8 @@ switch (sub) {
     const s = serve({
       port,
       host: valOf("--host") ?? undefined,
+      keyFile: valOf("--key-file") ?? undefined,
+      cors: valOf("--cors") ?? undefined,
       reusePort: has("--reuse-port") || process.env.APIPLAN_REUSE_PORT === "1",
     });
     process.stdout.write(`${bold("apiplan api")} ${dim("v" + VERSION)} listening on ${key(s.url)} · cached tokens default\n\n`);
@@ -927,7 +939,8 @@ switch (sub) {
     process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
     process.stdout.write(dim(`  GET  /v1/models · /health\n`));
     process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
-    if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_API_KEY to require a key\n`));
+    if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_SERVE_KEY_FILE (or --key-file) to require a key\n`));
+    else process.stdout.write(dim(`  key required: Authorization: Bearer <key> or x-api-key: <key> · GET /health is public liveness only\n`));
     await new Promise(() => {});
     break;
   }

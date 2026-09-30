@@ -18,7 +18,8 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 /**
  * chatjimmy.ai is reachable here too, but it is not an apiplan *provider*: it needs no
@@ -1918,7 +1919,45 @@ function errorFor(dialect: "openai" | "anthropic", status: number, message: stri
     : json({ error: { message, type: status === 401 ? "authentication_error" : status >= 500 ? "server_error" : "invalid_request_error", param: null, code: status === 401 ? "invalid_api_key" : (upstream ?? null) } }, status, extra);
 }
 
-export type ServeOpts = { port?: number; host?: string; token?: string; reusePort?: boolean };
+export type ServeOpts = { port?: number; host?: string; token?: string; keyFile?: string; cors?: string; reusePort?: boolean };
+
+/** Hosts that only this machine can reach. Anything else is a public bind. */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+export const isLoopbackHost = (h: string) => LOOPBACK_HOSTS.has(h.toLowerCase()) || /^127\./.test(h);
+
+/**
+ * The inbound key, from (in order) the explicit option, a key FILE, APIPLAN_SERVE_KEY, then
+ * the older APIPLAN_API_KEY. A file is the preferred way to hand a key to a remote server:
+ * a `--key <value>` flag would sit in `ps` output and in every shell history that ran it.
+ */
+export function inboundKey(opts: Pick<ServeOpts, "token" | "keyFile"> = {}, env: Record<string, string | undefined> = process.env): string | undefined {
+  if (opts.token) return opts.token;
+  const file = opts.keyFile ?? env.APIPLAN_SERVE_KEY_FILE;
+  if (file) {
+    const k = readFileSync(file, "utf8").trim();
+    if (!k) throw new Error(`apiplan serve: key file ${file} is empty`);
+    return k;
+  }
+  return env.APIPLAN_SERVE_KEY || env.APIPLAN_API_KEY || undefined;
+}
+
+/** Constant-time key check: both sides hashed to 32 bytes, so neither length nor content leaks through timing. */
+export function keyMatches(presented: string | null | undefined, key: string): boolean {
+  if (!presented) return false;
+  const a = createHash("sha256").update(presented).digest();
+  const b = createHash("sha256").update(key).digest();
+  return timingSafeEqual(a, b);
+}
+
+/** The key a caller presented on either vendor's header (OpenAI: Bearer; Anthropic: x-api-key). */
+export function presentedKeys(h: Headers): string[] {
+  const out: string[] = [];
+  const auth = h.get("authorization");
+  if (auth) out.push(auth.replace(/^Bearer\s+/i, ""));
+  const x = h.get("x-api-key");
+  if (x) out.push(x);
+  return out;
+}
 
 export function serve(opts: ServeOpts = {}) {
   // R-1: this process has an EVENT LOOP and exactly one thread, so no credential may ever be
@@ -1938,7 +1977,22 @@ export function serve(opts: ServeOpts = {}) {
   const port = opts.port ?? Number(process.env.APIPLAN_API_PORT ?? 8787);
   // Bind loopback by default: this hands out your subscription to whoever can reach it.
   const hostname = opts.host ?? process.env.APIPLAN_API_HOST ?? "127.0.0.1";
-  const token = opts.token ?? process.env.APIPLAN_API_KEY;
+  const token = inboundKey(opts);
+  // A public bind with no key would hand every subscription on this machine to anyone who
+  // can reach the port. Refuse to start rather than serve that.
+  if (!isLoopbackHost(hostname) && !token) {
+    throw new Error(`apiplan serve: refusing to bind ${hostname} without a key — set APIPLAN_SERVE_KEY_FILE (or --key-file) / APIPLAN_SERVE_KEY`);
+  }
+  const cors = opts.cors ?? process.env.APIPLAN_CORS_ORIGIN ?? "";
+  const corsHeaders: Record<string, string> = cors ? {
+    "access-control-allow-origin": cors,
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "authorization, x-api-key, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, anthropic-dangerous-direct-browser-access",
+    "access-control-expose-headers": "retry-after, x-should-retry, x-apiplan-failure",
+    "access-control-max-age": "600",
+    ...(cors === "*" ? {} : { vary: "origin" }),
+  } : {};
+  const authed = (req: Request) => !token || presentedKeys(req.headers).some((k) => keyMatches(k, token));
   const cachePolicy = "cached" as const;
   const startedAt = Date.now();
   let accepting = true;
@@ -1963,10 +2017,38 @@ export function serve(opts: ServeOpts = {}) {
   const server = Bun.serve({
     port, hostname, reusePort: opts.reusePort ?? false,
     idleTimeout: 255,
-    async fetch(req) {
+    async fetch(req, srv) {
+      const res = await route(req, srv);
+      if (!cors) return res;
+      // A Response relayed from fetch() has immutable headers; rebuild it around the same body.
+      try { for (const [k, v] of Object.entries(corsHeaders)) res.headers.set(k, v); return res; }
+      catch {
+        const headers = new Headers(res.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      }
+    },
+  });
+  async function route(req: Request, srv: { requestIP(r: Request): { address: string } | null }): Promise<Response> {
       const url = new URL(req.url);
       const path = url.pathname.replace(/\/+$/, "") || "/";
       const dialect: "openai" | "anthropic" = path.includes("/messages") || req.headers.has("x-api-key") ? "anthropic" : "openai";
+      // A browser preflight carries no credentials by design; it only learns the CORS policy.
+      if (cors && req.method === "OPTIONS") return new Response(null, { status: 204 });
+      // Liveness is public so a remote caller (or a monitor) can tell "down" from "wrong key";
+      // the full verdict — provider list, expiries, account detail — stays behind the key.
+      if (req.method === "GET" && path === "/health" && !authed(req)) {
+        return json({ status: "alive", auth: "required", dialects: ["openai", "anthropic"] });
+      }
+      // The control plane can drain this server. With a key set it is open only to a caller on
+      // this machine that did not arrive through a proxy (a forwarded request's peer is the
+      // proxy's loopback address, not the caller's), or to a caller holding the key.
+      if (path === "/_apiplan/control" || path === "/_apiplan/drain") {
+        const peer = srv.requestIP(req)?.address ?? "";
+        const local = isLoopbackHost(peer) || peer === "::ffff:127.0.0.1";
+        const proxied = req.headers.has("x-forwarded-for") || req.headers.has("forwarded") || req.headers.has("x-real-ip");
+        if (token && !(local && !proxied) && !authed(req)) return errorFor(dialect, 401, "invalid api key");
+      }
       if (req.method === "GET" && path === "/_apiplan/control") return json(control());
       if (req.method === "POST" && path === "/_apiplan/drain") {
         if (!accepting) return json(control());
@@ -1987,13 +2069,11 @@ export function serve(opts: ServeOpts = {}) {
       const handle = async (): Promise<Response> => {
         // Register whatever the local daemon holds before anything reads the registry —
         // /v1/models, /health and every call resolve against the same live truth.
+        // A key is optional on loopback and mandatory on any other bind; when set it is
+        // enforced on both the OpenAI and the Anthropic auth headers, since callers use
+        // whichever they know. Checked BEFORE any work, so an unauthenticated caller costs nothing.
+        if (!authed(req)) throw new HttpError(401, "invalid api key");
         await ensureOllama();
-        // A token is optional (it is loopback), but when set it is enforced on both the
-        // OpenAI and the Anthropic auth headers, since callers use whichever they know.
-        if (token) {
-          const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-          if (bearer !== token && req.headers.get("x-api-key") !== token) throw new HttpError(401, "invalid api key");
-        }
         if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return listModels(dialect);
         if (req.method === "GET" && (path === "/health" || path === "/")) return health();
         if (req.method !== "POST") throw new HttpError(405, `${req.method} ${path} is not supported`);
@@ -2029,8 +2109,7 @@ export function serve(opts: ServeOpts = {}) {
       if (settled) void settled.then(release, release);
       else release();
       return response;
-    },
-  });
+  }
   // server.port, not the requested one: port 0 means "any free port", and only the
   // server knows which it got.
   return { url: `http://${hostname}:${server.port}`, port: server.port, hostname, tokenRequired: !!token, control, stop: () => server.stop(true) };

@@ -3,7 +3,7 @@
 // checks a shape the translation layer owns. That keeps them credential-free and fast,
 // which is what lets them run in CI on three operating systems.
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { serve, optsFrom, fromAnthropic } from "../src/api.ts";
+import { serve, optsFrom, fromAnthropic, inboundKey, keyMatches, isLoopbackHost } from "../src/api.ts";
 
 const readSrc = (name: string) =>
   require("node:fs").readFileSync(new URL(`../src/${name}`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "utf8");
@@ -188,6 +188,95 @@ describe("a key is optional, but enforced on both headers when set", () => {
       expect((await fetch(s.url + "/v1/models", { headers: { "x-api-key": "secret" } })).status).toBe(200);
       expect(s.tokenRequired).toBe(true);
     } finally { s.stop(); }
+  });
+});
+
+describe("a remote-reachable server is gated by a key only its owner holds", () => {
+  test("a public bind without a key refuses to start", () => {
+    const prev = { a: process.env.APIPLAN_API_KEY, b: process.env.APIPLAN_SERVE_KEY, c: process.env.APIPLAN_SERVE_KEY_FILE };
+    delete process.env.APIPLAN_API_KEY; delete process.env.APIPLAN_SERVE_KEY; delete process.env.APIPLAN_SERVE_KEY_FILE;
+    try { expect(() => serve({ port: 0, host: "0.0.0.0" })).toThrow(/refusing to bind/); }
+    finally { for (const [k, v] of [["APIPLAN_API_KEY", prev.a], ["APIPLAN_SERVE_KEY", prev.b], ["APIPLAN_SERVE_KEY_FILE", prev.c]] as const) if (v !== undefined) process.env[k] = v; }
+  });
+  test("a public bind WITH a key starts and enforces it", async () => {
+    const s = serve({ port: 0, host: "0.0.0.0", token: "k-remote" });
+    try {
+      const at = `http://127.0.0.1:${s.port}`;
+      expect(s.tokenRequired).toBe(true);
+      expect((await fetch(at + "/v1/models")).status).toBe(401);
+      expect((await fetch(at + "/v1/models", { headers: { authorization: "Bearer k-remote" } })).status).toBe(200);
+    } finally { s.stop(); }
+  });
+  test("unauthenticated POSTs are refused on both dialects, before the body is read", async () => {
+    const s = serve({ port: 0, host: "127.0.0.1", token: "k" });
+    try {
+      const chat = await fetch(s.url + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      expect(chat.status).toBe(401);
+      expect(((await chat.json()) as any).error.code).toBe("invalid_api_key");
+      const msg = await fetch(s.url + "/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-api-key": "wrong" }, body: "not json" });
+      expect(msg.status).toBe(401);
+      expect(((await msg.json()) as any).error.type).toBe("authentication_error");
+    } finally { s.stop(); }
+  });
+  test("/health is public liveness only; the full verdict needs the key", async () => {
+    const s = serve({ port: 0, host: "127.0.0.1", token: "k" });
+    try {
+      const pub: any = await (await fetch(s.url + "/health")).json();
+      expect(pub).toEqual({ status: "alive", auth: "required", dialects: ["openai", "anthropic"] });
+      const full: any = await (await fetch(s.url + "/health", { headers: { "x-api-key": "k" } })).json();
+      expect(Array.isArray(full.providers)).toBe(true);
+    } finally { s.stop(); }
+  });
+  test("the control plane is closed to proxied callers without the key", async () => {
+    const s = serve({ port: 0, host: "127.0.0.1", token: "k" });
+    try {
+      expect((await fetch(s.url + "/_apiplan/control")).status).toBe(200); // local, unproxied: hotswap still works
+      expect((await fetch(s.url + "/_apiplan/control", { headers: { "x-forwarded-for": "203.0.113.9" } })).status).toBe(401);
+      expect((await fetch(s.url + "/_apiplan/drain", { method: "POST", headers: { "x-forwarded-for": "203.0.113.9" } })).status).toBe(401);
+      expect((await fetch(s.url + "/_apiplan/control", { headers: { "x-forwarded-for": "203.0.113.9", authorization: "Bearer k" } })).status).toBe(200);
+      expect(s.control().accepting).toBe(true);
+    } finally { s.stop(); }
+  });
+  test("key comparison is exact, length-independent, and empty never matches", () => {
+    expect(keyMatches("abc", "abc")).toBe(true);
+    expect(keyMatches("abd", "abc")).toBe(false);
+    expect(keyMatches("abcd", "abc")).toBe(false);
+    expect(keyMatches("", "abc")).toBe(false);
+    expect(keyMatches(null, "abc")).toBe(false);
+  });
+  test("the key comes from option, file, then env — and an empty file is an error", () => {
+    const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apiplan-key-"));
+    try {
+      const f = path.join(dir, "key");
+      fs.writeFileSync(f, "from-file\n");
+      expect(inboundKey({ token: "opt", keyFile: f }, {})).toBe("opt");
+      expect(inboundKey({ keyFile: f }, { APIPLAN_SERVE_KEY: "env" })).toBe("from-file");
+      expect(inboundKey({}, { APIPLAN_SERVE_KEY_FILE: f })).toBe("from-file");
+      expect(inboundKey({}, { APIPLAN_SERVE_KEY: "serve", APIPLAN_API_KEY: "legacy" })).toBe("serve");
+      expect(inboundKey({}, { APIPLAN_API_KEY: "legacy" })).toBe("legacy");
+      expect(inboundKey({}, {})).toBeUndefined();
+      fs.writeFileSync(f, "\n");
+      expect(() => inboundKey({ keyFile: f }, {})).toThrow(/empty/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  test("loopback detection", () => {
+    for (const h of ["127.0.0.1", "localhost", "::1", "127.0.0.2"]) expect(isLoopbackHost(h)).toBe(true);
+    for (const h of ["0.0.0.0", "::", "192.168.1.5", "example.com"]) expect(isLoopbackHost(h)).toBe(false);
+  });
+  test("CORS is opt-in: a preflight is answered and every response carries the policy", async () => {
+    const plain = serve({ port: 0, host: "127.0.0.1", token: "k" });
+    const s = serve({ port: 0, host: "127.0.0.1", token: "k", cors: "*" });
+    try {
+      expect((await fetch(plain.url + "/v1/models")).headers.get("access-control-allow-origin")).toBeNull();
+      const pre = await fetch(s.url + "/v1/messages", { method: "OPTIONS" });
+      expect(pre.status).toBe(204);
+      expect(pre.headers.get("access-control-allow-origin")).toBe("*");
+      expect(pre.headers.get("access-control-allow-headers")).toContain("x-api-key");
+      const denied = await fetch(s.url + "/v1/models");
+      expect(denied.status).toBe(401);
+      expect(denied.headers.get("access-control-allow-origin")).toBe("*");
+    } finally { plain.stop(); s.stop(); }
   });
 });
 
