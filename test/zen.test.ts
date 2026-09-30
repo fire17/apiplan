@@ -300,7 +300,7 @@ describe("T2 `spark` reaches Muse Spark, and nothing else moved", () => {
     // Zen republishes gpt-6-astra and grok-4.6 under their vendors' own names. If those names
     // resolved here, the same command on PATH would start billing a different account — the
     // single worst failure this port could cause, and the reason for the `zen-` prefix.
-    expect(resolve("opus")?.id).toBe("claude-opus-5");
+    expect(resolve("opus")?.id).toBe("claude-opus-5-5");
     expect(resolve("opus")?.provider).toBe("anthropic");
     expect(resolve("gpt")?.provider).toBe("openai");
     expect(resolve("codex")?.provider).toBe("openai");

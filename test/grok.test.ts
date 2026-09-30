@@ -602,7 +602,7 @@ describe("grok's contract and registration", () => {
 
   test("adding grok did not disturb any other provider's aliases", () => {
     // The resolve path is shared, so a new family is exactly where an alias regression hides.
-    expect(resolve("opus")?.id).toBe("claude-opus-5");
+    expect(resolve("opus")?.id).toBe("claude-opus-5-5");
     expect(resolve("codex")?.provider).toBe("openai");
     expect(resolve("gemini")?.provider).toBe("google");
     expect(resolve("nonexistent-model-xyz")).toBeNull();
