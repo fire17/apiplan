@@ -515,6 +515,7 @@ USAGE
   apiplan vision <video>         ordered concurrent Gemini frame understanding
   apiplan commands               every global command, and whether PATH finds it
   apiplan voices                 every speech voice available to you, and from where
+  apiplan usage [--json] [--provider anthropic|openai]  subscription 5h + weekly windows, per provider
   apiplan live-models [--json]    voice models, transports and supported capabilities
   apiplan live-check [--live-model m] [--text words]  bounded subscription audio check
   apiplan install [--dry-run]    create the default command set and put it on PATH (--dry-run: show what would change)
@@ -783,6 +784,27 @@ switch (sub) {
     break;
   }
   case "doctor": await cmdDoctor(); break;
+  case "usage": {
+    const { subscriptionUsage, USAGE_PROVIDERS } = await import("../src/usage.ts");
+    const p = valOf("--provider");
+    if (p && !USAGE_PROVIDERS.includes(p as any)) die(`usage: apiplan usage [--json] [--provider ${USAGE_PROVIDERS.join("|")}]`);
+    const r = await subscriptionUsage(p as any);
+    if (has("--json")) { process.stdout.write(JSON.stringify(r, null, 2) + "\n"); break; }
+    const bar = (n: number) => { const f = Math.max(0, Math.min(20, Math.round(n / 5))); const s = "\u2588".repeat(f) + dim("\u2591".repeat(20 - f)); return n >= 90 ? bad(s) : n >= 70 ? warn(s) : ok(s); };
+    const when = (t: string | null) => { if (!t) return ""; const ms = Date.parse(t) - Date.now(); if (ms <= 0) return dim(" resets now"); const h = Math.floor(ms / 3_600_000), m = Math.round((ms % 3_600_000) / 60_000); return dim(` resets in ${h >= 24 ? `${Math.floor(h / 24)}d ${h % 24}h` : `${h}h ${m}m`} (${t})`); };
+    const row = (label: string, w: { used_percent: number; resets_at: string | null } | null) =>
+      process.stdout.write(`  ${pad(label, 22)} ${w ? `${bar(w.used_percent)} ${pad(`${w.used_percent}%`, 7)}${when(w.resets_at)}` : dim("\u2014 not reported")}\n`);
+    for (const [id, u] of Object.entries(r)) {
+      if (!u) continue;
+      process.stdout.write(`${head(id)}${u.account ? `  ${u.account}` : ""}${u.plan ? dim(` \u00b7 ${u.plan}`) : ""}${u.status ? dim(` \u00b7 ${u.status}`) : ""}\n`);
+      if (u.error) process.stdout.write(`  ${DOT_BAD} ${u.error}\n`);
+      if (u.five_hour || !u.error) row("5-hour", u.five_hour);
+      if (u.seven_day || !u.error) row("weekly", u.seven_day);
+      for (const [k, w] of Object.entries(u.extra)) row(k, w);
+      process.stdout.write(dim(`  source: ${u.source} \u00b7 fetched ${u.fetched_at}\n\n`));
+    }
+    break;
+  }
   case "talk": case "converse": {
     // A persona long enough to be worth writing belongs in a file, not in argv.
     const personaFrom = () => {
@@ -937,7 +959,7 @@ switch (sub) {
     process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
     process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
     process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
-    process.stdout.write(dim(`  GET  /v1/models · /health\n`));
+    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /health\n`));
     process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
     if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_SERVE_KEY_FILE (or --key-file) to require a key\n`));
     else process.stdout.write(dim(`  key required: Authorization: Bearer <key> or x-api-key: <key> · GET /health is public liveness only\n`));

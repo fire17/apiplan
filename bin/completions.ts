@@ -13,7 +13,7 @@ import { join } from "node:path";
 
 export const SHELLS = ["zsh", "bash", "fish"] as const;
 export type Shell = (typeof SHELLS)[number];
-export const SUBCOMMANDS = ["status", "roster", "models", "media", "vision", "commands", "voices", "live-models", "live-check",
+export const SUBCOMMANDS = ["status", "roster", "models", "media", "vision", "commands", "voices", "usage", "live-models", "live-check",
   "install", "add", "rename", "rm", "sync", "prune", "doctor", "update", "daemon", "serve", "hotswap", "talk", "path",
   "shell-init", "completions", "chatgpt", "help"];
 /** Every flag bin/ask.ts accepts — src/engine.ts parseArgs is the truth; a test pins the two together. */

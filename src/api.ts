@@ -17,6 +17,7 @@ import { capacityRecordFromResponse, isRealAccountIdent } from "./capacity-signa
 import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinking,
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
+import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -2333,6 +2334,13 @@ export function serve(opts: ServeOpts = {}) {
         if (!authed(req)) throw new HttpError(401, "invalid api key");
         await ensureOllama();
         if (req.method === "GET" && (path === "/v1/models" || path === "/models")) return listModels(dialect);
+        // Subscription windows (5h + weekly) per provider, for a caller that switches vendors at a
+        // threshold. Cached in-process (src/usage.ts), so polling this cannot hammer upstream.
+        if (req.method === "GET" && (path === "/v1/usage" || path === "/usage")) {
+          const p = url.searchParams.get("provider") ?? undefined;
+          if (p !== undefined && !USAGE_PROVIDERS.includes(p as UsageProvider)) throw new HttpError(400, `provider must be one of ${USAGE_PROVIDERS.join(", ")}`);
+          return json(await subscriptionUsage(p as UsageProvider | undefined));
+        }
         if (req.method === "GET" && (path === "/health" || path === "/")) return health();
         if (req.method !== "POST") throw new HttpError(405, `${req.method} ${path} is not supported`);
 
