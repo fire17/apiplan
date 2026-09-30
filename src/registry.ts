@@ -143,11 +143,14 @@ const FALLBACK: Record<ProviderId, CatalogEntry[]> = {
     { id: "claude-opus-4-1-20250805", label: "Claude Opus 4.1" },
   ],
   google: [
-    // Read live from `agy models` on 2026-08-27 against the Antigravity subscription.
+    // Read live from `agy models` on 2026-08-27 against the Antigravity subscription;
+    // gemini-3.8-flash added 2026-09-30 from the live fetchAvailableModels catalog (it is the
+    // catalog's defaultAgentModelId, gemini-3.8-flash-high, with -low/-medium beside it).
     // The EFFORT is part of Google's wire id (gemini-3.7-flash-low), unlike OpenAI where it
     // is a request field — so these ids carry family/variant only and the provider appends
     // the effort in build(). Baking it in here would break the alias law: `gemini` must mean
     // the newest gemini, not one arbitrary effort of it.
+    { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", efforts: GOOGLE_EFFORTS },
     { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", efforts: GOOGLE_EFFORTS },
     { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash", efforts: GOOGLE_EFFORTS },
     { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", efforts: GOOGLE_EFFORTS },

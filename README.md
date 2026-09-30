@@ -500,7 +500,7 @@ for Opus 4.6.
 | `GET /v1/models` | 32 live models across Anthropic, OpenAI, Google, Ollama and jimmy |
 
 Verified live across all four provider families: `opus → claude-opus-5`,
-`astra → gpt-6-astra`, `sol → gpt-5.6-sol`, `gemini → gemini-3.7-flash`, and `heretic → heretic:latest`.
+`astra → gpt-6-astra`, `sol → gpt-5.6-sol`, `gemini → gemini-3.8-flash`, and `heretic → heretic:latest`.
 Official OpenAI and Anthropic SDK contracts remain covered in the test suite.
 
 It binds `127.0.0.1` only, because it hands out your subscription to anything that can
