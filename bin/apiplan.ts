@@ -60,7 +60,7 @@ function dropNote(id: ProviderId, list: { id: string }[]): string {
  * listed from 0.155.0 up to 99.0.0). P1 owns the single constant (CODEX_CLIENT_VERSION_FLOOR
  * in src/registry.ts); until it lands the literal below is the same number.
  */
-const CODEX_CLIENT_VERSION: string = (R as any).CODEX_CLIENT_VERSION_FLOOR ?? "0.155.0";
+const CODEX_CLIENT_VERSION: string = (R as any).CODEX_CLIENT_VERSION_FLOOR ?? "0.159.0";
 const semverMax = (...vs: (string | undefined)[]) => vs.filter((v): v is string => !!v && /^\d+\.\d+\.\d+$/.test(v))
   .sort((a, b) => { const x = a.split(".").map(Number), y = b.split(".").map(Number); return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]); }).at(-1) ?? CODEX_CLIENT_VERSION;
 /** a < b, both x.y.z (a malformed a counts as below). */

@@ -40,7 +40,7 @@ export const CATALOG_0155 = {
 };
 
 type Probe = { resolve: Record<string, string | null>; openai: any[]; roundTrip: string[]; err?: string };
-const NAMES = ["luna", "sol", "astra", "terra", "gpt", "gpt6", "codex", "gpt56", "luna6", "sol6", "astra6",
+const NAMES = ["gpt-6.1-sol", "GPT-6.1-Sol", "gpt61sol", "gpt61", "sol61", "luna", "sol", "astra", "terra", "gpt", "gpt6", "codex", "gpt56", "luna6", "sol6", "astra6",
   "luna56", "sol56", "terra56", "gpt6luna", "gpt6sol", "gpt56luna", "gpt56sol", "gpt-6-luna", "GPT-6-Luna",
   "gpt-6-sol", "spark13", "gpt-6-terra", "terra6"];
 /** Run the registry against `cache` (null = no models.openai.json → FALLBACK) in a hermetic home. */
@@ -63,8 +63,10 @@ function probe(cache: any[] | null): Probe {
 const rowOf = (p: Probe, id: string) => p.openai.find((m) => m.id === id);
 
 describe("catalog client version", () => {
-  test("the floor is the lowest version that lists every model known today (0.155.0)", () => {
-    expect(CODEX_CLIENT_VERSION_FLOOR).toBe("0.155.0");
+  // gpt-6.1-sol STATES minimal_client_version 0.153.0 but is listed only from 0.159.0 (live
+  // 2026-09-30: absent at 0.158.0 and 0.158.1, present at 0.159.0 … 99.0.0), so the floor carries it.
+  test("the floor is the lowest version that lists every model known today (0.159.0)", () => {
+    expect(CODEX_CLIENT_VERSION_FLOOR).toBe("0.159.0");
     expect(CODEX_CATALOG_PROBE_VERSION).toBe("99.0.0");
   });
   test("neededClientVersion = highest minimal_client_version among API-capable rows", () => {
@@ -177,9 +179,19 @@ describe("robustness", () => {
   });
   test("a fresh machine with no cache (FALLBACK) already knows GPT-6 Sol and Luna", () => {
     const p = probe(null);
-    expect([p.resolve.luna, p.resolve.sol, p.resolve.luna6, p.resolve.sol56, p.resolve.gpt]).toEqual(["gpt-6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-6-astra"]);
+    // 2026-09-30: GPT-6.1-Sol (version 6.1, catalog priority 1) now owns `sol` and `gpt`; sol6 keeps GPT-6-Sol.
+    expect([p.resolve.luna, p.resolve.sol, p.resolve.sol6, p.resolve.luna6, p.resolve.sol56, p.resolve.gpt]).toEqual(["gpt-6-luna", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-6.1-sol"]);
     expect(rowOf(p, "gpt-6-luna")).toMatchObject({ ctx: 272000, max: 872000, images: true, def: "medium" });
     expect(rowOf(p, "gpt-6-luna").efforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+    expect(p.roundTrip).toEqual([]);
+  });
+  test("FALLBACK knows GPT-6.1-Sol: exact id, explicit names, honest aliases", () => {
+    const p = probe(null);
+    const r = rowOf(p, "gpt-6.1-sol");
+    expect(r).toMatchObject({ ctx: 272000, max: 872000, images: true, def: "low", rank: 1 });
+    expect(r.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    for (const n of ["gpt-6.1-sol", "GPT-6.1-Sol", "gpt61sol", "gpt61", "sol61", "codex"]) expect([n, p.resolve[n]]).toEqual([n, "gpt-6.1-sol"]);
+    expect([p.resolve.gpt6, p.resolve.astra, p.resolve.sol6]).toEqual(["gpt-6-astra", "gpt-6-astra", "gpt-6-sol"]);
     expect(p.roundTrip).toEqual([]);
   });
 });

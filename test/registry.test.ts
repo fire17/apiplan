@@ -14,7 +14,7 @@ describe("family aliases follow the newest model", () => {
     expect(id("sonnet")).toBe("claude-sonnet-5-5");
     expect(id("fable")).toBe("claude-fable-5-1");
     expect(id("haiku")).toBe("claude-haiku-4-5-20251001");
-    expect(id("gpt")).toBe("gpt-6-astra");
+    expect(id("gpt")).toBe("gpt-6.1-sol"); // 6.1 > 6 (2026-09-30); `gpt6`/`astra` stay on GPT-6-Astra
   });
 });
 
@@ -73,7 +73,8 @@ describe("every subscription model marked API-capable is addressable", () => {
     expect(id("codex-auto-review")).toBe("codex-auto-review");
     expect(id("reserve")).toBe("gpt-reserve");
     expect(id("auto-review")).toBe("codex-auto-review");
-    expect(id("codex")).toBe("gpt-6-astra"); // the newest gpt — Astra since 2026-09-05
+    // the newest gpt — Astra since 2026-09-05, GPT-6.1-Sol once read as Codex client ≥ 0.159.0 (2026-09-30)
+    expect(["gpt-6.1-sol", "gpt-6-astra"]).toContain(id("codex"));
   });
   test("models explicitly unsupported in the API are not advertised", () => {
     expect(id("gpt-5.3-codex-spark")).toBeNull();

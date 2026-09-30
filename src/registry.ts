@@ -40,10 +40,13 @@ export type CatalogEntry = {
  * `minimal_client_version` is above the version the client asks as. THE single floor constant:
  * the lowest version that lists every model known today — gpt-6-sol and gpt-6-luna need 0.155.0
  * (observed live 2026-09-29: absent at 0.153.4 and 0.154.9, listed from 0.155.0 up to 99.0.0),
- * gpt-6-astra 0.153.0 (2026-09-05). The refresh asks as the max of this, the installed Codex's
+ * gpt-6-astra 0.153.0 (2026-09-05). gpt-6.1-sol needs 0.159.0 although its row STATES
+ * minimal_client_version 0.153.0 (observed live 2026-09-30: absent at 0.158.0/0.158.1, listed from
+ * 0.159.0 up to 99.0.0) — so neededClientVersion() cannot learn it and the floor must carry it.
+ * The refresh asks as the max of this, the installed Codex's
  * stamps and APIPLAN_CODEX_CLIENT_VERSION (bin/apiplan.ts) — it only ever moves UP.
  */
-export const CODEX_CLIENT_VERSION_FLOOR = "0.155.0";
+export const CODEX_CLIENT_VERSION_FLOOR = "0.159.0";
 /** A far-future client version the catalog answers (HTTP 200 at 99.0.0, 2026-09-29). Asking as it
  *  shows every row the server has, so its answer is used only to LEARN the version to ask as —
  *  never stored: metadata is version-sensitive (gpt-6-sol's default effort read `low` at 0.155.0
@@ -236,13 +239,16 @@ const FALLBACK: Record<ProviderId, CatalogEntry[]> = {
   openai: [
     // GPT-6 (read live from the Codex catalog): Astra lists from `client_version` 0.153.0
     // (2026-09-05), Sol and Luna from 0.155.0 (2026-09-29) — see CODEX_CLIENT_VERSION_FLOOR above.
-    // In the catalog's own priority order (astra 1, sol 2, luna 3), which keeps `gpt` on Astra.
+    // In the catalog's own priority order (6.1-sol 1, astra 2, sol 3, luna 4; live 2026-09-30).
     // Efforts are the catalog's, minus `ultra`: that one is a Codex CLI delegation mode the
     // Responses endpoint rejects as a reasoning effort (400, live). `none` on sol/luna is added
     // in ONE place for cache and fallback alike — WIRE_EFFORTS below.
-    { id: "gpt-6-astra", label: "GPT-6-Astra", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", rank: 1, ...GPT6 },
-    { id: "gpt-6-sol", label: "GPT-6-Sol", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "low", rank: 2, ...GPT6 },
-    { id: "gpt-6-luna", label: "GPT-6-Luna", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", rank: 3, ...GPT6 },
+    // GPT-6.1-Sol (2026-09-30): catalog priority 1, listed from client 0.159.0 (see the floor).
+    // Version 6.1 > 6, so `gpt`, `codex` and `sol` follow it; `sol6`/`gpt6` stay on GPT-6.
+    { id: "gpt-6.1-sol", label: "GPT-6.1-Sol", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "low", rank: 1, ...GPT6 },
+    { id: "gpt-6-astra", label: "GPT-6-Astra", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", rank: 2, ...GPT6 },
+    { id: "gpt-6-sol", label: "GPT-6-Sol", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "low", rank: 3, ...GPT6 },
+    { id: "gpt-6-luna", label: "GPT-6-Luna", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", rank: 4, ...GPT6 },
     { id: "gpt-5.6-sol", label: "GPT-5.6-Sol", efforts: ["low", "medium", "high", "xhigh", "max"] },
     { id: "gpt-5.6-luna", label: "GPT-5.6-Luna", efforts: ["low", "medium", "high", "xhigh", "max"] },
     { id: "gpt-5.6-terra", label: "GPT-5.6-Terra", efforts: ["low", "medium", "high", "xhigh", "max"] },

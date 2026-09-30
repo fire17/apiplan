@@ -4,7 +4,7 @@
 // with 1,024 `cached_tokens` from the Codex subscription endpoint.
 import { expect, test, describe } from "bun:test";
 import { openai } from "../src/providers.ts";
-import { resolve, aliasesFor } from "../src/registry.ts";
+import { resolve, aliasesFor, models } from "../src/registry.ts";
 import { defaults } from "../src/commands.ts";
 import { parseArgs } from "../src/engine.ts";
 
@@ -15,15 +15,20 @@ describe("gpt-6-astra is addressable", () => {
   test.each(["astra", "gpt6astra", "gpt-6-astra", "GPT-6-Astra", "gpt6"])("%s → gpt-6-astra", (name) => {
     expect(resolve(name)?.id).toBe("gpt-6-astra");
   });
-  test("it is the newest gpt, so the family alias follows it and the older variants stay reachable", () => {
-    expect(resolve("gpt")?.id).toBe("gpt-6-astra");
-    expect(resolve("codex")?.id).toBe("gpt-6-astra");
+  // Astra was the newest gpt from 2026-09-05; GPT-6.1-Sol (listed from Codex client 0.159.0,
+  // 2026-09-30) outranks it once the catalog is read at that version. Either cache state is valid,
+  // so the family alias must follow whichever is newest — and Astra stays reachable by name.
+  const newestGpt = () => models("openai").find((m) => m.family === "gpt" && m.version.length)!.id;
+  test("the family alias follows the newest gpt and the older variants stay reachable", () => {
+    expect(["gpt-6.1-sol", "gpt-6-astra"]).toContain(newestGpt());
+    expect(resolve("gpt")?.id).toBe(newestGpt());
+    expect(resolve("codex")?.id).toBe(newestGpt());
     expect(resolve("sol")?.variant).toBe("sol");
     expect(resolve("gpt56sol")?.id).toBe("gpt-5.6-sol");
     expect(resolve("gpt56")?.id).toBe("gpt-5.6-sol");
   });
   test("aliases and efforts come from the catalog entry — minus `ultra`, which the endpoint rejects", () => {
-    expect(aliasesFor(astra())).toEqual(["gpt", "gpt6astra", "astra"]);
+    expect(aliasesFor(astra())).toEqual([...(newestGpt() === "gpt-6-astra" ? ["gpt"] : []), "gpt6astra", "astra"]);
     // live 2026-09-05: reasoning.effort 'ultra' → 400 on gpt-5.6-sol and gpt-6-astra;
     // 'minimal' → 400 on gpt-6-astra. What is advertised must be what is accepted.
     expect(openai.efforts(astra())).toEqual(["low", "medium", "high", "xhigh", "max"]);

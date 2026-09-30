@@ -474,7 +474,7 @@ modelRoles:
     // R4 — his picker order is untouched, and zen never gets in front of it.
     test("HARNESS_ORDER is byte-identical and every zen id lands after every other row", () => {
       expect(HARNESS_ORDER).toEqual([
-        "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
+        "gpt-6-astra", "claude-fable-5-1", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
         "claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
         "gemini-*", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-*",
       ]);
@@ -563,6 +563,8 @@ describe("GPT-6 Sol/Luna rows", () => {
   test("each sits at the head of its family slot, the 5.6 id right behind it", () => {
     expect(HARNESS_ORDER.indexOf("gpt-6-sol") + 1).toBe(HARNESS_ORDER.indexOf("gpt-5.6-sol"));
     expect(HARNESS_ORDER.indexOf("gpt-6-luna") + 1).toBe(HARNESS_ORDER.indexOf("gpt-5.6-luna"));
-    expect(HARNESS_ORDER.indexOf("gpt-6-sol")).toBe(2);
+    // 2026-09-30: GPT-6.1-Sol heads the Sol slot, GPT-6-Sol right behind it.
+    expect(HARNESS_ORDER.indexOf("gpt-6.1-sol")).toBe(2);
+    expect(HARNESS_ORDER.indexOf("gpt-6-sol")).toBe(3);
   });
 });

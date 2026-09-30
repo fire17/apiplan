@@ -22,9 +22,10 @@ export const JIMMY_ID = "llama3.1-8B";
  * Haiku (latest), then everything else in a logical order. A `*` entry expands to every
  * registry model of that prefix, newest first; a missing id is simply skipped.
  * 2026-09-29: GPT-6 Sol/Luna take the head of their family's slot; the 5.6 ids follow them.
+ * 2026-09-30: GPT-6.1-Sol heads the Sol slot.
  */
 export const HARNESS_ORDER = [
-  "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
+  "gpt-6-astra", "claude-fable-5-1", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
   "claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
   "gemini-*", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-*",
 ];
