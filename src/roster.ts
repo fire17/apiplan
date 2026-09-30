@@ -18,14 +18,15 @@ export const JIMMY_ID = "llama3.1-8B";
 /**
  * The default order, as fire17 set it (2026-09-05): Astra, Fable 5.1, Sol, Fable 5,
  * Opus 5, Opus 4.8, Opus 4.6, Terra, Luna, Jimmy, Gemini (all variants), Sonnet 5,
+ * [2026-09-30: Opus 5.5 leads the Opus block, Sonnet 5.5 the Sonnet block]
  * Haiku (latest), then everything else in a logical order. A `*` entry expands to every
  * registry model of that prefix, newest first; a missing id is simply skipped.
  * 2026-09-29: GPT-6 Sol/Luna take the head of their family's slot; the 5.6 ids follow them.
  */
 export const HARNESS_ORDER = [
-  "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5",
-  "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
-  "gemini-*", "claude-sonnet-5", "claude-haiku-*",
+  "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
+  "claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
+  "gemini-*", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-*",
 ];
 /** Labelled so nobody — human or agent — picks them for real work. */
 export const DUMB_LABEL = "(dumb - do not use)";
@@ -308,11 +309,15 @@ export const DOCUMENTED: Record<string, Documented> = {
   "grok-build-0.1": xai(256_000, 1, 2, 0.2, xaiTier(2, 4, 0.4)),
   "claude-fable-5-1": claude(1_000_000, 10, 50, 0.25),
   "claude-fable-5": claude(1_000_000, 10, 50),
+  // Opus 5.5 / Sonnet 5.5 read 2026-09-30 from the same pricing page: Opus 5.5 is $4/$20
+  // with cache hits at 0.05x ($0.20); Sonnet 5.5 is $2/$10, standard 0.1x cache hits.
+  "claude-opus-5-5": claude(1_000_000, 4, 20, 0.2),
   "claude-opus-5": claude(1_000_000, 5, 25),
   "claude-opus-4-8": claude(1_000_000, 5, 25),
   "claude-opus-4-7": claude(1_000_000, 5, 25),
   "claude-opus-4-6": claude(1_000_000, 5, 25),
   "claude-opus-4-5-20251101": claude(200_000, 5, 25),
+  "claude-sonnet-5-5": claude(1_000_000, 2, 10),
   "claude-sonnet-5": claude(1_000_000, 2, 10),
   "claude-sonnet-4-6": claude(1_000_000, 3, 15),
   "claude-sonnet-4-5-20250929": claude(200_000, 3, 15),

@@ -7,11 +7,11 @@ import { resolve, models, norm, aliasesFor } from "../src/registry.ts";
 const id = (name: string) => resolve(name)?.id ?? null;
 
 describe("family aliases follow the newest model", () => {
-  test("opus is Opus 5, not 4.8", () => {
-    expect(id("opus")).toBe("claude-opus-5");
+  test("opus is Opus 5.5, not 5 or 4.8", () => {
+    expect(id("opus")).toBe("claude-opus-5-5");
   });
   test("sonnet, fable, haiku, gpt resolve to their newest", () => {
-    expect(id("sonnet")).toBe("claude-sonnet-5");
+    expect(id("sonnet")).toBe("claude-sonnet-5-5");
     expect(id("fable")).toBe("claude-fable-5-1");
     expect(id("haiku")).toBe("claude-haiku-4-5-20251001");
     expect(id("gpt")).toBe("gpt-6-astra");
@@ -20,11 +20,13 @@ describe("family aliases follow the newest model", () => {
 
 describe("explicit versions stay reachable", () => {
   test.each([
+    ["opus55", "claude-opus-5-5"],
     ["opus5", "claude-opus-5"],
     ["opus48", "claude-opus-4-8"],
     ["opus47", "claude-opus-4-7"],
     ["opus46", "claude-opus-4-6"],
     ["opus45", "claude-opus-4-5-20251101"],
+    ["sonnet55", "claude-sonnet-5-5"],
     ["sonnet5", "claude-sonnet-5"],
     ["sonnet46", "claude-sonnet-4-6"],
     ["sonnet45", "claude-sonnet-4-5-20250929"],
@@ -95,12 +97,16 @@ describe("registry shape", () => {
     expect(all.some((m) => m.provider === "anthropic")).toBe(true);
     expect(all.some((m) => m.provider === "openai")).toBe(true);
     const opus = all.filter((m) => m.family === "opus");
-    expect(opus[0].id).toBe("claude-opus-5");
+    expect(opus[0].id).toBe("claude-opus-5-5");
   });
   test("only the newest of a family owns the bare family alias", () => {
+    const newest = models().find((m) => m.id === "claude-opus-5-5")!;
     const five = models().find((m) => m.id === "claude-opus-5")!;
     const old = models().find((m) => m.id === "claude-opus-4-8")!;
-    expect(aliasesFor(five)).toContain("opus");
+    expect(aliasesFor(newest)).toContain("opus");
+    expect(aliasesFor(newest)).toContain("opus55");
+    expect(aliasesFor(five)).not.toContain("opus");
+    expect(aliasesFor(five)).toContain("opus5");
     expect(aliasesFor(old)).not.toContain("opus");
     expect(aliasesFor(old)).toContain("opus48");
   });

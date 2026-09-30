@@ -19,12 +19,14 @@ describe("harness roster", () => {
     const present = HARNESS_ORDER.filter((x) => !x.endsWith("*") && ids.includes(x));
     expect(present.length).toBeGreaterThanOrEqual(8);
     expect(ids.slice(0, present.length)).toEqual(present);
+    expect(ids.indexOf("claude-opus-5-5")).toBe(ids.indexOf("claude-opus-5") - 1); // Opus 5.5 leads the Opus block
     const head = present.length;
     const gem = ids.filter((i) => i.startsWith("gemini-"));
     expect(gem.length).toBeGreaterThanOrEqual(4);
     expect(ids.indexOf(gem[0])).toBe(head);                        // gemini block right after jimmy
-    expect(ids.indexOf(`claude-sonnet-5 ${DUMB_LABEL}`)).toBe(head + gem.length);
-    expect(ids[head + 1 + gem.length].startsWith("claude-haiku-") && ids[head + 1 + gem.length].endsWith(DUMB_LABEL)).toBe(true);
+    expect(ids.indexOf(`claude-sonnet-5-5 ${DUMB_LABEL}`)).toBe(head + gem.length);
+    expect(ids.indexOf(`claude-sonnet-5 ${DUMB_LABEL}`)).toBe(head + 1 + gem.length);
+    expect(ids[head + 2 + gem.length].startsWith("claude-haiku-") && ids[head + 2 + gem.length].endsWith(DUMB_LABEL)).toBe(true);
   });
   test("sonnet and haiku carry the warning in id AND name, nothing else does", () => {
     for (const e of harnessRoster()) {
@@ -36,7 +38,8 @@ describe("harness roster", () => {
   test("a labelled id still resolves to the real model", () => {
     expect(resolve(`claude-sonnet-5 ${DUMB_LABEL}`)?.id).toBe("claude-sonnet-5");
     expect(resolve(`claude-haiku-4-5-20251001 ${DUMB_LABEL}`)?.id).toBe("claude-haiku-4-5-20251001");
-    expect(resolve("sonnet (anything)")?.id).toBe("claude-sonnet-5");
+    expect(resolve(`claude-sonnet-5-5 ${DUMB_LABEL}`)?.id).toBe("claude-sonnet-5-5");
+    expect(resolve("sonnet (anything)")?.id).toBe("claude-sonnet-5-5");
     expect(resolve("(nothing)")).toBeNull();
   });
   test("no duplicates, no ollama library, jimmy once, every listed id resolves", () => {
@@ -49,6 +52,7 @@ describe("harness roster", () => {
     const by = Object.fromEntries(harnessRoster().map((e) => [e.id, e]));
     expect(by["gpt-6-astra"]).toMatchObject({ reasoning: true, efforts: ["low", "medium", "high", "xhigh", "max"], input: ["text", "image"], contextWindow: 1050000, maxTokens: 128000 });
     expect(by["claude-opus-5"]).toMatchObject({ reasoning: true, efforts: ["low", "medium", "high", "xhigh", "max"], contextWindow: 1000000 });
+    expect(by["claude-opus-5-5"]).toMatchObject({ reasoning: true, efforts: ["low", "medium", "high", "xhigh", "max"], contextWindow: 1000000, maxTokens: 128000 });
     expect(by[JIMMY_ID]).toMatchObject({ reasoning: false, input: ["text"] });
   });
   /**
@@ -112,6 +116,9 @@ describe("harness roster", () => {
     // platform.claude.com/docs/en/about-claude/pricing: Fable 5.1 cache reads at 0.025x
     expect(by["claude-fable-5-1"].cost).toEqual({ input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 });
     expect(by[`claude-sonnet-5 ${DUMB_LABEL}`].cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
+    // 2026-09-30 pricing page: Opus 5.5 $4/$20, cache hits 0.05x; Sonnet 5.5 $2/$10
+    expect(by["claude-opus-5-5"].cost).toEqual({ input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 });
+    expect(by[`claude-sonnet-5-5 ${DUMB_LABEL}`].cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
     expect(by[`claude-haiku-4-5-20251001 ${DUMB_LABEL}`]).toMatchObject({ contextWindow: 200000, maxTokens: 64000, cost: { input: 1, output: 5 } });
     expect(by[JIMMY_ID].cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     expect(rosterYaml()).toContain("cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5,");
@@ -467,9 +474,9 @@ modelRoles:
     // R4 — his picker order is untouched, and zen never gets in front of it.
     test("HARNESS_ORDER is byte-identical and every zen id lands after every other row", () => {
       expect(HARNESS_ORDER).toEqual([
-        "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5",
-        "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
-        "gemini-*", "claude-sonnet-5", "claude-haiku-*",
+        "gpt-6-astra", "claude-fable-5-1", "gpt-6-sol", "gpt-5.6-sol", "claude-fable-5", "claude-opus-5-5",
+        "claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", JIMMY_ID,
+        "gemini-*", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-*",
       ]);
       const all = harnessRoster().map((e) => e.id);
       const firstZen = all.findIndex((i) => i.startsWith("zen-"));

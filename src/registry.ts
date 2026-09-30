@@ -125,6 +125,10 @@ export const GEMINI_EFFORTS_MINIMAL = ["minimal", "low", "medium", "high"];
 const GPT6 = { contextWindow: 272_000, maxContextWindow: 872_000, input: ["text", "image"] };
 const FALLBACK: Record<ProviderId, CatalogEntry[]> = {
   anthropic: [
+    // Opus 5.5 (2026-09-21) and Sonnet 5.5 (2026-09-28): read live from /v1/models on
+    // 2026-09-30 (created_at stamps), ids confirmed in platform.claude.com models overview.
+    { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+    { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
     { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
     { id: "claude-opus-5", label: "Claude Opus 5" },
     { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
