@@ -1,10 +1,10 @@
 #project v1
 slug: apiplan
 first_shipped: 2026-07-28
-last_updated: 2026-09-05
-version: v0.7.1
+last_updated: 2026-10-01
+version: v0.9.0
 status: published
 repo: https://github.com/fire17/apiplan
 channels: github
-last_shipped: 2026-08-31
+last_shipped: 2026-10-01
 ---
