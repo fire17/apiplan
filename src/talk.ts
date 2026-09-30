@@ -11,6 +11,7 @@ import { unlinkSync } from "node:fs";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { VpCapture, type VpEvent } from "./aec.ts";
+import { resolveLiveModel } from "./live-models.ts";
 
 const RATE = 24000;
 
@@ -29,6 +30,9 @@ export type TalkResult = {
 
 export type TalkOpts = {
   model?: string;
+  signal?: AbortSignal;
+  duration?: number;
+  inputFile?: string;
   voice?: string;
   /** Persona / behaviour for the whole conversation, not one line. */
   direction?: string;
@@ -72,6 +76,22 @@ export type TalkOpts = {
 };
 
 export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
+  const selected = resolveLiveModel(o.model);
+  if (selected.transport === "codex-webrtc") {
+    const { talkCodexLive } = await import("./talk-codex-live.ts");
+    return talkCodexLive(o);
+  }
+  // Gemini's Bidi socket is a THIRD transport, and everything below this line — the mic
+  // command, the OpenAI credentials, session.update, response.create — is Realtime's
+  // vocabulary. Rather than a half-working duplicate of this 7,000-line conversation
+  // loop, the refusal names the verb that DOES drive it: live-check runs a real bounded
+  // exchange (synthesized utterance in, speech or transcript out) and --dictate
+  // transcribes. A full mic-driven Gemini conversation is a further piece of work; what
+  // is refused here is pretending this loop already is one.
+  if (selected.transport === "gemini-bidi") {
+    throw new Error(`${selected.id} speaks Google's BidiGenerateContent protocol, which this conversation loop (OpenAI Realtime) cannot drive. Verified paths today: \`apiplan live-check --live-model ${selected.id}\` for a real bounded exchange, or \`--dictate --live-model gemini-transcribe-live\` to transcribe.`);
+  }
+  if (o.inputFile || o.duration) throw new Error("--input-audio and --duration currently apply only to codex-live talk.");
   const mic = micCommand(RATE);
   // LiveMind stereo voice field (canon 023): the MOUTH leans right, the MIND leans left.
   // The interleave happens in-process (panChunk) so his knob is live — the player only
@@ -98,7 +118,7 @@ export async function talk(o: TalkOpts = {}): Promise<TalkResult> {
   // when its cuts stop being followed by anything he said (redteam S3).
   let bargeOn = !!o.barge && process.env.APIPLAN_BARGE_OK === "1";
   const c = openai.creds();
-  const model = o.model || process.env.APIPLAN_REALTIME_MODEL || "gpt-realtime";
+  const model = selected.id;
   // gpt-4o-mini-transcribe hallucinates far less than whisper-1 on near-silence; override
   // via env if a deployment needs whisper-1 back.
   const transcribeModel = process.env.APIPLAN_TRANSCRIBE || "gpt-4o-mini-transcribe";

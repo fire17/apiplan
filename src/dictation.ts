@@ -17,9 +17,11 @@
 //     last word clips it ("commit." → "can"). Half a second of zero-PCM before
 //     CloseStream cures it and costs nothing audible.
 import { micCommand } from "./platform.ts";
-import { anthropic, openai } from "./providers.ts";
+import { anthropic, openai, openRealtime } from "./providers.ts";
+import { resolveLiveModel, requireLiveCapability } from "./live-models.ts";
 
 export type DictateOpts = {
+  model?: string;
   /** Which subscription transcribes: "anthropic" (default) or "openai". */
   provider?: "anthropic" | "openai";
   /** BCP-47-ish language hint. Anthropic's engine takes one pinned language. */
@@ -47,6 +49,12 @@ function audioSource(rate: number): string[] | null {
 
 /** One dictation: mic → socket → final transcript. Resolves with the full text. */
 export function dictate(o: DictateOpts = {}): Promise<string> {
+  // A Gemini live id selects by MODEL rather than by `provider`, because it is a third
+  // transport rather than a third subscription: the two providers above are a
+  // subscription each, and this one is an API key. Routing on the resolved transport is
+  // what stops `--dictate --live-model gemini-transcribe-live` from opening an OpenAI
+  // socket to a Google model — the exact failure realtimeModelId() refuses for talk.
+  if (o.model && resolveLiveModel(o.model).transport === "gemini-bidi") return dictateGeminiBidi(o);
   return (o.provider === "openai" ? dictateOpenAI : dictateAnthropic)(o);
 }
 
@@ -185,16 +193,16 @@ function dictateAnthropic(o: DictateOpts): Promise<string> {
  * .completed` carries each settled line. gpt-4o-transcribe streams interim deltas too.
  */
 function dictateOpenAI(o: DictateOpts): Promise<string> {
+  const selected = resolveLiveModel(o.model);
+  requireLiveCapability(selected, "dictation");
   const mic = audioSource(OAI_RATE);
   if (!mic) throw new Error("no microphone capture available — install ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`).");
   const c = openai.creds();
   const say = o.onEvent ?? (() => {});
-  const model = process.env.APIPLAN_REALTIME_MODEL || "gpt-realtime";
+  const model = selected.id;
   const stt = process.env.APIPLAN_STT_MODEL || "gpt-4o-transcribe";
 
-  const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
-    headers: { Authorization: `Bearer ${c.token}` },
-  } as any);
+  const ws = openRealtime(c.token, model);
 
   return new Promise<string>((resolve, reject) => {
     const settled: string[] = [];
@@ -299,4 +307,58 @@ function dictateOpenAI(o: DictateOpts): Promise<string> {
       reject(new Error(`dictation closed early (${e?.code ?? "?"}) ${String(e?.reason ?? "").slice(0, 120)}`));
     };
   });
+}
+
+// ─────────────────────────── Google Gemini Live (BidiGenerateContent) ───────────────────────────
+
+/**
+ * Dictation over Gemini's Live socket. A THIRD transport, not a third provider: it
+ * authenticates with a Gemini API key rather than a subscription token, and speaks
+ * BidiGenerateContent rather than either STT protocol above.
+ *
+ * PROVEN LIVE 2026-09-06 against gemini-3.5-transcribe-live: 3.4 s of 16 kHz mono PCM16
+ * came back as two `interimInputTranscription` events and one final `inputTranscription`
+ * 1.7 s after setup. Same 16 kHz rate as the Anthropic path, so `audioSource` and its
+ * APIPLAN_DICTATE_INPUT file-replay seam are reused unchanged — which is also how this
+ * path is testable at all, since a microphone cannot be scripted.
+ *
+ * The mic is read to EXHAUSTION and then transcribed in one bounded exchange, rather than
+ * streamed live. That is honest about what was measured: the server's automatic detector
+ * settles this model reliably at the END of an utterance, and a Ctrl-C-able infinite
+ * streaming session was never driven. So this serves a bounded clip — a file replay, or a
+ * mic run stopped by Enter — and does not pretend to be an open-ended session.
+ */
+async function dictateGeminiBidi(o: DictateOpts): Promise<string> {
+  const selected = resolveLiveModel(o.model);
+  requireLiveCapability(selected, "dictation");
+  const source = audioSource(RATE);
+  if (!source) throw new Error("no microphone capture available — install ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`).");
+  const say = o.onEvent ?? (() => {});
+
+  const proc = Bun.spawn(source, { stdout: "pipe", stderr: "ignore" });
+  const chunks: Uint8Array[] = [];
+  let stopped = false;
+  const restoreKeys = stopKeys(() => { stopped = true; try { proc.kill(); } catch {} });
+  say("info", `capturing for ${selected.id} — Enter finishes`);
+  try {
+    const reader = proc.stdout.getReader();
+    while (!stopped) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+  } finally { restoreKeys(); try { proc.kill(); } catch {} }
+
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  if (!total) throw new Error("captured no audio — is the microphone working? (macOS: check the terminal's mic permission)");
+  const pcm = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) { pcm.set(c, at); at += c.length; }
+
+  const { transcribeBidi } = await import("./gemini-live.ts");
+  const result = await transcribeBidi(pcm, {
+    model: selected.id,
+    onEvent: (kind, text) => say(kind, text),
+  });
+  return result.text;
 }

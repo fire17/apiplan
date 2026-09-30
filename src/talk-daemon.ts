@@ -22,10 +22,11 @@
 import { openai, openRealtime } from "./providers.ts";
 import { ipc, ipcTarget } from "./platform.ts";
 import { VERSION } from "./engine.ts";
+import { resolveLiveModel } from "./live-models.ts";
 
 const RATE = 24000;
 const DEFAULT_VOICE = "cedar";
-const realtimeModel = () => process.env.APIPLAN_REALTIME_MODEL || "gpt-realtime";
+const realtimeModel = () => resolveLiveModel().id;
 const defaultVoice = () => process.env.APIPLAN_VOICE || DEFAULT_VOICE;
 
 /** What the thin CLI sends to POST /talk. A subset of TalkOpts: the daemon supplies
@@ -215,6 +216,8 @@ export function armPark(reason = ""): void {
   if (busy) return;                                   // a call owns the socket right now
   if (park && park.state !== "dead") return;          // already parked or on its way
   if (process.env.APIPLAN_TALK_PARK === "off") return;
+  try { if (!resolveLiveModel().capabilities.park) { trace("selected live transport does not support parking"); return; } }
+  catch (error: any) { trace(error.message); return; }
   if (!openai.probe().connected) { trace("not parking: openai not logged in"); return; }
 
   const model = realtimeModel(), voice = defaultVoice();
@@ -307,6 +310,12 @@ export async function handleTalk(req: Request): Promise<Response> {
 
   let r: TalkReq = {};
   try { r = (await req.json()) as TalkReq; } catch { r = {}; }
+  try {
+    if (resolveLiveModel(r.model).transport !== "realtime-websocket") {
+      busy = false;
+      return Response.json({ error: "Codex live uses the direct native transport. Run apiplan talk --live-model codex-live." }, { status: 400 });
+    }
+  } catch (error: any) { busy = false; return Response.json({ error: error.message }, { status: 400 }); }
 
   const enc = new TextEncoder();
   let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -338,7 +347,7 @@ export async function handleTalk(req: Request): Promise<Response> {
 }
 
 async function runCall(r: TalkReq, push: (ev: TalkEvent) => void): Promise<void> {
-  const model = r.model || realtimeModel();
+  const model = resolveLiveModel(r.model).id;
   const voice = r.voice || defaultVoice();
   const barge = !!r.barge;
 
