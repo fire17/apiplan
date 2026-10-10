@@ -20,6 +20,7 @@ import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
 import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
+import { predictionConfig, predictFromRequest, ComposerError, type ComposerRequest } from "./composer.ts";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -2442,6 +2443,11 @@ export function serve(opts: ServeOpts = {}) {
           return json(await subscriptionUsage(p as UsageProvider | undefined));
         }
         if (req.method === "GET" && (path === "/health" || path === "/")) return health();
+        // Codex composer predictions (src/composer.ts, docs/COMPOSER.md): the live server config.
+        if (req.method === "GET" && (path === "/v1/composer/config" || path === "/composer/config")) {
+          const { cfg, source, error } = await predictionConfig({ fresh: url.searchParams.get("fresh") === "1" });
+          return json({ object: "composer.config", source, ...(error ? { error } : {}), ...cfg });
+        }
         if (req.method !== "POST") throw new HttpError(405, `${req.method} ${path} is not supported`);
 
         // Only `model` is inspected here; each route parses the rest in its own dialect.
@@ -2457,6 +2463,25 @@ export function serve(opts: ServeOpts = {}) {
           case "/v1/messages/count_tokens": case "/messages/count_tokens": return countTokens(body);
           case "/v1/audio/speech": case "/audio/speech": return await speech(body);
           case "/v1/images/generations": case "/images/generations": return await images(body, req.signal);
+          case "/v1/composer/predictions": case "/composer/predictions": {
+            // Reading this machine's own transcripts (codex_thread / claude_session) is the owner's
+            // alone — the same rule /v1/usage/keys uses to show every key.
+            const peer = srv.requestIP(req)?.address ?? "";
+            const local = (isLoopbackHost(peer) || peer === "::ffff:127.0.0.1")
+              && !(req.headers.has("x-forwarded-for") || req.headers.has("forwarded") || req.headers.has("x-real-ip"));
+            const owner = who.id === LEGACY.id || (who.id === ANONYMOUS.id && local);
+            const meter: Meter = acct.meter = { model: typeof body?.model === "string" ? body.model : "gpt-6-astra", provider: "openai", stream: false };
+            let p;
+            try { p = await predictFromRequest(body as ComposerRequest, { allowLocalSources: owner, signal: req.signal }); }
+            catch (e: any) { throw new HttpError(e instanceof ComposerError ? e.status : 500, e.message); }
+            meter.model = p.model;
+            if (p.usage) {
+              const cached = p.usage.cached_tokens ?? 0;
+              meter.usage = { input: Math.max(0, (p.usage.input_tokens ?? 0) - cached), output: p.usage.output_tokens ?? 0,
+                cacheRead: cached, cacheWrite: 0, estimated: p.usage.input_tokens === undefined, basis: "exclusive" };
+            }
+            return json(p);
+          }
           default: throw new HttpError(404, `no route for POST ${path}`);
         }
       };
