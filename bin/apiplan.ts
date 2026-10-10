@@ -516,6 +516,7 @@ USAGE
   apiplan commands               every global command, and whether PATH finds it
   apiplan voices                 every speech voice available to you, and from where
   apiplan usage [--json] [--provider anthropic|openai]  subscription 5h + weekly windows, per provider
+  apiplan composer [--codex id|--claude id|--file f] [--json]  predict your next message (Codex composer predictions)
   apiplan live-models [--json]    voice models, transports and supported capabilities
   apiplan live-check [--live-model m] [--text words]  bounded subscription audio check
   apiplan install [--dry-run]    create the default command set and put it on PATH (--dry-run: show what would change)
@@ -790,6 +791,10 @@ switch (sub) {
     break;
   }
   case "doctor": await cmdDoctor(); break;
+  case "composer": {
+    const { main } = await import("./composer.ts");
+    process.exit(await main(argv.slice(1)));
+  }
   case "usage": {
     const { subscriptionUsage, USAGE_PROVIDERS } = await import("../src/usage.ts");
     const p = valOf("--provider");
@@ -1054,8 +1059,8 @@ switch (sub) {
     process.stdout.write(`${bold("apiplan api")} ${dim("v" + VERSION)} listening on ${key(s.url)} · cached tokens default\n\n`);
     process.stdout.write(`  ${dim("OpenAI SDK   ")} OPENAI_BASE_URL=${s.url}/v1\n`);
     process.stdout.write(`  ${dim("Anthropic SDK")} ANTHROPIC_BASE_URL=${s.url}\n\n`);
-    process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations\n`));
-    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /v1/usage/keys[?group=model,day,key] · /health · /dashboard\n`));
+    process.stdout.write(dim(`  POST /v1/chat/completions · /v1/messages · /v1/audio/speech · /v1/images/generations · /v1/composer/predictions\n`));
+    process.stdout.write(dim(`  GET  /v1/models · /v1/usage · /v1/usage/keys[?group=model,day,key] · /v1/composer/config · /health · /dashboard\n`));
     process.stdout.write(dim(`  any model id or alias works on either shape — \`apiplan models\` lists them\n`));
     if (!s.tokenRequired) process.stdout.write(dim(`  loopback only; set APIPLAN_SERVE_KEY_FILE (or --key-file) to require a key\n`));
     else process.stdout.write(dim(`  key required: Authorization: Bearer <key> or x-api-key: <key> · GET /health is public liveness only\n`));
