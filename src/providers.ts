@@ -6,7 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { HOME, IS_MAC, STATE_DIR, readJson, writeJson } from "./platform.ts";
 import type { Model, ProviderId } from "./registry.ts";
-import { ANTHROPIC_EFFORTS, GOOGLE_EFFORTS, saveModels } from "./registry.ts";
+import { ANTHROPIC_EFFORTS, GOOGLE_EFFORTS, saveModels, googleWireId } from "./registry.ts";
 import type { StreamShape } from "./stream-shape.ts";
 import { realtimeModelId } from "./live-models.ts";
 
@@ -1719,7 +1719,7 @@ type GoogleMediaCatalog = {
  * authority for the crucial distinction between input and output capability: a chat model's
  * `supportsVideo` means it can WATCH video; only imageGenerationModelIds names a media
  * generator. The current catalog has no video- or music-generation id. */
-export async function refreshGoogleCatalog(): Promise<{ count: number; imageModels: string[] }> {
+export async function refreshGoogleCatalog(): Promise<{ count: number; imageModels: string[]; extras: string[] }> {
   await google.prepare?.();
   const c = google.creds();
   const res = await fetch(`${GOOGLE_BASE()}/v1internal:fetchAvailableModels`, {
@@ -1750,15 +1750,47 @@ export async function refreshGoogleCatalog(): Promise<{ count: number; imageMode
     efforts: GOOGLE_EFFORTS.filter((e) => m.efforts.includes(e)),
   }));
   if (!list.length) throw new Error("fetchAvailableModels returned no addressable Gemini chat models");
-  saveModels("google", list);
   const imageModels = Array.isArray(body?.imageGenerationModelIds) ? body.imageGenerationModelIds.filter((x: any) => typeof x === "string") : [];
+  const extras = antigravityExtras(body?.models ?? {}, imageModels);
+  saveModels("google", [...list, ...extras]);
   const catalog: GoogleMediaCatalog = {
     fetched_at: Date.now(), imageGenerationModelIds: imageModels,
     audioTranscriptionModelIds: Array.isArray(body?.audioTranscriptionModelIds) ? body.audioTranscriptionModelIds : [],
     supportedMimeTypes: mime,
   };
   writeJson(GOOGLE_MEDIA_CACHE(), catalog);
-  return { count: list.length, imageModels };
+  return { count: list.length, imageModels, extras: extras.map((e) => e.id) };
+}
+
+/**
+ * The chat models Antigravity serves BESIDE its effort-suffixed Gemini ids: Claude, GPT-OSS
+ * and the lite/older Gemini lines. Each was probed live on 2026-10-11 with one tiny turn
+ * (Claude answered with modelVersion "claude-sonnet-4-6"; a bogus id answered 404, so the
+ * route really selects the model). Until then the effort regex dropped all of them.
+ *
+ * Skipped: completion/tab ids (chat_*, tab_*), media generators, and the Gemini agent /
+ * tiered / extra-low / thinking variants, which are product wrappers rather than models.
+ * Several ids sharing one displayName are server-side aliases of ONE model (gemini-2.5-flash
+ * and gemini-3.5-flash-lite both display "Gemini 3.5 Flash Lite"), so only the id that spells
+ * the name is kept — or the sole id when the name is unique.
+ */
+export function antigravityExtras(models: Record<string, any>, skip: string[] = []): { id: string; label: string; efforts: string[] }[] {
+  const byName = new Map<string, string[]>();
+  for (const [wire, info] of Object.entries<any>(models)) {
+    if (/^(?:chat_|tab_)/.test(wire) || skip.includes(wire)) continue;
+    if (/^gemini-[\d.]+-(?:flash|pro)-(?:low|medium|high)$/.test(wire)) continue;
+    if (wire.startsWith("gemini-") && /-(?:agent|tiered|extra-low|thinking|image)$/.test(wire)) continue;
+    const name = String(info?.displayName ?? "").trim();
+    if (!name) continue;
+    byName.set(name, [...(byName.get(name) ?? []), wire]);
+  }
+  const out: { id: string; label: string; efforts: string[] }[] = [];
+  for (const [name, wires] of byName) {
+    const slug = name.toLowerCase().replace(/\s*\((?:thinking|low|medium|high)\)\s*$/, "").replace(/\s+/g, "-");
+    const pick = wires.find((w) => w === slug) ?? (wires.length === 1 ? wires[0] : undefined);
+    if (pick) out.push({ id: `agy-${pick}`, label: `${name} (Antigravity)`, efforts: [] });
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function googleImageModel(): string {
@@ -2212,7 +2244,10 @@ export const google: Provider & StreamShape = {
     // and an id that already ends in one is left alone (a doubled suffix is a 404).
     const advertised = m.efforts ?? GOOGLE_EFFORTS;
     const effort = o.effort && advertised.includes(o.effort) ? o.effort : advertised[0];
-    const wire = advertised.some((e) => m.id.endsWith(`-${e}`)) ? m.id : `${m.id}-${effort}`;
+    // An `agy-` model (Claude, GPT-OSS, lite Gemini on Antigravity) has no effort ladder: its
+    // wire id is used exactly as the catalog lists it, minus the route marker.
+    const wire = !advertised.length ? googleWireId(m.id)
+      : advertised.some((e) => m.id.endsWith(`-${e}`)) ? m.id : `${m.id}-${effort}`;
     // Gemini names a function RESULT by the function's name, while both other dialects
     // name it by the call's id. The mapping only exists in the transcript, so it is built
     // here from every tool call the assistant already made.

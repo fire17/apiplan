@@ -292,6 +292,13 @@ function parseOpenai(id: string, label: string, efforts?: string[]): Model | nul
 /** "gemini-3.7-flash" → family gemini, version [3,7], variant flash. A trailing effort
  *  (…-low) is NOT part of the model identity — the provider appends it at call time. */
 function parseGoogle(id: string, label: string, efforts?: string[]): Model | null {
+  // Antigravity also serves models that are not effort-suffixed Gemini chat ids — Claude,
+  // GPT-OSS and the lite/older Gemini lines (fetchAvailableModels, probed live 2026-10-11).
+  // They carry the `agy-` route marker for the same reason zen's ids carry `zen-`: the plain
+  // name (claude-sonnet-4-6) already means the DIRECT route, on a different credential and
+  // bill. The marker comes off for the wire (googleWireId). No efforts: the wire id is used
+  // exactly as listed, so the family is the whole id and no short alias is minted.
+  if (/^agy-[a-z0-9][a-z0-9.-]*$/.test(id)) return { id, provider: "google", family: id, version: [], label, efforts: [] };
   const m = id.match(/^gemini-([\d.]+)-(flash|pro)(?:-(?:low|medium|high))?$/);
   if (!m) return null;
   return { id: `gemini-${m[1]}-${m[2]}`, provider: "google", family: "gemini",
@@ -402,6 +409,8 @@ function parseGemini(id: string, label: string, efforts?: string[]): Model | nul
     label, efforts,
   };
 }
+/** The Antigravity wire id of a `google` model: the `agy-` route marker removed. */
+export const googleWireId = (id: string) => id.replace(/^agy-/, "");
 /** The vendor's own spelling of a `gemini` model id — what goes on the wire. The route
  *  marker is a registry-side fact (see parseGemini) and must never reach the endpoint,
  *  which answers 404 for an id it does not publish. */
@@ -665,7 +674,10 @@ export function aliasesFor(m: Model): string[] {
   const v = m.version.join("");
   const out = new Set<string>();
   if (m.family !== "codex" && all.filter((x) => x.family === m.family && x.provider === m.provider)[0]?.id === m.id) out.add(m.family);
-  out.add(m.family + v + (m.variant ?? ""));
+  // Same rule for the family+version+variant name: two Ollama tags of one family (gpt-oss:20b-cloud
+  // and gpt-oss:120b-cloud, both version-less) share it, and only the one resolve() returns owns it.
+  const fv = m.family + v + (m.variant ?? "");
+  if (resolve(fv)?.id === m.id) out.add(fv);
   // A BARE VARIANT IS ONLY AN ALIAS IF IT ACTUALLY LANDS HERE. resolve() returns the FIRST
   // model carrying a variant word, so when several models share one — `nano` across zen's
   // gpt-5-nano and gpt-5.4-nano, `sol` across the ChatGPT subscription and the zen gateway's

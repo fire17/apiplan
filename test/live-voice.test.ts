@@ -27,7 +27,7 @@ describe("live model selection", () => {
     expect(resolveLiveModel("realtime-mini").id).toBe("gpt-realtime-mini");
     expect(resolveLiveModel("realtime-2.1-mini").id).toBe("gpt-realtime-2.1-mini");
     expect(resolveLiveModel("custom-realtime-2026").evidence).toContain("unverified");
-    expect(LIVE_MODELS.find(m => m.id === "gpt-realtime-2.1-mini")?.evidence).toContain("not been tested");
+    expect(LIVE_MODELS.find(m => m.id === "gpt-realtime-2.1-mini")?.evidence).toContain("full spoken turn");
   });
   test("does not put live models on a Realtime socket", () => {
     expect(() => realtimeModelId("codex-live")).toThrow("WebRTC");
