@@ -2148,16 +2148,39 @@ export function speechModel(requested: unknown): string {
   if (requested === undefined || requested === null || requested === "") return DEFAULT_LIVE_MODEL;
   if (typeof requested !== "string") throw new HttpError(400, "`model` must be a string");
   if (OPENAI_TTS_IDS.has(requested)) return DEFAULT_LIVE_MODEL;
+  if (isGeminiTts(requested)) return requested;
   const m = LIVE_MODELS.find((x) => x.id === requested || x.aliases.includes(requested));
   if (!m) throw new HttpError(404, `no speech model '${requested}' is available (Realtime models: ${LIVE_MODELS.filter((x) => x.transport === "realtime-websocket").map((x) => x.id).join(", ")})`);
   if (m.transport !== "realtime-websocket") throw new HttpError(400, `${m.id} uses the ${m.transport} transport; /v1/audio/speech speaks over a Realtime WebSocket model`);
   return m.id;
 }
 
-async function speech(body: any): Promise<Response> {
+/** Gemini's TTS family (gemini-3.1-flash-tts-preview, gemini-2.5-flash-preview-tts, …) —
+ *  spoken through the Gemini API key (gemini-media.ts), not a Realtime socket. */
+export const isGeminiTts = (id: string) => /^gemini-[a-z0-9.-]*-tts(?:-[a-z0-9.-]+)?$/i.test(id);
+
+/** OpenAI's voice names. A Gemini TTS request carrying one of them (or none) speaks with Gemini's
+ *  default voice; any other name is passed through as a Gemini prebuilt voice (Kore, Puck, …). */
+const OPENAI_VOICES = new Set(["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse", "marin", "cedar"]);
+export const geminiVoice = (v: unknown) => typeof v === "string" && v && !OPENAI_VOICES.has(v.toLowerCase()) ? v : "Kore";
+
+async function speech(body: any, signal?: AbortSignal): Promise<Response> {
   const text = body?.input;
   if (typeof text !== "string" || !text) throw new HttpError(400, "`input` is required");
   const model = speechModel(body?.model);
+  if (isGeminiTts(model)) {
+    // The server's Gemini API key: serve keys are inbound only, so there is no per-caller
+    // upstream credential to use instead. Upstream status is passed through (a disabled
+    // project answers 403 SERVICE_DISABLED, an unknown TTS id 404).
+    const { generateGeminiSpeech } = await import("./gemini-media.ts");
+    let r;
+    try { r = await generateGeminiSpeech(text, geminiVoice(body?.voice), signal, model); }
+    catch (e: any) {
+      const st = Number(/answered (\d{3})/.exec(e?.message ?? "")?.[1]);
+      throw new HttpError(st >= 400 && st < 600 ? st : 502, e?.message ?? String(e));
+    }
+    return new Response(r.bytes, { headers: { "content-type": r.contentType, "x-apiplan-model": model } });
+  }
   const voice = typeof body?.voice === "string" ? body.voice : "alloy";
   // `instructions` is OpenAI's own field for steering delivery — same idea as `tts --as`.
   const direction = typeof body?.instructions === "string" ? body.instructions : undefined;
@@ -2483,7 +2506,7 @@ export function serve(opts: ServeOpts = {}) {
           case "/v1/responses": case "/responses": return await openaiResponses(body, req.signal, acct.meter = meterFor(body));
           case "/v1/messages": case "/messages": return await anthropicMessages(body, req.signal, acct.meter = meterFor(body));
           case "/v1/messages/count_tokens": case "/messages/count_tokens": return countTokens(body);
-          case "/v1/audio/speech": case "/audio/speech": return await speech(body);
+          case "/v1/audio/speech": case "/audio/speech": return await speech(body, req.signal);
           case "/v1/images/generations": case "/images/generations": return await images(body, req.signal);
           case "/v1/composer/predictions": case "/composer/predictions": {
             // Reading this machine's own transcripts (codex_thread / claude_session) is the owner's

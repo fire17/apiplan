@@ -171,9 +171,9 @@ export async function generateGeminiMusic(prompt: string, signal?: AbortSignal):
   return { bytes: Buffer.from(inline.data, "base64"), contentType: inline.mimeType ?? inline.mime_type ?? "audio/mpeg", model };
 }
 
-export async function generateGeminiSpeech(text: string, voice = "Kore", signal?: AbortSignal): Promise<MediaFile> {
+export async function generateGeminiSpeech(text: string, voice = "Kore", signal?: AbortSignal, modelId?: string): Promise<MediaFile> {
   const key = geminiApiKey();
-  const model = process.env.APIPLAN_GEMINI_TTS_MODEL ?? "gemini-3.1-flash-tts-preview";
+  const model = modelId ?? process.env.APIPLAN_GEMINI_TTS_MODEL ?? "gemini-3.1-flash-tts-preview";
   const res = await fetch(`${BASE()}/v1beta/models/${model}:generateContent`, {
     method: "POST", headers: headers(key), signal,
     body: JSON.stringify({
