@@ -21,6 +21,7 @@ import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.
 import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
 import { predictionConfig, predictFromRequest, ComposerError, type ComposerRequest } from "./composer.ts";
+import { LIVE_MODELS, DEFAULT_LIVE_MODEL } from "./live-models.ts";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -2133,14 +2134,35 @@ function listModels(dialect: "openai" | "anthropic"): Response {
     aliases: m.provider === "jimmy" ? [...JIMMY_ALIASES] : aliasesFor(m) })) });
 }
 
+/** OpenAI's own TTS ids. SDKs send one by default; they mean "speak this", so they keep the default voice model. */
+const OPENAI_TTS_IDS = new Set(["tts-1", "tts-1-hd", "gpt-4o-mini-tts", "gpt-4o-tts"]);
+
+/**
+ * The Realtime model a /v1/audio/speech request runs on. It used to be ignored outright — every
+ * call ran DEFAULT_LIVE_MODEL and a bogus id answered 200 (MIND report 2026-10-11, agent:hero-greetings
+ * asking for gpt-realtime-2.1 on srv2). Now: absent or an OpenAI TTS id → the default; a catalogued
+ * Realtime model (id or alias) → that model; a catalogued model on another transport → 400; anything
+ * else → 404, as /v1/images/generations does — never a silent substitution.
+ */
+export function speechModel(requested: unknown): string {
+  if (requested === undefined || requested === null || requested === "") return DEFAULT_LIVE_MODEL;
+  if (typeof requested !== "string") throw new HttpError(400, "`model` must be a string");
+  if (OPENAI_TTS_IDS.has(requested)) return DEFAULT_LIVE_MODEL;
+  const m = LIVE_MODELS.find((x) => x.id === requested || x.aliases.includes(requested));
+  if (!m) throw new HttpError(404, `no speech model '${requested}' is available (Realtime models: ${LIVE_MODELS.filter((x) => x.transport === "realtime-websocket").map((x) => x.id).join(", ")})`);
+  if (m.transport !== "realtime-websocket") throw new HttpError(400, `${m.id} uses the ${m.transport} transport; /v1/audio/speech speaks over a Realtime WebSocket model`);
+  return m.id;
+}
+
 async function speech(body: any): Promise<Response> {
   const text = body?.input;
   if (typeof text !== "string" || !text) throw new HttpError(400, "`input` is required");
+  const model = speechModel(body?.model);
   const voice = typeof body?.voice === "string" ? body.voice : "alloy";
   // `instructions` is OpenAI's own field for steering delivery — same idea as `tts --as`.
   const direction = typeof body?.instructions === "string" ? body.instructions : undefined;
-  const { bytes, contentType } = await speakRealtime(PROVIDERS.openai.creds(), { text, voice, format: "wav", direction });
-  return new Response(bytes, { headers: { "content-type": contentType } });
+  const { bytes, contentType } = await speakRealtime(PROVIDERS.openai.creds(), { text, voice, format: "wav", direction, liveModel: model });
+  return new Response(bytes, { headers: { "content-type": contentType, "x-apiplan-model": model } });
 }
 
 async function images(body: any, signal?: AbortSignal): Promise<Response> {
@@ -2292,7 +2314,7 @@ export function serve(opts: ServeOpts = {}) {
     "access-control-allow-origin": cors,
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "authorization, x-api-key, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, anthropic-dangerous-direct-browser-access",
-    "access-control-expose-headers": "retry-after, x-should-retry, x-apiplan-failure",
+    "access-control-expose-headers": "retry-after, x-should-retry, x-apiplan-failure, x-apiplan-model",
     "access-control-max-age": "600",
     ...(cors === "*" ? {} : { vary: "origin" }),
   } : {};
