@@ -145,7 +145,7 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
         notes.push(`${id}: ${list.length} models from /v1/models${dropNote(id, list)}`);
       } else if (id === "google") {
         const r = await refreshGoogleCatalog();
-        notes.push(`${id}: ${r.count} chat models from Antigravity's live catalog${r.imageModels.length ? ` · image generation: ${r.imageModels.join(", ")}` : " · no media generator advertised"}`);
+        notes.push(`${id}: ${r.count} chat models from Antigravity's live catalog${r.extras.length ? ` + ${r.extras.length} more (${r.extras.join(", ")})` : ""}${r.imageModels.length ? ` · image generation: ${r.imageModels.join(", ")}` : " · no media generator advertised"}`);
       } else if (id === "ollama") {
         // The library is local, so this is the one refresh that needs no login and no
         // network: a loopback GET. It lives in the provider (refreshOllama) because the API
@@ -171,6 +171,18 @@ async function refreshModels(only?: ProviderId): Promise<string[]> {
         // saying so here stops "26 models" reading as "26 models you can use".
         const keyless = connected ? "" : " · no key yet, so this is the catalog only — `opencode auth login` or OPENCODE_API_KEY before a call";
         notes.push(`${id}: ${scanned}${hidden}${dropNote(id, r.list)}${keyless}`);
+      } else if (id === "gemini") {
+        // The API-key catalog (GET /v1beta/models). Until 2026-10-11 this provider fell into the
+        // Codex branch below, which wrote the CODEX list into models.gemini.json: every
+        // gemini-key-* id vanished (0 models in `status`, `geminikey`/`flashlite` "no longer
+        // resolves" in doctor) and refreshGemini() — written for exactly this — was never called.
+        const { refreshGemini } = await import("../src/providers-gemini.ts");
+        const r = await refreshGemini();
+        notes.push(`${id}: ${r.count} chat models (${r.live} live) from ${r.source}${dropNote(id, models(id).map((m) => ({ id: m.id })))}`);
+      } else if (id !== "openai") {
+        // `online` (the ChatGPT website) and `grok` carry their own catalogs; the Codex list is
+        // not theirs and overwriting their cache with it made every one of their ids unaddressable.
+        notes.push(`${id}: built-in catalog — nothing to refresh`);
       } else {
         const r = await refreshOpenaiCatalog(p);
         saveModels(id, r.list);
