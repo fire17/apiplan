@@ -1844,7 +1844,10 @@ export function parseGoogleImageResponse(body: any, requestedModel: string): Ima
     model: r.modelVersion ?? requestedModel,
   };
   const block = r.promptFeedback?.blockReason ?? cand?.finishReason;
-  throw new Error(block ? `image generation stopped: ${block}` : "the Gemini image model returned no image");
+  // Any text the model wrote instead is its explanation; carry a short excerpt.
+  const said = (cand?.content?.parts ?? []).map((p: any) => (typeof p?.text === "string" && !p.thought ? p.text : "")).join(" ").trim().replace(/\s+/g, " ");
+  const why = said ? ` — "${said.length > 300 ? said.slice(0, 300) + "…" : said}"` : "";
+  throw new Error(block && block !== "STOP" ? `image generation stopped: ${block}${why}` : `the Gemini image model returned no image${why}`);
 }
 
 /**

@@ -2197,20 +2197,50 @@ async function images(body: any, signal?: AbortSignal): Promise<Response> {
   const p = providerFor(m);
   if (!p.canGenerateImages) throw new HttpError(400, `${m.label} cannot generate images`);
   const o: CallOpts = { genImage: true, ...(body?.size ? { imageSize: body.size } : {}), ...(body?.quality ? { imageQuality: body.quality } : {}) };
-  let b64 = "", revised = "";
-  if (p.generateImage) {
-    await p.prepare?.();
-    const r = await p.generateImage(prompt, o, p.creds(), signal);
-    b64 = r.base64;
-    revised = r.revisedPrompt ?? "";
-  } else {
-    for await (const d of run(m, [{ role: "user", text: prompt }], o, signal)) {
-      if (d.imageB64) b64 = d.imageB64;
-      if (d.revisedPrompt) revised = d.revisedPrompt;
+  let b64 = "", revised = "", said = "";
+  try {
+    if (p.generateImage) {
+      await p.prepare?.();
+      const r = await p.generateImage(prompt, o, p.creds(), signal);
+      b64 = r.base64;
+      revised = r.revisedPrompt ?? "";
+    } else {
+      for await (const d of run(m, [{ role: "user", text: prompt }], o, signal)) {
+        if (d.imageB64) b64 = d.imageB64;
+        if (d.revisedPrompt) revised = d.revisedPrompt;
+        // What the model WROTE instead of drawing — usually a refusal or an explanation.
+        // It used to be dropped, so a refusal and an outage both read as one bare 502.
+        if (d.text) said += d.text;
+      }
     }
+  } catch (e: any) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Gemini's "stopped: SAFETY" / "returned no image" is the model declining, not an outage.
+    const declined = /image generation stopped:|returned no image — "/i.test(msg);
+    logImageFailure(m.id, declined ? 422 : e instanceof HttpError ? e.status : 502, msg);
+    if (declined) throw new HttpError(422, `the model declined to draw: ${msg}`, "model_declined");
+    throw e;
   }
-  if (!b64) throw new HttpError(502, "the model returned no image");
+  if (!b64) {
+    const e = noImageError(said);
+    logImageFailure(m.id, e.status, said.trim().replace(/\s+/g, " "));
+    throw e;
+  }
   return json({ created: now(), data: [{ b64_json: b64, ...(revised ? { revised_prompt: revised } : {}) }] });
+}
+
+/** No image came back: a model that WROTE something declined (422 model_declined, with an
+ *  excerpt of its words); one that wrote nothing is an upstream failure (502). */
+export function noImageError(said: string): HttpError {
+  const excerpt = said.trim().replace(/\s+/g, " ");
+  if (!excerpt) return new HttpError(502, "the model returned no image (and no text)");
+  return new HttpError(422, `the model declined to draw: "${excerpt.length > 300 ? excerpt.slice(0, 300) + "…" : excerpt}"`, "model_declined");
+}
+
+/** One stderr line per failed image request: model, status and the first 200 characters of
+ *  what the model said — never the prompt, never a credential. */
+function logImageFailure(model: string, status: number, said: string): void {
+  process.stderr.write(`apiplan images: ${status} model=${model} said=${JSON.stringify(said.slice(0, 200))}\n`);
 }
 
 // ─────────────────────────── the server ───────────────────────────
