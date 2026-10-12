@@ -1,0 +1,3 @@
+# Daily catalog reports are machine-local (installed versions, account catalogs) — not shipped.
+*
+!.gitignore
