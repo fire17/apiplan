@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily model-catalog + harness-version REPORT (never installs or updates anything).
+     Install:   cp scripts/com.fire17.apiplan-catalog-daily.plist ~/Library/LaunchAgents/
+                launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fire17.apiplan-catalog-daily.plist
+     Run now:   launchctl kickstart gui/$(id -u)/com.fire17.apiplan-catalog-daily
+     Remove:    launchctl bootout gui/$(id -u)/com.fire17.apiplan-catalog-daily && rm ~/Library/LaunchAgents/com.fire17.apiplan-catalog-daily.plist
+     A plist edit needs bootout + bootstrap (kickstart reuses the cached job). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fire17.apiplan-catalog-daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/magic/.bun/bin/bun</string>
+    <string>/Users/magic/Creations/APIPlan/scripts/catalog-daily.ts</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/magic/Creations/APIPlan</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/magic/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/magic</string>
+    <key>NO_COLOR</key><string>1</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/magic/.livemind/catalog-daily.log</string>
+  <key>StandardErrorPath</key><string>/Users/magic/.livemind/catalog-daily.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>
