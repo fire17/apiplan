@@ -941,7 +941,26 @@ export function optsFrom(body: any, system?: string): CallOpts {
   if (typeof max === "number") o.maxTokens = max;
   if (typeof body?.temperature === "number") o.temperature = body.temperature;
   if (body?.thinking?.type === "disabled") o.thinkOff = true;
+  const ws = webSearchTool(body?.web_search_options);
+  if (ws) o.hostedTools = [ws];
   return o;
+}
+
+/**
+ * Chat Completions' own web-search switch (`web_search_options: {}` — OpenAI's spelling) as the
+ * hosted Responses tool the Codex backend runs: `{type:"web_search", search_context_size?,
+ * user_location?}`. Chat nests the location under `approximate`; Responses spells it flat.
+ * Forwarded by the openai adapter only (see CallOpts.hostedTools).
+ */
+export function webSearchTool(opts: unknown): Record<string, unknown> | undefined {
+  if (!opts || typeof opts !== "object" || Array.isArray(opts)) return undefined;
+  const o = opts as any;
+  const tool: Record<string, unknown> = { type: "web_search" };
+  if (typeof o.search_context_size === "string") tool.search_context_size = o.search_context_size;
+  const loc = o.user_location;
+  if (loc && typeof loc === "object") tool.user_location = loc.approximate && typeof loc.approximate === "object" ? { type: "approximate", ...loc.approximate } : loc;
+  if (o.filters && typeof o.filters === "object") tool.filters = o.filters;
+  return tool;
 }
 
 /** GPT-6 lists none|low|medium|high|xhigh|max (model pages + live 2026-09-29); the backend
@@ -1598,8 +1617,9 @@ async function openaiChat(body: any, signal?: AbortSignal, meter?: Meter): Promi
 //
 // Stateless on purpose: nothing is stored, so `previous_response_id` is refused with a
 // message saying what to send instead (the whole conversation in `input`, as `store:false`
-// clients already do). Built-in tools (web_search, file_search, computer) and reasoning
-// items have no equivalent on every backend and are not forwarded.
+// clients already do). Built-in tools (file_search, computer) and reasoning items have no
+// equivalent on every backend and are not forwarded; `web_search` is forwarded to Codex
+// (openai) models only, which run it server-side (2026-10-16), and dropped for the rest.
 
 /** One Responses content part → the Chat Completions part it means, or null to drop. */
 function responsesPart(p: any): any {
@@ -1661,6 +1681,10 @@ export function responsesToChat(body: any): any {
     .map((t: any) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
   const chat: any = { model: body?.model, messages, stream: !!body?.stream };
   if (tools.length) chat.tools = tools;
+  // A hosted web_search tool rides as Chat's own web_search_options, so it reaches optsFrom()
+  // like any chat caller's; the openai adapter turns it back into the Responses tool.
+  const search = (Array.isArray(body?.tools) ? body.tools : []).find((t: any) => t?.type === "web_search" || t?.type === "web_search_preview");
+  if (search) { const { type: _t, ...rest } = search; chat.web_search_options = rest; }
   if (tools.length && body?.tool_choice !== undefined) chat.tool_choice = body.tool_choice;
   for (const k of ["max_output_tokens", "temperature", "reasoning", "prompt_cache_key", "service_tier", "metadata", "image_detail"]) {
     if (body?.[k] !== undefined) chat[k] = body[k];
