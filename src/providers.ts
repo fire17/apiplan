@@ -87,6 +87,13 @@ export type ToolChoice = "auto" | "none" | "required" | { name: string };
 export type CallOpts = {
   effort?: string; maxTokens?: number; system?: string; thinkOff?: boolean;
   /**
+   * Hosted (server-side) tools in the Responses wire shape — today only `{type:"web_search", …}`,
+   * which the Codex backend runs itself and answers with url_citation annotations (probed live
+   * 2026-10-16). Only the `openai` adapter forwards them; every other backend ignores the field,
+   * exactly as built-in tools were ignored before it existed.
+   */
+  hostedTools?: Record<string, unknown>[];
+  /**
    * Chat vs Work — the two composer modes chatgpt.com itself exposes, chosen per request.
    * ONLY the `online` website provider acts on it; every other provider ignores it, because
    * no other transport has the concept (the Codex responses backend has no mode at all).
@@ -1323,6 +1330,7 @@ export const openai: Provider & StreamShape = {
         body.tool_choice = typeof o.toolChoice === "object" ? { type: "function", name: o.toolChoice.name } : o.toolChoice;
       }
     }
+    if (o.hostedTools?.length) body.tools = [...(body.tools ?? []), ...o.hostedTools];
     // Drawing runs as a built-in tool on the SAME subscription endpoint as chat —
     // verified live: the backend returns base64 in an image_generation_call.
     if (o.genImage) {
