@@ -173,9 +173,9 @@ async function chatStreamUsage(model: string): Promise<any> {
   return withUsage[0];
 }
 /** The message_delta of a streamed Anthropic-front reply, plus its message_start. */
-async function messagesStreamUsage(model: string): Promise<{ start: any; delta: any }> {
+async function messagesStreamUsage(model: string, system?: string): Promise<{ start: any; delta: any }> {
   const r = await post("/v1/messages", {
-    model, max_tokens: 64, stream: true, messages: [{ role: "user", content: "hello" }],
+    model, max_tokens: 64, stream: true, messages: [{ role: "user", content: "hello" }], ...(system ? { system } : {}),
   });
   const frames = await sseFrames(r);
   const delta = frames.filter((f) => f.type === "message_delta");
@@ -468,16 +468,54 @@ describe("a streamed reply's cumulative snapshots", () => {
     expect(openaiOrdinary(last.usage)).toBe(UNCACHED);
   });
 
-  test("the Anthropic front's own message_start estimate is marked, and message_delta is exact", async () => {
-    // message_start is emitted before upstream has answered, so its count is necessarily
-    // this server's estimate and says so; the closing message_delta carries the real one.
+  // ── BUG 2026-10-16 (BUG-2026-10-16-stream-usage-estimate.md) ──
+  // message_start used to carry THIS SERVER'S character-count estimate of the prompt. Real
+  // Anthropic puts the upstream's true count there, and LangChain / @librechat/agents merge
+  // message_start and message_delta with Math.max per field — so on a cached prompt the
+  // estimate (7,052) beat the real uncached remainder (16) and was billed as uncached Opus
+  // input on every streamed call. The prompt below is long enough that the old estimate
+  // (~10k) is far above the real uncached 2,000, which is exactly the production shape.
+  const LONG_SYSTEM = "x".repeat(40_000);
+
+  test("Claude backend: message_start forwards the upstream's real usage, never an estimate", async () => {
+    await upstream({ anthropicStart: pairedAnthropic, anthropic: pairedAnthropic });
+    const { start, delta } = await messagesStreamUsage(CLAUDE, LONG_SYSTEM);
+    expect(start.message.x_apiplan_usage).toBeUndefined();
+    expect(start.message.usage.input_tokens).toBe(UNCACHED);
+    expect(start.message.usage.cache_read_input_tokens).toBe(CACHED);
+    expect(start.message.usage.cache_creation_input_tokens).toBe(0);
+    expect(delta.usage.input_tokens).toBe(UNCACHED);
+    expect(delta.usage.cache_read_input_tokens).toBe(CACHED);
+  });
+
+  test("Codex backend: message_start says 0 (no count yet), and message_delta is exact", async () => {
+    // The Responses backend reports usage only when the turn completes, so at message_start
+    // there is no real count to forward — 0, unmarked, is what never inflates a max-merge.
     await upstream({ openai: pairedOpenAI });
-    const { start, delta } = await messagesStreamUsage(CODEX);
-    expect(start.message.x_apiplan_usage).toBe("estimated");
+    const { start, delta } = await messagesStreamUsage(CODEX, LONG_SYSTEM);
+    expect(start.message.x_apiplan_usage).toBeUndefined();
+    expect(start.message.usage.input_tokens).toBe(0);
     expect(delta.usage.input_tokens).toBe(UNCACHED);
     expect(delta.usage.cache_read_input_tokens).toBe(CACHED);
     expect(anthropicPromptTotal(delta.usage)).toBe(TOTAL);
     expect(delta.x_apiplan_usage).toBeUndefined();
+  });
+
+  test("a client that max-merges message_start and message_delta bills the real count", async () => {
+    // The exact merge LangChain does. Whatever message_start said must never exceed the truth.
+    for (const [model, fx] of [[CLAUDE, { anthropicStart: pairedAnthropic, anthropic: pairedAnthropic }], [CODEX, { openai: pairedOpenAI }]] as const) {
+      await upstream(fx as any);
+      const { start, delta } = await messagesStreamUsage(model, LONG_SYSTEM);
+      for (const k of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        expect(Math.max(start.message.usage[k] ?? 0, delta.usage[k] ?? 0)).toBe(delta.usage[k] ?? 0);
+      }
+    }
+  });
+
+  test("message ids look like Anthropic's (msg_01…)", async () => {
+    await upstream({ anthropic: pairedAnthropic });
+    const { start } = await messagesStreamUsage(CLAUDE);
+    expect(start.message.id).toMatch(/^msg_01[0-9A-Za-z]{22}$/);
   });
 
   test("a stream that was not asked for usage still reports none", async () => {

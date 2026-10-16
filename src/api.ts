@@ -250,7 +250,7 @@ function credOf(id: string): CredFp {
  * the bearer in hand could only have been written by something that already held it.
  */
 const SEEN = new Set<string>();
-const seenKey = (id: string, cred: string) => `${id} ${cred}`;
+const seenKey = (id: string, cred: string) => `${id}\0${cred}`;
 
 /*  REMOVED (S-3, 2026-08-28): legacyCredOf() read what the fingerprint used to be —
  *  probe()'s detail line — so that an entry predating credFp() could be migrated in place.
@@ -390,6 +390,11 @@ function trackCarry(o: Outcome, f: CredFp, chainChanged: boolean): NonNullable<O
 
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+/** Anthropic's own id shape, `msg_01` / `toolu_01` + 22 base62 characters. A client that
+ *  recognises an Anthropic message by its id (or stores it in a column sized for one) must
+ *  not meet `msg-<hex>` from this gateway. */
+const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const anthropicId = (p: string) => `${p}_01${Array.from(crypto.getRandomValues(new Uint8Array(22)), (b) => B62[b % 62]).join("")}`;
 
 // ─────────────────────────── talking to a provider ───────────────────────────
 
@@ -1038,7 +1043,7 @@ function toolEvents(d: Delta, mint: () => string): ToolEv[] {
   if (d.toolCallDone) {
     const ref = mint();
     const json = typeof d.toolCallDone.args === "string" ? d.toolCallDone.args : JSON.stringify(d.toolCallDone.args ?? {});
-    const id = d.toolCallDone.id ?? rid("toolu");
+    const id = d.toolCallDone.id ?? anthropicId("toolu");
     // The vendor's opaque per-call token (Gemini's thought signature) is filed against the
     // id the client will echo back, since no dialect has a field to carry it across a turn.
     if (d.toolCallDone.sig) rememberToolSig(id, d.toolCallDone.sig);
@@ -1882,7 +1887,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter)
   const ac = linkAbort(signal);
   const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
   const id0 = jimmy ? JIMMY_MODEL : m!.id;
-  const id = rid("msg");
+  const id = anthropicId("msg");
   let auto = 0;
   const mint = () => `auto:${auto++}`;
 
@@ -1948,11 +1953,25 @@ async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter)
   if (pre.error) { ac.abort(); throw pre.error; }
   const primed = pre.primed!;
   return streamResponse("anthropic", async function* () {
-    // The real input count only arrives with the upstream stream, which has not been opened
-    // yet — so message_start carries an estimate, MARKED as one, and the closing
-    // message_delta corrects it with whatever upstream really reported.
-    const estIn = estimateTokens(turns, system);
-    const msg = { id, type: "message", role: "assistant", model: id0, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estIn, output_tokens: 0 }, [USAGE_MARK]: "estimated" };
+    // ── message_start carries the UPSTREAM'S count, or 0 — never this server's estimate ──
+    // BUG 2026-10-16: it used to carry estimateTokens(), marked "estimated". Clients that
+    // merge message_start and message_delta with Math.max per field (LangChain,
+    // @librechat/agents) then billed that estimate — ~0.6x the whole prompt — as UNCACHED
+    // input on every streamed call, because the real uncached remainder of a cached prompt
+    // is tiny (7,052 billed against a real 16). So wait for the upstream's first event:
+    // Claude opens with its own message_start, whose real counts (cache fields included) are
+    // forwarded as they are; a backend that counts only at the end (Codex Responses) leaves
+    // nothing, and 0 is what Anthropic semantics allow there and what never inflates a max.
+    // The closing message_delta still carries the full, real count.
+    const t: Tally = {};
+    const src = withPings(replay(primed));
+    const first = await src.next();
+    if (!first.done && first.value !== PING) tally(t, first.value as DeltaX);
+    const s0 = normalizeTally(t, m?.provider);
+    const msg = {
+      id, type: "message", role: "assistant", model: id0, content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: s0.input ?? 0, output_tokens: s0.output ?? 0, ...cacheUsageAnthropic(s0) },
+    };
     yield sse({ type: "message_start", message: msg }, "message_start");
     // Blocks are numbered as they open — text is no longer permanently index 0, because a
     // reply can be tool calls only, or text and calls interleaved. Anthropic's wire format
@@ -1961,10 +1980,10 @@ async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter)
     let next = 0, textIdx: number | null = null, sawTool = false;
     let thinkIdx: number | null = null;
     let text = "";
-    const t: Tally = {};
     const byRef = new Map<string, Call>(), order: Call[] = [];
     const idxOf = new Map<string, number>();
-    for await (const d0 of withPings(replay(primed))) {
+    const rest = (async function* () { if (!first.done) yield first.value; yield* src; })();
+    for await (const d0 of rest) {
       if (d0 === PING) { yield sse({ type: "ping" }, "ping"); continue; }
       const d = d0 as DeltaX;
       tally(t, d);
@@ -2016,11 +2035,12 @@ async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter)
       yield sse({ type: "content_block_stop", index: 0 }, "content_block_stop");
     }
     const n = normalizeTally(t, m?.provider);
-    meterUsage(meter, n, () => estIn, () => estimateOut(text));
+    const estIn = () => estimateTokens(turns, system);
+    meterUsage(meter, n, estIn, () => estimateOut(text));
     yield sse({
       type: "message_delta",
       delta: { stop_reason: stopWith(t.stopReason, sawTool), stop_sequence: null },
-      usage: { input_tokens: n.input ?? estIn, output_tokens: n.output ?? estimateOut(text), ...cacheUsageAnthropic(n) },
+      usage: { input_tokens: n.input ?? estIn(), output_tokens: n.output ?? estimateOut(text), ...cacheUsageAnthropic(n) },
       ...(n.input === undefined || n.output === undefined ? { [USAGE_MARK]: "estimated" } : {}),
       ...basisMark(n),
     }, "message_delta");
