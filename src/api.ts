@@ -2369,6 +2369,11 @@ export function serve(opts: ServeOpts = {}) {
     "access-control-allow-headers": "authorization, x-api-key, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-arch, x-stainless-lang, x-stainless-os, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, anthropic-dangerous-direct-browser-access",
     "access-control-expose-headers": "retry-after, x-should-retry, x-apiplan-failure, x-apiplan-model",
     "access-control-max-age": "600",
+    // Chrome's Private/Local Network Access: a PUBLIC https page calling this loopback server
+    // sends a preflight with `Access-Control-Request-Private-Network: true` and refuses the call
+    // unless the answer opts in. Only sent when the owner configured --cors at all, so a serve
+    // without CORS stays unreachable from web pages exactly as before.
+    "access-control-allow-private-network": "true",
     ...(cors === "*" ? {} : { vary: "origin" }),
   } : {};
   /**
