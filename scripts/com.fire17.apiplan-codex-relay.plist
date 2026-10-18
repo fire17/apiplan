@@ -26,6 +26,8 @@
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/Users/magic/.livemind/codex-relay.log</string>
   <key>StandardErrorPath</key><string>/Users/magic/.livemind/codex-relay.log</string>
+  <!-- the LunaSight shipper is started detached and outlives the 15-min pass -->
+  <key>AbandonProcessGroup</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
 </dict>
