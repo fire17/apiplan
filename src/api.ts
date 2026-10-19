@@ -2572,6 +2572,19 @@ export function serve(opts: ServeOpts = {}) {
           const { cfg, source, error } = await predictionConfig({ fresh: url.searchParams.get("fresh") === "1" });
           return json({ object: "composer.config", source, ...(error ? { error } : {}), ...cfg });
         }
+        // The LunaSight app fetches the current Codex access token at run time instead of embedding it
+        // in the APK (Tami, ACF351C4 2026-10-19: no reinstall to swap the token). It hands out a live
+        // subscription bearer, so ONLY a store key labelled "lunasight" (or "lunasight-<device>") gets
+        // it — never keyless/open mode, never the owner's legacy key. The body is never logged.
+        if (req.method === "GET" && (path === "/v1/lunasight/credential" || path === "/lunasight/credential")) {
+          const noStore = { "cache-control": "no-store" };
+          const own = who.id !== LEGACY.id && who.id !== ANONYMOUS.id && (who.label === "lunasight" || who.label.startsWith("lunasight-"));
+          if (!own) return json({ error: { type: "permission_error", message: "this credential is only for a lunasight key" } }, 403, noStore);
+          let c: Creds;
+          try { c = PROVIDERS.openai.creds(); }
+          catch (e: any) { return json({ error: { type: "unavailable", message: String(e?.message ?? "no usable Codex login") } }, 503, noStore); }
+          return json({ access_token: c.token, account_id: c.account, expires_at: c.expiresAt }, 200, noStore);
+        }
         if (req.method !== "POST") throw new HttpError(405, `${req.method} ${path} is not supported`);
 
         // Only `model` is inspected here; each route parses the rest in its own dialect.
