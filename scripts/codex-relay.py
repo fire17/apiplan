@@ -189,7 +189,9 @@ def early_refresh(now):
 
 def remote_openai():
     """srv2's own view of the provider: (connected, expires) — read from /health, no secret involved."""
-    cmd = ("curl -s -m 20 localhost:8787/health | python3 -c 'import json,sys;"
+    # The owner key is read from srv2's own key file AT RUNTIME on srv2, so the command text (which the tunnel
+    # logs) only ever holds the path — keyless /health answers just "alive" once srv2 stops serving open.
+    cmd = ("curl -s -m 20 -H \"authorization: Bearer $(cat /root/.apiplan-owner.key)\" localhost:8787/health | python3 -c 'import json,sys;"
            "p=[p for p in json.load(sys.stdin)[\"providers\"] if p[\"id\"]==\"openai\"][0];"
            "print(p[\"connected\"],p.get(\"expires\"))'")
     r = subprocess.run([os.path.join(HANDOFF, "lm-srv"), "run", LABEL, cmd], capture_output=True, text=True, timeout=90)
