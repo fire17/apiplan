@@ -528,6 +528,7 @@ USAGE
   apiplan commands               every global command, and whether PATH finds it
   apiplan voices                 every speech voice available to you, and from where
   apiplan usage [--json] [--provider anthropic|openai]  subscription 5h + weekly windows, per provider
+  apiplan usage --account [--warn 90]  one line per provider: ok / WARN / CAPPED / UNKNOWN; exit 0/2/3/1
   apiplan composer [--codex id|--claude id|--file f] [--json]  predict your next message (Codex composer predictions)
   apiplan live-models [--json]    voice models, transports and supported capabilities
   apiplan live-check [--live-model m] [--text words]  bounded subscription audio check
@@ -813,6 +814,15 @@ switch (sub) {
     const p = valOf("--provider");
     if (p && !USAGE_PROVIDERS.includes(p as any)) die(`usage: apiplan usage [--json] [--provider ${USAGE_PROVIDERS.join("|")}]`);
     const r = await subscriptionUsage(p as any);
+    if (has("--account")) {
+      // One line per provider for a watchdog; exit 0 ok / 1 unknown / 2 warn / 3 capped.
+      const { accountAlert } = await import("../src/usage.ts");
+      const warnAt = Number(valOf("--warn") ?? "90");
+      if (!Number.isFinite(warnAt) || warnAt <= 0 || warnAt > 100) die("usage: apiplan usage --account [--warn 1-100] [--provider P] [--json]");
+      const a = accountAlert(r, { warnAt });
+      process.stdout.write(has("--json") ? JSON.stringify({ ...a, warn_at: warnAt }) + "\n" : a.lines.join("\n") + "\n");
+      process.exit({ ok: 0, unknown: 1, warn: 2, capped: 3 }[a.level]);
+    }
     if (has("--json")) { process.stdout.write(JSON.stringify(r, null, 2) + "\n"); break; }
     const bar = (n: number) => { const f = Math.max(0, Math.min(20, Math.round(n / 5))); const s = "\u2588".repeat(f) + dim("\u2591".repeat(20 - f)); return n >= 90 ? bad(s) : n >= 70 ? warn(s) : ok(s); };
     const when = (t: string | null) => { if (!t) return ""; const ms = Date.parse(t) - Date.now(); if (ms <= 0) return dim(" resets now"); const h = Math.floor(ms / 3_600_000), m = Math.round((ms % 3_600_000) / 60_000); return dim(` resets in ${h >= 24 ? `${Math.floor(h / 24)}d ${h % 24}h` : `${h}h ${m}m`} (${t})`); };

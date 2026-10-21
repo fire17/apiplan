@@ -316,6 +316,46 @@ async function one(p: UsageProvider, d: Required<UsageDeps>): Promise<ProviderUs
 }
 
 /** Each provider answers on its own: one failing never fails the other. */
+/** One line per provider for a watchdog: the worst window leads; >= warnAt is WARN, >= 100 is CAPPED
+ *  (the account refuses with 429 until it resets), no windows or an error is UNKNOWN — never a silent ok.
+ *  `apiplan usage --account` prints these and exits 0 ok / 1 unknown / 2 warn / 3 capped. */
+export type AlertLevel = "ok" | "unknown" | "warn" | "capped";
+export function accountAlert(r: Partial<Record<UsageProvider, ProviderUsage>>, opts: { warnAt?: number; now?: number } = {}): { level: AlertLevel; lines: string[] } {
+  const warnAt = opts.warnAt ?? 90, now = opts.now ?? Date.now();
+  const rank: Record<AlertLevel, number> = { ok: 0, unknown: 1, warn: 2, capped: 3 };
+  let level: AlertLevel = "ok";
+  const lines: string[] = [];
+  const inStr = (t: string) => {
+    const ms = Date.parse(t) - now;
+    if (!(ms > 0)) return "now";
+    const h = Math.floor(ms / 3_600_000), m = Math.floor((ms % 3_600_000) / 60_000);
+    return h >= 24 ? `${Math.floor(h / 24)}d${h % 24}h` : `${h}h${String(m).padStart(2, "0")}m`;
+  };
+  for (const [id, u] of Object.entries(r) as [UsageProvider, ProviderUsage | undefined][]) {
+    if (!u) continue;
+    const wins: [string, UsageWindow][] = [];
+    if (u.five_hour) wins.push(["5-hour", u.five_hour]);
+    if (u.seven_day) wins.push(["weekly", u.seven_day]);
+    for (const [k, w] of Object.entries(u.extra ?? {})) if (w && typeof w.used_percent === "number") wins.push([k, w]);
+    let lv: AlertLevel, line: string;
+    if (!wins.length) { lv = "unknown"; line = `UNKNOWN ${id}: ${u.error ?? "no windows reported"}`; }
+    else {
+      const worst = wins.reduce((a, b) => (b[1].used_percent > a[1].used_percent ? b : a));
+      const pct = worst[1].used_percent;
+      lv = pct >= 100 ? "capped" : pct >= warnAt ? "warn" : "ok";
+      if (lv === "ok") line = `ok ${id} ${worst[0]} ${pct}%`;
+      else {
+        const reset = worst[1].resets_at ? ` (resets ${worst[1].resets_at}, in ${inStr(worst[1].resets_at)})` : "";
+        const rest = wins.filter((w) => w !== worst).map(([k, w]) => `${k} ${w.used_percent}%`);
+        line = `${lv.toUpperCase()} ${id} ${worst[0]} ${pct}%${reset}${rest.length ? ` · ${rest.join(" · ")}` : ""}`;
+      }
+    }
+    if (rank[lv] > rank[level]) level = lv;
+    lines.push(line);
+  }
+  return { level, lines };
+}
+
 export async function subscriptionUsage(provider?: UsageProvider, deps: UsageDeps = {}): Promise<Partial<Record<UsageProvider, ProviderUsage>>> {
   const d = defaults(deps);
   const which = provider ? [provider] : USAGE_PROVIDERS;
