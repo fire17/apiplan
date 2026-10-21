@@ -546,6 +546,7 @@ USAGE
   apiplan keys new <label>       mint a per-device/project key for serve (shown ONCE; only its hash is kept)
   apiplan keys list              every key: id, label, created, revoked, requests, tokens, cost to date
   apiplan keys revoke <id>       refuse that key from now on (a running server picks it up live)
+  apiplan keys label <id> <name> rename a key in place (same id and secret; usage shows the new name)
   apiplan keys usage [--since 24h|7d|30d] [--by model|day|key] [--json]
                                  per-key totals from the usage ledger; --by adds breakdowns with bars
                                  (the same data as http://<serve>/dashboard)
@@ -991,9 +992,18 @@ switch (sub) {
       catch (e: any) { die(e?.message ?? String(e)); }
       break;
     }
+    if (action === "label" || action === "rename") {
+      const id = argv[2];
+      const label = argv.slice(3).filter((a, i, all) => !a.startsWith("--") && all[i - 1] !== "--keys-file").join(" ");
+      if (!id || !label) die("usage: apiplan keys label <id> <new label>   (same key and secret, new name)");
+      const before = K.readStore(file).keys.find((k) => k.id === id)?.label;
+      try { const r = K.relabelKey(id, label, file); process.stdout.write(`${ok("✓")} key ${bold(r.id)}: ${before} → ${bold(r.label)}\n`); }
+      catch (e: any) { die(e?.message ?? String(e)); }
+      break;
+    }
     if (action === "list" || action === "ls" || action === undefined) {
       const store = K.readStore(file);
-      const tot = new Map(K.totalsByKey(K.readLedger()).map((t) => [t.key_id, t]));
+      const tot = new Map(K.totalsByKey(K.readLedger(), undefined, K.storeLabels(file)).map((t) => [t.key_id, t]));
       const others = [...tot.values()].filter((t) => !store.keys.some((k) => k.id === t.key_id));
       const rows = store.keys.map((k) => ({ id: k.id, label: k.label, created_at: k.created_at, revoked_at: k.revoked_at ?? null, ...(tot.get(k.id) ?? {}) })) as any[];
       if (has("--json")) { process.stdout.write(JSON.stringify({ keys: rows, other: others }, null, 2) + "\n"); break; }
@@ -1011,7 +1021,7 @@ switch (sub) {
       try { windowMs = K.parseWindow(since); } catch (e: any) { die(e.message); }
       const now = Date.now();
       const lines = K.readLedger(windowMs ? now - windowMs : 0);
-      const rows = K.totalsByKey(lines);
+      const rows = K.totalsByKey(lines, undefined, K.storeLabels(file));
       const by = valOf("--by");
       if (by !== undefined) {
         // Parity with GET /v1/usage/keys?group=…: the same breakdown(), days at this machine's clock.

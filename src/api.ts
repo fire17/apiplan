@@ -18,7 +18,7 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
-import { keyCache, appendLedger, readLedger, totalsByKey, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
+import { keyCache, appendLedger, readLedger, totalsByKey, storeLabels, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
 import { predictionConfig, predictFromRequest, ComposerError, type ComposerRequest } from "./composer.ts";
 import { LIVE_MODELS, DEFAULT_LIVE_MODEL } from "./live-models.ts";
@@ -2548,7 +2548,7 @@ export function serve(opts: ServeOpts = {}) {
           const now = Date.now();
           const only = all ? undefined : (k: string) => k === me.id;
           const lines = readLedger(windowMs ? now - windowMs : 0);
-          const rows = totalsByKey(lines, only);
+          const rows = totalsByKey(lines, only, storeLabels(keys.file));
           if (!all && !rows.length) rows.push({ key_id: me.id, label: me.label, requests: 0, errors: 0, input_tokens: 0, output_tokens: 0,
             cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0, cost_usd: 0, unpriced_requests: 0, last_used: null });
           // The default body is byte-for-byte what it was; `breakdown` appears only when asked for,

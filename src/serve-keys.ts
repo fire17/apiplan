@@ -72,6 +72,32 @@ export function revokeKey(id: string, file = keysFile()): KeyRecord {
   return k;
 }
 
+/** The lunasight label is an access grant (GET /v1/lunasight/credential), not just a name. */
+const lunasightClass = (label: string) => label === "lunasight" || label.startsWith("lunasight-");
+
+/** Rename a key's label in place: same id, same secret, same created_at — every holder keeps working.
+ *  Refused for a revoked key, a label another active key already has, and any move into or out of
+ *  the lunasight class (a relabel must never grant or drop that credential). */
+export function relabelKey(id: string, label: string, file = keysFile()): KeyRecord {
+  const clean = label.trim();
+  if (!clean) throw new Error("a key needs a label (the device, project or person it is for)");
+  const store = readStore(file);
+  const k = store.keys.find((x) => x.id === id);
+  if (!k) throw new Error(`no key with id '${id}' (apiplan keys list)`);
+  if (k.revoked_at) throw new Error(`key ${id} (${k.label}) is revoked; mint a new one instead`);
+  if (k.label === clean) return k;
+  if (store.keys.some((x) => x.id !== id && !x.revoked_at && x.label === clean)) throw new Error(`label '${clean}' is already on another active key`);
+  if (lunasightClass(k.label) !== lunasightClass(clean)) throw new Error(`'${k.label}' → '${clean}' would move the key ${lunasightClass(k.label) ? "out of" : "into"} the lunasight class (it grants the Codex credential); mint a new key instead`);
+  k.label = clean;
+  writeStore(store, file);
+  return k;
+}
+
+/** id → current label, revoked keys included, for usage views (the ledger keeps the label at request time). */
+export function storeLabels(file = keysFile()): Map<string, string> {
+  try { return new Map(readStore(file).keys.map((k) => [k.id, k.label])); } catch { return new Map(); }
+}
+
 /** The store a running server consults, re-read only when the file changed. */
 export function keyCache(file = keysFile()) {
   let stamp = "", active: KeyRecord[] = [];
@@ -172,7 +198,7 @@ export type KeyTotals = {
   total_tokens: number; cost_usd: number; unpriced_requests: number; last_used: string | null;
 };
 
-export function totalsByKey(lines: LedgerLine[], only?: (keyId: string) => boolean): KeyTotals[] {
+export function totalsByKey(lines: LedgerLine[], only?: (keyId: string) => boolean, labels?: Map<string, string>): KeyTotals[] {
   const by = new Map<string, KeyTotals>();
   for (const l of lines) {
     if (only && !only(l.key_id)) continue;
@@ -191,6 +217,8 @@ export function totalsByKey(lines: LedgerLine[], only?: (keyId: string) => boole
   for (const t of by.values()) {
     t.total_tokens = t.input_tokens + t.output_tokens + t.cache_read_tokens + t.cache_write_tokens;
     t.cost_usd = Math.round(t.cost_usd * 1e6) / 1e6;
+    const now = labels?.get(t.key_id);
+    if (now) t.label = now; // a relabeled key shows its current name for past requests too
   }
   return [...by.values()].sort((a, b) => b.cost_usd - a.cost_usd || b.requests - a.requests);
 }
