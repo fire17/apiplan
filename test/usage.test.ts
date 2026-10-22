@@ -2,6 +2,7 @@
 // scope-refusal fallback onto unified rate-limit headers, and the token never leaving.
 import { expect, test, describe, beforeEach } from "bun:test";
 import { subscriptionUsage, resetUsageCache, type UsageDeps, type UsageProvider } from "../src/usage.ts";
+import { CODEX_CLIENT_VERSION_FLOOR } from "../src/registry.ts";
 import { serve } from "../src/api.ts";
 import type { Creds } from "../src/providers.ts";
 
@@ -89,6 +90,11 @@ describe("subscriptionUsage", () => {
     const codex = calls.find((c) => c.url.includes("/codex/usage"))!;
     expect(codex.headers["chatgpt-account-id"]).toBe("acct-123");
     expect(codex.headers["user-agent"]).toMatch(/^codex_cli_rs\//);
+    // The edge WAF 403s a stale client (2026-10-22: 0.144.2 → HTML 403 from srv2, 0.162.1 + originator → 200).
+    const ver = codex.headers["user-agent"].split("/")[1];
+    const [a, b, c2] = ver.split(".").map(Number), [x, y, z] = CODEX_CLIENT_VERSION_FLOOR.split(".").map(Number);
+    expect((a - x) || (b - y) || (c2 - z)).toBeGreaterThanOrEqual(0);
+    expect(codex.headers["originator"]).toBe("codex_cli_rs");
     expect(calls.some((c) => c.url.includes("/v1/messages"))).toBe(false);
     noToken(r);
   });

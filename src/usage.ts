@@ -23,6 +23,7 @@
 import { PROVIDERS, type Creds } from "./providers.ts";
 import { parseResetValue } from "./capacity-signal.ts";
 import { readJson, HOME } from "./platform.ts";
+import { CODEX_CLIENT_VERSION_FLOOR } from "./registry.ts";
 import { join } from "node:path";
 
 export type UsageWindow = { used_percent: number; resets_at: string | null };
@@ -52,7 +53,13 @@ const FIVE_H = 5 * 3600, SEVEN_D = 7 * 86400;
 const TIMEOUT_MS = 10_000;
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage";
-const CODEX_UA = "codex_cli_rs/0.144.2";
+// The edge WAF answers a stale Codex client with an HTML 403 (2026-10-22, srv2: codex_cli_rs/0.144.2 → 403,
+// 0.162.1 + originator → 200), so ask as the catalog floor or newer, the same identity real traffic carries.
+const codexUA = () => {
+  const env = process.env.APIPLAN_CODEX_CLIENT_VERSION ?? "";
+  const cmp = (a: string, b: string) => { const x = a.split(".").map(Number), y = b.split(".").map(Number); return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]); };
+  return `codex_cli_rs/${/^\d+\.\d+\.\d+$/.test(env) && cmp(env, CODEX_CLIENT_VERSION_FLOOR) > 0 ? env : CODEX_CLIENT_VERSION_FLOOR}`;
+};
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /** Fixed TTL, success or failure alike: a poller can never pull it down to an aggressive floor. */
@@ -289,7 +296,7 @@ async function openaiUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
     for (;;) {
       tries++;
       r = await get(d.fetch, CODEX_USAGE_URL, { headers: {
-        authorization: `Bearer ${c.token}`, "user-agent": CODEX_UA, accept: "application/json",
+        authorization: `Bearer ${c.token}`, "user-agent": codexUA(), originator: "codex_cli_rs", accept: "application/json",
         ...(c.account ? { "chatgpt-account-id": c.account } : {}),
       } });
       text = await r.text();
