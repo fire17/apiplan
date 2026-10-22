@@ -44,6 +44,8 @@ export type UsageDeps = {
   fetch?: typeof fetch;
   creds?: (p: UsageProvider) => Creds;
   now?: () => number;
+  /** Backoff between edge-WAF retries; injectable so tests never wait. */
+  sleep?: (ms: number) => Promise<void>;
 };
 
 const FIVE_H = 5 * 3600, SEVEN_D = 7 * 86400;
@@ -279,12 +281,23 @@ async function openaiUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
   try { c = d.creds("openai"); }
   catch (e) { return { ...u, source: "none", error: `credential: ${e instanceof Error ? e.message : String(e)}` }; }
   try {
-    const r = await get(d.fetch, CODEX_USAGE_URL, { headers: {
-      authorization: `Bearer ${c.token}`, "user-agent": CODEX_UA, accept: "application/json",
-      ...(c.account ? { "chatgpt-account-id": c.account } : {}),
-    } });
-    const text = await r.text();
-    if (!r.ok) return { ...u, error: scrub(codexWhy(r.status, text), c.token) };
+    // An HTML 403 is Cloudflare's edge WAF, which comes and goes while real Codex traffic keeps flowing
+    // (2026-10-22 07:32Z: one such block paged the MIND as UNKNOWN). Retry it twice with backoff before
+    // reporting; a JSON 403 or a 401 is a real refusal and is reported at once.
+    const backoff = [2000, 5000];
+    let r: Response, text: string, tries = 0;
+    for (;;) {
+      tries++;
+      r = await get(d.fetch, CODEX_USAGE_URL, { headers: {
+        authorization: `Bearer ${c.token}`, "user-agent": CODEX_UA, accept: "application/json",
+        ...(c.account ? { "chatgpt-account-id": c.account } : {}),
+      } });
+      text = await r.text();
+      const waf = r.status === 403 && !text.trimStart().startsWith("{");
+      if (!waf || tries > backoff.length) break;
+      await d.sleep(backoff[tries - 1]);
+    }
+    if (!r.ok) return { ...u, error: scrub(codexWhy(r.status, text) + (tries > 1 ? `, ${tries} tries` : ""), c.token) };
     let b: any;
     try { b = JSON.parse(text); } catch { return { ...u, error: "codex/usage returned a body that is not JSON" }; }
     fromCodexBody(b, u, now);
@@ -300,6 +313,7 @@ const defaults = (deps: UsageDeps): Required<UsageDeps> => ({
   fetch: deps.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a)) as typeof fetch,
   creds: deps.creds ?? ((p) => PROVIDERS[p].creds()),
   now: deps.now ?? Date.now,
+  sleep: deps.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms))),
 });
 
 async function one(p: UsageProvider, d: Required<UsageDeps>): Promise<ProviderUsage> {

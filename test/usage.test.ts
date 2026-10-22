@@ -58,7 +58,8 @@ function mockFetch(routes: (c: Call) => Response | Promise<Response>) {
 }
 const J = (v: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json", ...headers } });
-const deps = (f: typeof fetch): UsageDeps => ({ fetch: f, creds, now: () => NOW });
+const SLEPT: number[] = [];
+const deps = (f: typeof fetch): UsageDeps => ({ fetch: f, creds, now: () => NOW, sleep: async (ms: number) => { SLEPT.push(ms); } });
 const noToken = (v: unknown) => {
   const s = JSON.stringify(v);
   expect(s).not.toContain(A_TOK);
@@ -157,16 +158,46 @@ describe("subscriptionUsage", () => {
   });
 
   test("codex HTML 403 → edge-WAF error string; anthropic unaffected", async () => {
-    const { f } = mockFetch((c) =>
+    SLEPT.length = 0;
+    const { f, calls } = mockFetch((c) =>
       c.url.includes("/codex/usage")
         ? new Response("<!DOCTYPE html><html>Just a moment...</html>", { status: 403, headers: { "content-type": "text/html" } })
         : J(OAUTH_OK));
     const r = await subscriptionUsage(undefined, deps(f));
-    expect(r.openai!.error).toMatch(/edge WAF, not by auth \(HTTP 403, HTML body\)/);
+    expect(r.openai!.error).toMatch(/edge WAF, not by auth \(HTTP 403, HTML body\), 3 tries/);
+    // retried twice with backoff before reporting (2026-10-22: one transient edge block paged the MIND)
+    expect(calls.filter((c) => c.url.includes("/codex/usage")).length).toBe(3);
+    expect(SLEPT).toEqual([2000, 5000]);
     expect(r.openai!.five_hour).toBeNull();
     expect(r.anthropic!.error).toBeUndefined();
     expect(r.anthropic!.five_hour!.used_percent).toBe(13);
     noToken(r);
+  });
+
+  test("a transient edge-WAF 403 that clears on retry reports the windows, no error", async () => {
+    SLEPT.length = 0;
+    let n = 0;
+    const { f } = mockFetch((c) => {
+      if (!c.url.includes("/codex/usage")) return J(OAUTH_OK);
+      return ++n === 1 ? new Response("<html>Just a moment...</html>", { status: 403, headers: { "content-type": "text/html" } }) : J(CODEX_BOTH);
+    });
+    const r = await subscriptionUsage("openai", deps(f));
+    expect(r.openai!.error).toBeUndefined();
+    expect(r.openai!.seven_day).not.toBeNull();
+    expect(n).toBe(2);
+    expect(SLEPT).toEqual([2000]);
+  });
+
+  test("a JSON 403 (vendor refusal) and a 401 are NOT retried: they are not transient", async () => {
+    for (const res of [() => J({ detail: "forbidden" }, 403), () => J({}, 401)]) {
+      resetUsageCache(); SLEPT.length = 0;
+      let n = 0;
+      const { f } = mockFetch((c) => (c.url.includes("/codex/usage") ? (n++, res()) : J(OAUTH_OK)));
+      const r = await subscriptionUsage("openai", deps(f));
+      expect(r.openai!.error).toBeDefined();
+      expect(n).toBe(1);
+      expect(SLEPT).toEqual([]);
+    }
   });
 
   test("one provider down (network throws, creds missing) never breaks the other", async () => {
