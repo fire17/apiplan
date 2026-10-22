@@ -37,6 +37,10 @@ HANDOFF = os.path.join(HOME, "Creations/LiveMind/server/handoff")
 LUNASIGHT = os.path.join(HOME, "Creations/lunasight/bin/lunasight-token-ship.py")
 LUNASIGHT_LOG = os.path.join(HOME, ".livemind/lunasight/token-ship.log")
 RELAY_LOG = os.path.join(HOME, ".livemind/codex-relay.log")
+# srv2 can run on a DIFFERENT ChatGPT account than the Mac (2026-10-22, Tami AC483A86: srv2 → acct-b). While this
+# file exists the relay never pushes the Mac's token to srv2 — it would overwrite that account — and records the
+# pass as relayed so LunaSight is still shipped once per Mac refresh. Remove the file to resume pushing.
+SRV2_HOLD = os.path.join(HOME, ".apiplan/codex-relay.srv2-hold")
 LABEL = os.environ.get("CODEX_RELAY_LABEL", "livemind-srv2")
 REMOTE = "/root/.codex/auth.json"
 CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
@@ -244,13 +248,19 @@ def run_lunasight():
 
 def relay(a, lr, exp, st):
     ok_srv2 = False
-    try:
-        push_srv2(a)
-        ok_srv2 = True
-    except Exception as e:
-        log(f"srv2 push failed: {e} — will retry next pass")
-    seen = remote_openai()
-    log(f"srv2 openai after push: {seen}")
+    if os.path.exists(SRV2_HOLD):
+        ok_srv2 = True  # nothing to retry: srv2 is deliberately on its own account
+        why = open(SRV2_HOLD).read().strip()[:160]
+        log(f"srv2 push HELD ({SRV2_HOLD}: {why or 'no reason given'}) — srv2 keeps its own Codex login")
+        seen = "held"
+    else:
+        try:
+            push_srv2(a)
+            ok_srv2 = True
+        except Exception as e:
+            log(f"srv2 push failed: {e} — will retry next pass")
+        seen = remote_openai()
+        log(f"srv2 openai after push: {seen}")
     rc = run_lunasight()
     if ok_srv2:
         st.update({"last_refresh": lr, "exp": exp, "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -277,6 +287,7 @@ def main(argv):
         except Exception as e:
             log(f"   app-server probe FAILED: {e}")
         relay_due = st.get("last_refresh") != lr
+        if os.path.exists(SRV2_HOLD): log(f"SRV2 HOLD present ({SRV2_HOLD}) — a due relay skips srv2, ships LunaSight only")
         log(f"RELAY: {'due' if relay_due else 'not due'} — last relayed {st.get('last_refresh')} at {st.get('pushed_at')}; "
             f"on due: file-push {LABEL}:{REMOTE}, then {LUNASIGHT} (last rc {st.get('lunasight_rc')})")
         return 0
