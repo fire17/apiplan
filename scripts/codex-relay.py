@@ -239,9 +239,12 @@ def run_lunasight():
     os.makedirs(os.path.dirname(LUNASIGHT_LOG), exist_ok=True)
     wrapper = ('"$1" "$2" >> "$3" 2>&1; rc=$?; '
                'printf "%s codex-relay: lunasight-token-ship exit=%s\\n" "$(date +%Y-%m-%dT%H:%M:%S)" "$rc" >> "$4"')
+    # launchd's PATH has no ~/.local/bin, where wa-mind lives: the shipper's group post died on it (2026-10-25).
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([os.path.join(HOME, ".local/bin"), env.get("PATH", "/usr/bin:/bin")])
     subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", sys.executable, LUNASIGHT, LUNASIGHT_LOG, RELAY_LOG],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+                     start_new_session=True, env=env)
     log(f"lunasight-token-ship started detached (its output → {LUNASIGHT_LOG}; exit code lands here)")
     return "started"
 
