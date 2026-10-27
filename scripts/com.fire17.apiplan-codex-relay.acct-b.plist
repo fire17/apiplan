@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The second Codex chain: srv2 runs on the acct-b ChatGPT account, logged in on the Mac under
+     CODEX_HOME=~/.codex-accounts/acct-b. This pass early-refreshes THAT login inside its last 72 h and file-pushes
+     the refreshed ACCESS token to srv2. The Mac is the only refresher; srv2 never refreshes. See scripts/codex-relay.py --account.
+     Install:   cp scripts/com.fire17.apiplan-codex-relay.acct-b.plist ~/Library/LaunchAgents/
+                launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fire17.apiplan-codex-relay.acct-b.plist
+     Status:    python3 scripts/codex-relay.py --account acct-b --status
+     Remove:    launchctl bootout gui/$(id -u)/com.fire17.apiplan-codex-relay.acct-b && rm ~/Library/LaunchAgents/com.fire17.apiplan-codex-relay.acct-b.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fire17.apiplan-codex-relay.acct-b</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/magic/Creations/APIPlan/scripts/codex-relay.py</string>
+    <string>--account</string>
+    <string>acct-b</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/magic/Creations/APIPlan</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/magic/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/magic</string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/magic/.livemind/codex-relay.acct-b.log</string>
+  <key>StandardErrorPath</key><string>/Users/magic/.livemind/codex-relay.acct-b.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>

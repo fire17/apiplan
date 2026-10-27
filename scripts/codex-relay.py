@@ -25,6 +25,10 @@ LunaSight both did on 2026-10-18). Two legs close that:
                                 (read-only: proves the channel, refreshes nothing, sends nothing)
     codex-relay.py --status     Mac vs srv2 side by side; sends nothing
     codex-relay.py --force      relay now even if last_refresh did not change (never forces a refresh)
+    codex-relay.py --account NAME [...]   the same two legs for a SECOND chain rooted at
+                                ~/.codex-accounts/NAME/auth.json (CODEX_HOME for app-server), pushed to srv2 only
+                                (no LunaSight, the srv2 hold does not apply: srv2 RUNS this account). Its own state
+                                file; the first pass only records what srv2 already holds and pushes nothing.
 
 State: ~/.apiplan/codex-relay.state. No log line, state file or backup name ever carries a token value.
 """
@@ -44,6 +48,10 @@ SRV2_HOLD = os.path.join(HOME, ".apiplan/codex-relay.srv2-hold")
 LABEL = os.environ.get("CODEX_RELAY_LABEL", "livemind-srv2")
 REMOTE = "/root/.codex/auth.json"
 CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
+# --account NAME (2026-10-27, MIND: srv2 runs on acct-b, logged in on the Mac with
+# `CODEX_HOME=~/.codex-accounts/acct-b codex login --device-auth`). None = the Mac's own ~/.codex chain.
+ACCOUNT = None
+CODEX_HOME = None
 
 DAY = 86400
 EARLY_WINDOW = 72 * 3600      # refresh when less than this is left
@@ -115,8 +123,9 @@ def refresh_plan(lr, exp, now):
 def app_server_account_read(refresh, timeout=90):
     """JSON-RPC over `codex app-server` stdio: initialize → initialized → account/read. Returns the result dict
     (account type / plan / email — never tokens) or raises. The child is always terminated."""
+    env = dict(os.environ, CODEX_HOME=CODEX_HOME) if CODEX_HOME else None
     p = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                         stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
     def send(o):
         p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
     def wait_for(rid, deadline):
@@ -251,7 +260,7 @@ def run_lunasight():
 
 def relay(a, lr, exp, st):
     ok_srv2 = False
-    if os.path.exists(SRV2_HOLD):
+    if os.path.exists(SRV2_HOLD) and not ACCOUNT:
         ok_srv2 = True  # nothing to retry: srv2 is deliberately on its own account
         why = open(SRV2_HOLD).read().strip()[:160]
         log(f"srv2 push HELD ({SRV2_HOLD}: {why or 'no reason given'}) — srv2 keeps its own Codex login")
@@ -264,7 +273,7 @@ def relay(a, lr, exp, st):
             log(f"srv2 push failed: {e} — will retry next pass")
         seen = remote_openai()
         log(f"srv2 openai after push: {seen}")
-    rc = run_lunasight()
+    rc = None if ACCOUNT else run_lunasight()
     if ok_srv2:
         st.update({"last_refresh": lr, "exp": exp, "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                    "srv2": seen})
@@ -272,12 +281,28 @@ def relay(a, lr, exp, st):
     save_state(st)
 
 
+def use_account(name):
+    """Point every path at the second chain rooted at ~/.codex-accounts/NAME."""
+    global ACCOUNT, CODEX_HOME, AUTH, STATE
+    if not name or "/" in name or name.startswith("."):
+        raise SystemExit(f"codex-relay: bad --account {name!r}")
+    ACCOUNT = name
+    CODEX_HOME = os.path.join(HOME, ".codex-accounts", name)
+    AUTH = os.path.join(CODEX_HOME, "auth.json")
+    STATE = os.path.join(HOME, f".apiplan/codex-relay.{name}.state")
+
+
 def main(argv):
+    if "--account" in argv:
+        i = argv.index("--account")
+        use_account(argv[i + 1] if i + 1 < len(argv) else "")
     now = time.time()
     a, t, lr, exp = read_auth()
     if not t.get("access_token") or not t.get("account_id"):
-        log("Mac ~/.codex/auth.json has no access_token/account_id — nothing to relay"); return 1
+        log(f"{AUTH} has no access_token/account_id — nothing to relay"); return 1
     st = load_state()
+    if ACCOUNT:
+        log(f"chain: account {ACCOUNT} ({AUTH}) → {LABEL} only")
 
     if "--dry-run" in argv:
         due, why = refresh_plan(lr, exp, now)
@@ -290,9 +315,13 @@ def main(argv):
         except Exception as e:
             log(f"   app-server probe FAILED: {e}")
         relay_due = st.get("last_refresh") != lr
-        if os.path.exists(SRV2_HOLD): log(f"SRV2 HOLD present ({SRV2_HOLD}) — a due relay skips srv2, ships LunaSight only")
-        log(f"RELAY: {'due' if relay_due else 'not due'} — last relayed {st.get('last_refresh')} at {st.get('pushed_at')}; "
-            f"on due: file-push {LABEL}:{REMOTE}, then {LUNASIGHT} (last rc {st.get('lunasight_rc')})")
+        if os.path.exists(SRV2_HOLD) and not ACCOUNT: log(f"SRV2 HOLD present ({SRV2_HOLD}) — a due relay skips srv2, ships LunaSight only")
+        if ACCOUNT and not st:
+            log(f"RELAY: first pass SEEDS state from {lr} (srv2 already holds this login) — pushes nothing; "
+                f"later passes file-push {LABEL}:{REMOTE} when last_refresh moves")
+        else:
+            log(f"RELAY: {'due' if relay_due else 'not due'} — last relayed {st.get('last_refresh')} at {st.get('pushed_at')}; "
+                f"on due: file-push {LABEL}:{REMOTE}" + ("" if ACCOUNT else f", then {LUNASIGHT} (last rc {st.get('lunasight_rc')})"))
         return 0
 
     if "--status" in argv:
@@ -303,11 +332,18 @@ def main(argv):
     if exp and exp < now:
         log(f"Mac access token itself expired ({ts(exp)}) — run `codex` on the Mac; not pushing a dead token"); return 1
 
+    if ACCOUNT and not st and "--force" not in argv:
+        # srv2 already holds this login (pushed when it was made) — record it instead of re-pushing the same token
+        st.update({"last_refresh": lr, "exp": exp, "pushed_at": None, "srv2": "seeded (already on srv2)"})
+        save_state(st)
+        log(f"seeded state: last_refresh {lr} (exp {ts(exp)}) is what srv2 holds — nothing pushed")
+
     if early_refresh(now):
         a, t, lr, exp = read_auth()
 
     if "--force" in argv or st.get("last_refresh") != lr:
-        log(f"relaying last_refresh {st.get('last_refresh')} → {lr} (exp {ts(exp)}) to {LABEL} + LunaSight")
+        log(f"relaying last_refresh {st.get('last_refresh')} → {lr} (exp {ts(exp)}) to {LABEL}"
+            + ("" if ACCOUNT else " + LunaSight"))
         relay(a, lr, exp, st)
     return 0
 
