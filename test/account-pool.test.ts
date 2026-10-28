@@ -35,41 +35,41 @@ describe("choose()", () => {
   const u = (seven_day: number, five_hour = 0) => ({ seven_day, five_hour, at: now });
 
   test("stays on the active member while its weekly % is below 95", () => {
-    const r = choose({ ...base, active: "base", usage: { i0: u(94.9), i1: u(1), i2: u(2) } });
+    const r = choose({ ...base, active: "base", usage: { base: u(94.9), b: u(1), c: u(2) } });
     expect(r).toEqual({ label: "base", reason: "stay" });
   });
   test("at ≥95 switches to the member with the LOWEST weekly %", () => {
-    const r = choose({ ...base, active: "base", usage: { i0: u(95), i1: u(40), i2: u(12) } });
+    const r = choose({ ...base, active: "base", usage: { base: u(95), b: u(40), c: u(12) } });
     expect(r).toEqual({ label: "c", reason: "switch" });
   });
   test("weekly ties break on 5-hour %, then label order", () => {
-    expect(choose({ ...base, active: "base", usage: { i0: u(99), i1: u(10, 50), i2: u(10, 5) } }).label).toBe("c");
-    expect(choose({ ...base, active: "base", usage: { i0: u(99), i1: u(10, 5), i2: u(10, 5) } }).label).toBe("b");
+    expect(choose({ ...base, active: "base", usage: { base: u(99), b: u(10, 50), c: u(10, 5) } }).label).toBe("c");
+    expect(choose({ ...base, active: "base", usage: { base: u(99), b: u(10, 5), c: u(10, 5) } }).label).toBe("b");
   });
   test("an unpolled member ranks after every measured one", () => {
-    expect(choose({ ...base, active: "base", usage: { i0: u(99), i2: u(80) } }).label).toBe("c");
+    expect(choose({ ...base, active: "base", usage: { base: u(99), c: u(80) } }).label).toBe("c");
   });
   test("a capped member is skipped, then eligible again once its cap has passed", () => {
-    const usage = { i0: u(99), i1: u(5), i2: u(60) };
-    const capped = { i1: now + 1000 };
+    const usage = { base: u(99), b: u(5), c: u(60) };
+    const capped = { b: now + 1000 };
     expect(choose({ ...base, active: "base", usage, capped }).label).toBe("c");
     expect(choose({ ...base, active: "base", usage, capped, now: now + 1001 }).label).toBe("b");
   });
   test("minimum dwell holds an over-threshold member unless it is capped", () => {
-    const usage = { i0: u(97), i1: u(5), i2: u(6) };
+    const usage = { base: u(97), b: u(5), c: u(6) };
     expect(choose({ ...base, active: "base", usage, switchedAt: now - 60_000 })).toEqual({ label: "base", reason: "dwell" });
-    expect(choose({ ...base, active: "base", usage, switchedAt: now - 60_000, capped: { i0: now + HOUR } }).label).toBe("b");
+    expect(choose({ ...base, active: "base", usage, switchedAt: now - 60_000, capped: { base: now + HOUR } }).label).toBe("b");
     expect(choose({ ...base, active: "base", usage, switchedAt: now - 601_000 }).label).toBe("b");
   });
   test("nobody eligible: keep a working active member, else the one whose cap resets soonest", () => {
-    const usage = { i0: u(97), i1: u(98), i2: u(99) };
+    const usage = { base: u(97), b: u(98), c: u(99) };
     expect(choose({ ...base, active: "base", usage }).reason).toBe("none-eligible");
-    const capped = { i0: now + 3 * HOUR, i1: now + 2 * HOUR, i2: now + HOUR };
+    const capped = { base: now + 3 * HOUR, b: now + 2 * HOUR, c: now + HOUR };
     expect(choose({ ...base, active: "base", usage, capped })).toEqual({ label: "c", reason: "soonest" });
   });
   test("an expired credential is never chosen while another is eligible", () => {
     const members = [M[0], { ...M[1], expired: true }, M[2]];
-    expect(choose({ ...base, members, active: "base", usage: { i0: u(99), i1: u(1), i2: u(50) } }).label).toBe("c");
+    expect(choose({ ...base, members, active: "base", usage: { base: u(99), b: u(1), c: u(50) } }).label).toBe("c");
   });
 });
 
@@ -140,12 +140,12 @@ describe("AccountPool", () => {
       const win = (pct: number, resets: string | null = null) => ({ used_percent: pct, resets_at: resets });
       const usage = (d7: number, h5 = 1) => ({ account: null, five_hour: win(h5), seven_day: win(d7), extra: {}, source: "t", fetched_at: "" });
       expect(p.select().label).toBe("base");
-      p.recordUsage("baseident01", usage(96));
-      p.recordUsage(b.fp().ident, usage(30));
-      p.recordUsage(c.fp().ident, usage(10));
+      p.recordUsage("base", usage(96));
+      p.recordUsage(b.label, usage(30));
+      p.recordUsage(c.label, usage(10));
       expect(p.select().label).toBe("c");
       const reset = new Date(Date.now() + 2 * HOUR).toISOString();
-      p.recordUsage(c.fp().ident, { ...usage(50), five_hour: win(100, reset) });
+      p.recordUsage(c.label, { ...usage(50), five_hour: win(100, reset) });
       expect(p.select().label).toBe("b");
       const acc = p.accounts();
       expect(acc.find((a) => a.label === "c")!.capped_until).toBe(reset);
@@ -154,6 +154,54 @@ describe("AccountPool", () => {
       expect(st.providers.anthropic.active).toBe("b");
       expect(JSON.stringify(st)).not.toContain("AT-fake");
     } finally { delete process.env.APIPLAN_POOL_MIN_DWELL_S; }
+  });
+});
+
+describe("pool state is keyed by member label", () => {
+  const saved = process.env.APIPLAN_POOL_STATE;
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(T, "lbl-"));
+    mkdirSync(join(dir, "state"));
+    process.env.APIPLAN_POOL_STATE = join(dir, "state", "pool-state.json");
+    resetPools();
+  });
+  afterEach(() => { if (saved === undefined) delete process.env.APIPLAN_POOL_STATE; else process.env.APIPLAN_POOL_STATE = saved; resetPools(); });
+  const fakeBase: PoolMember = { label: "base", base: true, creds: () => ({ token: "AT-fake-base", source: "fake" }), fp: () => ({ cred: "x", ident: "baseident01", exp: Date.now() + HOUR }) };
+
+  test("a member whose file is rewritten with a NEW refresh token keeps its capped-until and usage", () => {
+    const f = join(dir, "b.json");
+    writeFileSync(f, anth("AT-fake-b1", "RT-fake-b1"));
+    const p = new AccountPool("anthropic", dir, fakeBase);
+    const b = p.members()[1];
+    const identBefore = b.fp().ident;
+    const until = Date.now() + 2 * HOUR;
+    p.markCapped("b", until);
+    p.recordUsage("b", { account: null, five_hour: { used_percent: 12, resets_at: null }, seven_day: { used_percent: 41, resets_at: null }, extra: {}, source: "t", fetched_at: "" });
+    // The external refresher rotates the refresh token: a new ident, the same member.
+    writeFileSync(f, anth("AT-fake-b2", "RT-fake-b2"));
+    const later = new Date(Date.now() + 5000);
+    utimesSync(f, later, later);
+    expect(b.fp().ident).not.toBe(identBefore);
+    const a = p.accounts().find((x) => x.label === "b")!;
+    expect(a.ident).toBe(b.fp().ident);
+    expect(a.capped_until).toBe(new Date(until).toISOString());
+    expect(a.seven_day).toBe(41);
+    expect(a.five_hour).toBe(12);
+    // …and survives a restart (fresh in-memory state, same file).
+    resetPools();
+    const again = new AccountPool("anthropic", dir, fakeBase).accounts().find((x) => x.label === "b")!;
+    expect([again.capped_until, again.seven_day]).toEqual([new Date(until).toISOString(), 41]);
+  });
+
+  test("an old ident-keyed (v1) pool-state.json is migrated: active kept, ident entries ignored", () => {
+    writeFileSync(join(dir, "b.json"), anth("AT-fake-b", "RT-fake-b"));
+    writeFileSync(process.env.APIPLAN_POOL_STATE!, JSON.stringify({ v: 1,
+      providers: { anthropic: { active: "b", switched_at: 1 } },
+      capped: { baseident01: Date.now() + HOUR }, usage: { baseident01: { seven_day: 99, at: 1 } } }));
+    const p = new AccountPool("anthropic", dir, fakeBase);
+    const acc = p.accounts();
+    expect(acc.map((a) => [a.label, a.active, a.capped_until, a.seven_day])).toEqual([["base", false, null, null], ["b", true, null, null]]);
   });
 });
 

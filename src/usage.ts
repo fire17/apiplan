@@ -342,12 +342,12 @@ async function one(p: UsageProvider, d: Required<UsageDeps>, account = ""): Prom
 
 /**
  * One ACCOUNT-POOL member's windows, fetched with that member's own credential. Cached and
- * oauth-held under `ident` (the member's credential-chain hash), never under the provider, so
+ * oauth-held under `member` (the pool member's stable label), never under the provider, so
  * members of one pool never overwrite each other's numbers or each other's 429 hold.
  */
-export async function accountUsage(p: UsageProvider, ident: string, creds: () => Creds, deps: UsageDeps = {}): Promise<ProviderUsage> {
+export async function accountUsage(p: UsageProvider, member: string, creds: () => Creds, deps: UsageDeps = {}): Promise<ProviderUsage> {
   const d = defaults({ ...deps, creds: () => creds() });
-  return one(p, d, ident || "?");
+  return one(p, d, member || "?");
 }
 
 /** Each provider answers on its own: one failing never fails the other. */

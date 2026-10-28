@@ -42,14 +42,20 @@ export type MemberUsage = {
   seven_day_resets_at?: string | null; five_hour_resets_at?: string | null;
   at: number; error?: string;
 };
-export type PoolState = {
-  v: 1;
-  providers: Partial<Record<PoolProvider, { active?: string; switched_at?: number }>>;
-  /** ident → epoch ms the member is refused until. */
+/**
+ * Per provider, keyed by member LABEL — never by credential ident. An external refresher rotates
+ * a Claude member's refresh token on every refresh (~8 h on srv2), and the ident hashes that
+ * token, so ident-keyed caps/usage were forgotten three times a day. The label (file name) is
+ * stable across refreshes; `ident` survives only as a display field in /health + `apiplan pool`.
+ */
+export type ProviderPoolState = {
+  active?: string; switched_at?: number;
+  /** label → epoch ms the member is refused until. */
   capped: Record<string, number>;
-  /** ident → last polled windows. */
+  /** label → last polled windows. */
   usage: Record<string, MemberUsage>;
 };
+export type PoolState = { v: 2; providers: Partial<Record<PoolProvider, ProviderPoolState>> };
 export type PoolAccount = {
   label: string; ident: string; active: boolean;
   seven_day: number | null; five_hour: number | null; capped_until: string | null;
@@ -65,13 +71,27 @@ const DEFAULT_CAP_MS = 3600_000;
 // ─────────────────────────── state ───────────────────────────
 
 let state: PoolState | null = null;
+/** v1 files (ident-keyed caps/usage) keep only their active member; the ident-keyed entries are dropped. */
 export function loadState(path = statePath()): PoolState {
   const s = readJson<any>(path, null);
-  return s && s.v === 1 && typeof s === "object"
-    ? { v: 1, providers: s.providers ?? {}, capped: s.capped ?? {}, usage: s.usage ?? {} }
-    : { v: 1, providers: {}, capped: {}, usage: {} };
+  const out: PoolState = { v: 2, providers: {} };
+  if (!s || typeof s !== "object" || !s.providers || typeof s.providers !== "object") return out;
+  for (const id of POOL_PROVIDERS) {
+    const p = s.providers[id];
+    if (!p || typeof p !== "object") continue;
+    out.providers[id] = {
+      ...(typeof p.active === "string" ? { active: p.active } : {}),
+      ...(typeof p.switched_at === "number" ? { switched_at: p.switched_at } : {}),
+      capped: s.v === 2 && p.capped && typeof p.capped === "object" ? p.capped : {},
+      usage: s.v === 2 && p.usage && typeof p.usage === "object" ? p.usage : {},
+    };
+  }
+  return out;
 }
 function st(): PoolState { return (state ??= loadState()); }
+function pst(provider: PoolProvider, from: PoolState = st()): ProviderPoolState {
+  return (from.providers[provider] ??= { capped: {}, usage: {} });
+}
 function save() { try { writeJson(statePath(), st()); } catch (e: any) { process.stderr.write(`[apiplan] pool: cannot write ${statePath()}: ${e?.message ?? e}\n`); } }
 
 // ─────────────────────────── members ───────────────────────────
@@ -101,8 +121,9 @@ function baseMember(provider: PoolProvider): PoolMember {
 export function memberFiles(dir: string): string[] {
   let names: string[];
   try { names = readdirSync(dir); } catch { return []; }
+  const state = statePath();
   return names.filter((n) => n.endsWith(".json") && !n.startsWith(".") && !n.includes(".RECOVER-") && !n.includes(".tmp-"))
-    .sort().map((n) => join(dir, n));
+    .sort().map((n) => join(dir, n)).filter((f) => f !== state);   // the pool's own state file is never a member
 }
 
 // ─────────────────────────── the selector ───────────────────────────
@@ -121,12 +142,12 @@ export function choose(c: {
   capped: Record<string, number>; usage: Record<string, MemberUsage>; switchPct: number; minDwellMs: number;
 }): { label: string; reason: "stay" | "dwell" | "switch" | "none-eligible" | "soonest" } {
   const { members, now } = c;
-  const isCapped = (m: Candidate) => (c.capped[m.ident] ?? 0) > now;
+  const isCapped = (m: Candidate) => (c.capped[m.label] ?? 0) > now;
   const usable = (m: Candidate) => !m.expired && m.ident !== "absent";
-  const eligible = (m: Candidate) => usable(m) && !isCapped(m) && (c.usage[m.ident]?.seven_day ?? 0) < c.switchPct;
+  const eligible = (m: Candidate) => usable(m) && !isCapped(m) && (c.usage[m.label]?.seven_day ?? 0) < c.switchPct;
   const idx = (m: Candidate) => members.indexOf(m);
   const rank = (a: Candidate, b: Candidate) => {
-    const ua = c.usage[a.ident], ub = c.usage[b.ident];
+    const ua = c.usage[a.label], ub = c.usage[b.label];
     const ka = ua?.seven_day !== undefined ? 0 : 1, kb = ub?.seven_day !== undefined ? 0 : 1;
     return (ka - kb) || ((ua?.seven_day ?? 0) - (ub?.seven_day ?? 0)) || ((ua?.five_hour ?? 0) - (ub?.five_hour ?? 0)) || (idx(a) - idx(b));
   };
@@ -137,7 +158,7 @@ export function choose(c: {
   const next = members.filter((m) => m !== cur && eligible(m)).sort(rank)[0];
   if (next) return { label: next.label, reason: "switch" };
   if (cur && !curDown) return { label: cur.label, reason: "none-eligible" };
-  const back = (m: Candidate) => (isCapped(m) ? c.capped[m.ident] : now);
+  const back = (m: Candidate) => (isCapped(m) ? c.capped[m.label] : now);
   const alt = members.filter(usable).sort((a, b) => (back(a) - back(b)) || rank(a, b))[0];
   return { label: (alt ?? cur ?? members[0]).label, reason: "soonest" };
 }
@@ -173,10 +194,9 @@ export class AccountPool {
   /** Re-run the selector, persist a change, and answer the member that serves next. */
   select(now = Date.now()): PoolMember {
     const all = this.candidates(now);
-    const s = st();
-    const ps = (s.providers[this.provider] ??= {});
+    const ps = pst(this.provider);
     const pick = choose({ members: all.map((x) => x.c), active: ps.active, switchedAt: ps.switched_at, now,
-      capped: s.capped, usage: s.usage, switchPct: switchPct(), minDwellMs: minDwellMs() });
+      capped: ps.capped, usage: ps.usage, switchPct: switchPct(), minDwellMs: minDwellMs() });
     if (pick.label !== ps.active) {
       if (ps.active !== undefined) process.stderr.write(`[apiplan] pool ${this.provider}: ${ps.active} → ${pick.label} (${pick.reason})\n`);
       ps.active = pick.label;
@@ -185,22 +205,25 @@ export class AccountPool {
     }
     return all.find((x) => x.c.label === pick.label)!.m;
   }
-  markCapped(ident: string, until: number) {
-    if (!ident || ident === "absent") return;
-    st().capped[ident] = Math.max(st().capped[ident] ?? 0, until);
+  /** Capped-until, by member label. */
+  cappedUntil(label: string): number { return pst(this.provider).capped[label] ?? 0; }
+  markCapped(label: string, until: number) {
+    if (!label) return;
+    const ps = pst(this.provider);
+    ps.capped[label] = Math.max(ps.capped[label] ?? 0, until);
     save();
   }
   /** Fold one polled usage answer in. A window at ≥100% caps the member until it resets. */
-  recordUsage(ident: string, u: ProviderUsage, now = Date.now()) {
-    if (!ident || ident === "absent") return;
-    const s = st();
-    const prev = s.usage[ident];
+  recordUsage(label: string, u: ProviderUsage, now = Date.now()) {
+    if (!label) return;
+    const s = pst(this.provider);
+    const prev = s.usage[label];
     if (!u.five_hour && !u.seven_day) {
-      s.usage[ident] = { ...(prev ?? {}), at: prev?.at ?? 0, error: u.error ?? "no windows reported" };
+      s.usage[label] = { ...(prev ?? {}), at: prev?.at ?? 0, error: u.error ?? "no windows reported" };
       save();
       return;
     }
-    s.usage[ident] = {
+    s.usage[label] = {
       ...(u.seven_day ? { seven_day: u.seven_day.used_percent, seven_day_resets_at: u.seven_day.resets_at } : {}),
       ...(u.five_hour ? { five_hour: u.five_hour.used_percent, five_hour_resets_at: u.five_hour.resets_at } : {}),
       at: now,
@@ -208,16 +231,17 @@ export class AccountPool {
     const full = [u.five_hour, u.seven_day].filter((w) => w && w.used_percent >= 100);
     if (full.length) {
       const until = Math.max(...full.map((w) => (w!.resets_at ? Date.parse(w!.resets_at) : NaN)).filter(Number.isFinite), 0);
-      s.capped[ident] = Math.max(s.capped[ident] ?? 0, until > now ? until : now + DEFAULT_CAP_MS);
+      s.capped[label] = Math.max(s.capped[label] ?? 0, until > now ? until : now + DEFAULT_CAP_MS);
     }
     save();
   }
   /** The /health + CLI view. Labels, 12-hex idents and percentages only — never a token. */
   accounts(now = Date.now(), from: PoolState = st()): PoolAccount[] {
-    const active = from.providers[this.provider]?.active;
+    const ps = from.providers[this.provider];
+    const active = ps?.active;
     return this.candidates(now).map(({ c }) => {
-      const u = from.usage[c.ident];
-      const cap = from.capped[c.ident] ?? 0;
+      const u = ps?.usage[c.label];
+      const cap = ps?.capped[c.label] ?? 0;
       return { label: c.label, ident: c.ident, active: c.label === active,
         seven_day: u?.seven_day ?? null, five_hour: u?.five_hour ?? null,
         capped_until: cap > now ? new Date(cap).toISOString() : null };
@@ -254,15 +278,11 @@ export function poolLease(provider: string): PoolMember | null {
 export function poolFailover(provider: string, failed: PoolMember, resetAt?: number, now = Date.now()): PoolMember | null {
   const p = poolFor(provider);
   if (!p) return null;
-  let ident = "absent";
-  try { ident = failed.fp().ident; } catch {}
-  p.markCapped(ident, resetAt && resetAt > now ? resetAt : now + DEFAULT_CAP_MS);
+  p.markCapped(failed.label, resetAt && resetAt > now ? resetAt : now + DEFAULT_CAP_MS);
   const next = p.select(now);
   if (next.label === failed.label) return null;
   // A member that is itself capped would only repeat the refusal: no retry then.
-  let nextIdent = "absent";
-  try { nextIdent = next.fp().ident; } catch {}
-  return (st().capped[nextIdent] ?? 0) > now ? null : next;
+  return p.cappedUntil(next.label) > now ? null : next;
 }
 
 /** /health's `accounts` for a provider, or undefined when its pool is off. */
@@ -284,7 +304,7 @@ export function pollPoolsOnce(deps: UsageDeps = {}): Promise<void> {
         let ident = "absent";
         try { ident = m.fp().ident; } catch {}
         if (ident === "absent") continue;
-        try { p.recordUsage(ident, await accountUsage(provider, ident, () => m.creds(), deps)); } catch {}
+        try { p.recordUsage(m.label, await accountUsage(provider, m.label, () => m.creds(), deps)); } catch {}
       }
       try { p.select(); } catch {}
     }
