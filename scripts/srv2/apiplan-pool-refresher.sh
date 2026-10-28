@@ -12,6 +12,14 @@ rc=0
 for f in "$DIR"/*.json; do
   [ -f "$f" ] || continue
   case "$(basename "$f")" in .*|*.RECOVER-*|*.tmp-*) continue ;; esac
+  # A `claude setup-token` login (apiplan-login.sh) is a 1-year access token with no refresh token: nothing to
+  # refresh, and cred-refresher would fail on it every tick. It is only reported once it nears its end.
+  if ! /usr/bin/python3 -c 'import json,sys; sys.exit(0 if (json.load(open(sys.argv[1])).get("claudeAiOauth") or {}).get("refreshToken") else 1)' "$f" 2>/dev/null; then
+    left=$(/usr/bin/python3 -c 'import json,sys,time; e=(json.load(open(sys.argv[1])).get("claudeAiOauth") or {}).get("expiresAt") or 0; print(int((e/1000-time.time())/86400))' "$f" 2>/dev/null)
+    echo "pool $(basename "$f" .json): setup-token, ${left:-?} d left — no refresh"
+    [ "${left:-0}" -lt 21 ] && { echo "pool $(basename "$f" .json): WARN setup-token expires in ${left:-?} d — re-run apiplan-login.sh"; rc=1; }
+    continue
+  fi
   echo "pool $(basename "$f" .json):"
   CRED_CLAUDE_FILE="$f" /usr/bin/python3 "$REFRESHER" --only claude || rc=1
 done
