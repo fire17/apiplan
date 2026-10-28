@@ -69,6 +69,7 @@ export type PoolState = { v: 2; providers: Partial<Record<PoolProvider, Provider
 export type PoolAccount = {
   label: string; ident: string; active: boolean; tier: TierName; auth: AuthKind | null;
   seven_day: number | null; five_hour: number | null; capped_until: string | null;
+  seven_day_resets_at: string | null; five_hour_resets_at: string | null;
 };
 
 const num = (v: string | undefined, d: number) => { const n = Number(v); return v !== undefined && v !== "" && Number.isFinite(n) ? n : d; };
@@ -337,7 +338,8 @@ export class AccountPool {
       const cap = ps?.capped[c.label] ?? 0;
       return { label: c.label, ident: c.ident, active: c.label === active, tier: this.tierOf(c.label), auth: c.auth ?? null,
         seven_day: u?.seven_day ?? null, five_hour: u?.five_hour ?? null,
-        capped_until: cap > now ? new Date(cap).toISOString() : null };
+        capped_until: cap > now ? new Date(cap).toISOString() : null,
+        seven_day_resets_at: u?.seven_day_resets_at ?? null, five_hour_resets_at: u?.five_hour_resets_at ?? null };
     });
   }
 }

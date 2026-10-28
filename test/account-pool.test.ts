@@ -346,7 +346,7 @@ describe("serve with an account pool", () => {
   test("/health accounts: labels, hashes and percentages — no secret fields", async () => {
     const h = await health(p, "anthropic");
     expect(Array.isArray(h.accounts)).toBe(true);
-    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "auth", "capped_until", "five_hour", "ident", "label", "seven_day", "tier"]);
+    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "auth", "capped_until", "five_hour", "five_hour_resets_at", "ident", "label", "seven_day", "seven_day_resets_at", "tier"]);
     expect(h.accounts.map((a: any) => [a.label, a.active])).toEqual([["base", false], ["b", true]]);
     expect(h.accounts[0].capped_until).toBeString();
     expect(h.accounts[0].ident).toMatch(/^[0-9a-f]{12}$/);

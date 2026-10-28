@@ -290,7 +290,10 @@ tr:last-child td { border-bottom: 0; }
       };
       el.append(h("div", { class: "card" }, h("h2", {}, prov === "openai" ? "OpenAI / Codex" : prov === "anthropic" ? "Anthropic" : prov),
         v.error ? h("div", { class: "note" }, "unavailable: " + v.error) : [bar("5-hour", v.five_hour), bar("Weekly", v.seven_day)],
-        h("div", { class: "note" }, [v.plan, v.source].filter(Boolean).join(" · "))));
+        h("div", { class: "note" }, [v.plan, v.source].filter(Boolean).join(" · ")),
+        Array.isArray(v.pool) ? h("div", { class: "note" }, v.pool.map((a) =>
+          (a.active ? "● " : "○ ") + a.label + " " + (a.seven_day === null ? "?" : Math.round(a.seven_day) + "%") + " wk"
+          + (a.tier !== "primary" ? " (" + a.tier + ")" : "") + (a.capped_until ? " · back " + until(a.capped_until) : "")).join("   ")) : null));
     }
   }
 

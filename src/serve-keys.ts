@@ -221,6 +221,7 @@ export function totalsByKey(lines: LedgerLine[], only?: (keyId: string) => boole
     t.cost_usd = Math.round(t.cost_usd * 1e6) / 1e6;
     const now = labels?.get(t.key_id);
     if (now) t.label = now; // a relabeled key shows its current name for past requests too
+    if (t.key_id === LEGACY.id) t.label = "owner"; // the single owner key (Tami, 2026-10-28: no untagged rows)
   }
   return [...by.values()].sort((a, b) => b.cost_usd - a.cost_usd || b.requests - a.requests);
 }

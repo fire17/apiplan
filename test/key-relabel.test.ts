@@ -64,7 +64,7 @@ describe("usage views show the current label", () => {
     relabelKey(record.id, "Roee", file);
     const rows = totalsByKey([line(record.id, "mag4"), line("legacy", "legacy")], undefined, storeLabels(file));
     expect(rows.find((r) => r.key_id === record.id)!.label).toBe("Roee");
-    expect(rows.find((r) => r.key_id === "legacy")!.label).toBe("legacy"); // not in the store: ledger label stays
+    expect(rows.find((r) => r.key_id === "legacy")!.label).toBe("owner"); // the owner key always shows as "owner" (2026-10-28)
     expect(totalsByKey([line(record.id, "mag4")])[0].label).toBe("mag4"); // without a store, unchanged behaviour
   });
 

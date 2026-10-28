@@ -19,7 +19,7 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
 import { poolLease, poolFailover, poolAccounts, startPoolPoller, type PoolMember } from "./account-pool.ts";
-import { keyCache, appendLedger, readLedger, totalsByKey, storeLabels, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
+import { keyCache, appendLedger, readLedger, readStore, totalsByKey, storeLabels, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
 import { predictionConfig, predictFromRequest, ComposerError, type ComposerRequest } from "./composer.ts";
 import { LIVE_MODELS, DEFAULT_LIVE_MODEL } from "./live-models.ts";
@@ -2108,6 +2108,30 @@ function countTokens(body: any): Response {
  * alive, and readiness probes elsewhere use `curl -sf` on this route. The verdict lives
  * in the body, where a caller has to actually read it.
  */
+/**
+ * GET /v1/usage with an account pool: the base well alone is not what serves (Tami ACA9819E,
+ * 2026-10-28: the dashboard said Anthropic 100% while alice served at 1%). A pooled provider's
+ * windows become the ACTIVE member's; the owner also gets every member under `pool`. Any other
+ * caller sees only the active percentages — never which accounts exist (seamless for friends).
+ */
+export function pooledUsage(u: Record<string, any>, owner: boolean): Record<string, any> {
+  const out: Record<string, any> = { ...u };
+  for (const id of Object.keys(u)) {
+    let acc: ReturnType<typeof poolAccounts>;
+    try { acc = poolAccounts(id); } catch { acc = undefined; }
+    const active = acc?.find((a) => a.active);
+    if (!acc || !active) continue;
+    const win = (pct: number | null, resets: string | null) => (pct === null ? null : { used_percent: pct, resets_at: resets });
+    const { error: _e, ...base } = (u[id] ?? {}) as Record<string, any>;
+    out[id] = { ...base,
+      five_hour: win(active.five_hour, active.five_hour_resets_at), seven_day: win(active.seven_day, active.seven_day_resets_at),
+      source: owner ? `account pool · active ${active.label} (${acc.length} accounts)` : "account pool",
+      ...(owner ? { pool: acc.map((a) => ({ label: a.label, tier: a.tier, active: a.active, seven_day: a.seven_day,
+        five_hour: a.five_hour, capped_until: a.capped_until })) } : {}) };
+  }
+  return out;
+}
+
 function accountsOf(id: string): { accounts?: ReturnType<typeof poolAccounts> } {
   try { const a = poolAccounts(id); return a ? { accounts: a } : {}; } catch { return {}; }
 }
@@ -2569,6 +2593,14 @@ export function serve(opts: ServeOpts = {}) {
         // whichever they know. Checked BEFORE any work, so an unauthenticated caller costs nothing.
         const who = acct.who = identify(req);
         if (!who) throw new HttpError(401, "invalid api key");
+        // The owner: the legacy key, or a keyless caller on this machine not via a proxy (the same
+        // rule /v1/usage/keys uses to show every key).
+        const isOwner = (r: Request) => {
+          const peer = srv.requestIP(r)?.address ?? "";
+          const local = (isLoopbackHost(peer) || peer === "::ffff:127.0.0.1")
+            && !(r.headers.has("x-forwarded-for") || r.headers.has("forwarded") || r.headers.has("x-real-ip"));
+          return who.id === LEGACY.id || (who.id === ANONYMOUS.id && local);
+        };
         // Per-key totals from the usage ledger. A per-client key sees only itself; the legacy
         // (owner) key and a keyless caller on this machine (not via a proxy) see every key; any
         // other keyless caller (open mode) sees only the anonymous bucket.
@@ -2604,7 +2636,21 @@ export function serve(opts: ServeOpts = {}) {
         if (req.method === "GET" && (path === "/v1/usage" || path === "/usage")) {
           const p = url.searchParams.get("provider") ?? undefined;
           if (p !== undefined && !USAGE_PROVIDERS.includes(p as UsageProvider)) throw new HttpError(400, `provider must be one of ${USAGE_PROVIDERS.join(", ")}`);
-          return json(await subscriptionUsage(p as UsageProvider | undefined));
+          return json(pooledUsage(await subscriptionUsage(p as UsageProvider | undefined), isOwner(req)));
+        }
+        // Owner-only key audit (MIND, 2026-10-28): every key's label, created, last use, 7-day
+        // requests, and the keys with no use in 7 days — for the groups ↔ agents ↔ keys audit.
+        if (req.method === "GET" && (path === "/v1/keys/audit" || path === "/keys/audit")) {
+          if (!isOwner(req)) throw new HttpError(403, "owner key only");
+          const now = Date.now(), week = now - 7 * 864e5;
+          const all = readLedger(0);
+          const last = new Map<string, string>();
+          for (const l of all) if (!last.has(l.key_id) || l.ts > last.get(l.key_id)!) last.set(l.key_id, l.ts);
+          const wk = new Map(totalsByKey(all.filter((l) => Date.parse(l.ts) >= week)).map((t) => [t.key_id, t.requests]));
+          const rows = readStore(keys.file).keys.map((k) => ({ id: k.id, label: k.label, created_at: k.created_at,
+            revoked_at: k.revoked_at ?? null, last_used: last.get(k.id) ?? null, requests_7d: wk.get(k.id) ?? 0 }));
+          return json({ object: "keys.audit", generated_at: new Date(now).toISOString(), keys: rows,
+            zero_use_7d: rows.filter((r) => !r.revoked_at && r.requests_7d === 0).map((r) => r.label) });
         }
         if (req.method === "GET" && (path === "/health" || path === "/")) return health();
         // Codex composer predictions (src/composer.ts, docs/COMPOSER.md): the live server config.
