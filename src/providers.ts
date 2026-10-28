@@ -688,6 +688,47 @@ export function warmCreds(): void {
   }
 }
 
+// ─────────────────────────── account-pool members ───────────────────────────
+
+/**
+ * The fingerprint of a credential JSON in its provider's well shape — the ONE formula both the
+ * base well (credFp() below) and every account-pool member file use, so a member's `ident` can
+ * never drift from what the same credential would fingerprint as in the base well.
+ *   anthropic  {claudeAiOauth:{accessToken, refreshToken?, expiresAt}}
+ *   openai     codex auth.json {tokens:{access_token, refresh_token?, account_id?}}
+ * Hash only: the token is never returned.
+ */
+export function credFpFromJson(provider: "anthropic" | "openai", j: any): CredFp {
+  if (provider === "anthropic") {
+    const t = j?.claudeAiOauth;
+    if (!t?.accessToken) return { cred: "absent", ident: "absent", exp: 0 };
+    const exp = Number(t.expiresAt) || 0;
+    return { cred: `${h12(t.accessToken)}:${exp}`, ident: h12(String(t.refreshToken ?? t.accessToken)), exp };
+  }
+  const tok = j?.tokens?.access_token;
+  if (!tok) return { cred: "absent", ident: "absent", exp: 0 };
+  const exp = jwtExp(tok) ?? 0;
+  return { cred: `${h12(tok)}:${exp}`, ident: h12(String(j.tokens.refresh_token ?? j.tokens.account_id ?? j.account_id ?? tok)), exp };
+}
+/**
+ * Creds out of a pool member file (same JSON shape as the provider's base well). Throws a
+ * plain Error naming the FILE (never its content) when the credential is absent or expired —
+ * apiplan never refreshes these; an external refresher rewrites the file in place.
+ */
+export function credsFromJson(provider: "anthropic" | "openai", j: any, source: string): Creds {
+  if (provider === "anthropic") {
+    const t = j?.claudeAiOauth;
+    if (!t?.accessToken) throw new Error(`pool member ${source}: no claudeAiOauth.accessToken`);
+    if (t.expiresAt && t.expiresAt < Date.now()) throw new Error(`pool member ${source}: Claude OAuth token expired`);
+    return { token: t.accessToken, expiresAt: t.expiresAt, source };
+  }
+  const t = j?.tokens;
+  if (!t?.access_token) throw new Error(`pool member ${source}: no tokens.access_token`);
+  const exp = jwtExp(t.access_token);
+  if (exp && exp < Date.now()) throw new Error(`pool member ${source}: Codex OAuth token expired`);
+  return { token: t.access_token, account: t.account_id ?? j.account_id, expiresAt: exp, source };
+}
+
 // ─────────────────────────── Anthropic (Claude Code subscription) ───────────────────────────
 
 /** macOS keeps it in the Keychain; Linux/WSL/Windows in ~/.claude/.credentials.json. */
@@ -982,12 +1023,7 @@ export const anthropic: Provider & StreamShape = {
   },
   /** U-1: the Keychain/file well, re-read once, before a refusal becomes a 401. */
   refreshCreds() { return readAnthropicRaw.refresh(); },
-  credFp() {
-    const t = readAnthropicRaw()?.json?.claudeAiOauth;
-    if (!t?.accessToken) return { cred: "absent", ident: "absent", exp: 0 };
-    const exp = Number(t.expiresAt) || 0;
-    return { cred: `${h12(t.accessToken)}:${exp}`, ident: h12(String(t.refreshToken ?? t.accessToken)), exp };
-  },
+  credFp() { return credFpFromJson("anthropic", readAnthropicRaw()?.json); },
   efforts: (m) => m.efforts ?? ANTHROPIC_EFFORTS,
   build(m, turns, o, c) {
     const betas = [env("APIPLAN_OAUTH_BETA", "oauth-2025-04-20")];
@@ -1282,13 +1318,7 @@ export const openai: Provider & StreamShape = {
     if (exp && exp < Date.now()) throw new Error("Codex OAuth token expired — run `codex` once to refresh it.");
     return { token: t.access_token, account: t.account_id ?? a.account_id, expiresAt: exp, source: codexAuthFile().replace(HOME, "~") };
   },
-  credFp() {
-    const a = readCodexRaw();
-    const tok = a?.tokens?.access_token;
-    if (!tok) return { cred: "absent", ident: "absent", exp: 0 };
-    const exp = jwtExp(tok) ?? 0;
-    return { cred: `${h12(tok)}:${exp}`, ident: h12(String(a.tokens.refresh_token ?? a.tokens.account_id ?? a.account_id ?? tok)), exp };
-  },
+  credFp() { return credFpFromJson("openai", readCodexRaw()); },
   efforts: (m) => m.efforts ?? ["low", "medium", "high", "xhigh"],
   build(m, turns, o, c) {
     const body: any = {

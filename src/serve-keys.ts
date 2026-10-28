@@ -161,6 +161,8 @@ export type LedgerLine = {
   estimated?: true;
   /** Present only when the provider's counters could not be partitioned exactly. */
   usage_basis?: string;
+  /** The account-pool member label that served; present only while that provider pools accounts. */
+  account?: string;
 };
 
 let ledgerWarned = false;

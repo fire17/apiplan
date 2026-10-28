@@ -66,7 +66,9 @@ const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const ttlMs = () => Math.max(1000, Number(process.env.APIPLAN_USAGE_TTL_MS) || 60_000);
 
 type Entry = { at: number; value?: ProviderUsage; inflight?: Promise<ProviderUsage> };
-const cache = new Map<UsageProvider, Entry>();
+/** Keyed by provider for the base well ("anthropic"), and by `provider#ident` for an
+ *  account-pool member, so pool members never overwrite each other's (or the base's) answer. */
+const cache = new Map<string, Entry>();
 /**
  * Credentials whose token was refused on /api/oauth/usage for SCOPE (403 permission_error,
  * user:profile). A token's scope never changes, so that credential skips the oauth call for as
@@ -77,11 +79,12 @@ const scopeRefused = new Set<string>();
  * oauth/usage rate-limits hard at the edge (AccountTracker measured 15 of 17 one-minute polls
  * refused, and floors its own cadence at 300 s). After a 429 the header probe answers instead
  * and oauth is left alone until this instant — a success elsewhere never shortens the hold.
+ * Keyed per ACCOUNT ("" = the base well), so one pool member's 429 never holds another's poll.
  */
-let oauthHoldUntil = 0;
+const oauthHoldUntil = new Map<string, number>();
 const OAUTH_HOLD_MS = 300_000;
 
-export function resetUsageCache(): void { cache.clear(); scopeRefused.clear(); oauthHoldUntil = 0; }
+export function resetUsageCache(): void { cache.clear(); scopeRefused.clear(); oauthHoldUntil.clear(); }
 
 const hashTok = (t: string) => new Bun.CryptoHasher("sha256").update(t).digest("hex").slice(0, 16);
 const iso = (ms: number | undefined) => (ms && Number.isFinite(ms) ? new Date(ms).toISOString() : null);
@@ -147,7 +150,7 @@ export function fromUnifiedHeaders(h: Headers, u: ProviderUsage, now: number): b
   return any;
 }
 
-async function anthropicUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
+async function anthropicUsage(d: Required<UsageDeps>, holdKey = ""): Promise<ProviderUsage> {
   const now = d.now();
   let c: Creds;
   try { c = d.creds("anthropic"); }
@@ -156,7 +159,7 @@ async function anthropicUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
   const mode = (process.env.APIPLAN_USAGE_ANTHROPIC_SOURCE ?? "auto").toLowerCase();
   const id = hashTok(tok);
   let oauthNote = "";
-  if (mode !== "headers" && !scopeRefused.has(id) && (mode === "oauth" || now >= oauthHoldUntil)) {
+  if (mode !== "headers" && !scopeRefused.has(id) && (mode === "oauth" || now >= (oauthHoldUntil.get(holdKey) ?? 0))) {
     const u = blank("oauth/usage", now);
     u.account = claudeAccount(c);
     try {
@@ -182,7 +185,7 @@ async function anthropicUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
           oauthNote = `oauth/usage HTTP ${r.status}${msg ? `: ${msg.slice(0, 160)}` : ""}`;
           if (r.status === 429) {
             const ra = parseResetValue(r.headers.get("retry-after"), now);
-            oauthHoldUntil = Math.max(now + OAUTH_HOLD_MS, ra ?? 0);
+            oauthHoldUntil.set(holdKey, Math.max(now + OAUTH_HOLD_MS, ra ?? 0));
           }
         }
         if (mode === "oauth") return { ...u, error: scrub(oauthNote, tok) };
@@ -194,7 +197,7 @@ async function anthropicUsage(d: Required<UsageDeps>): Promise<ProviderUsage> {
   } else if (scopeRefused.has(id)) {
     oauthNote = "oauth/usage skipped: this token lacks scope user:profile";
   } else if (mode !== "headers") {
-    oauthNote = `oauth/usage held after a 429 until ${new Date(oauthHoldUntil).toISOString()}`;
+    oauthNote = `oauth/usage held after a 429 until ${new Date(oauthHoldUntil.get(holdKey) ?? 0).toISOString()}`;
   }
 
   // The inference-header probe: the one path a user:inference-only token can take.
@@ -323,17 +326,28 @@ const defaults = (deps: UsageDeps): Required<UsageDeps> => ({
   sleep: deps.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms))),
 });
 
-async function one(p: UsageProvider, d: Required<UsageDeps>): Promise<ProviderUsage> {
-  const e = cache.get(p);
+async function one(p: UsageProvider, d: Required<UsageDeps>, account = ""): Promise<ProviderUsage> {
+  const key = account ? `${p}#${account}` : p;
+  const e = cache.get(key);
   const now = d.now();
   if (e?.value && now - e.at < ttlMs()) return e.value;
   if (e?.inflight) return e.inflight;
-  const run = (p === "anthropic" ? anthropicUsage(d) : openaiUsage(d)).catch((err): ProviderUsage =>
+  const run = (p === "anthropic" ? anthropicUsage(d, account) : openaiUsage(d)).catch((err): ProviderUsage =>
     ({ ...blank("none", now), error: `internal: ${err instanceof Error ? err.message : String(err)}` }));
-  cache.set(p, { at: e?.at ?? 0, value: e?.value, inflight: run });
+  cache.set(key, { at: e?.at ?? 0, value: e?.value, inflight: run });
   const v = await run;
-  cache.set(p, { at: d.now(), value: v });
+  cache.set(key, { at: d.now(), value: v });
   return v;
+}
+
+/**
+ * One ACCOUNT-POOL member's windows, fetched with that member's own credential. Cached and
+ * oauth-held under `ident` (the member's credential-chain hash), never under the provider, so
+ * members of one pool never overwrite each other's numbers or each other's 429 hold.
+ */
+export async function accountUsage(p: UsageProvider, ident: string, creds: () => Creds, deps: UsageDeps = {}): Promise<ProviderUsage> {
+  const d = defaults({ ...deps, creds: () => creds() });
+  return one(p, d, ident || "?");
 }
 
 /** Each provider answers on its own: one failing never fails the other. */

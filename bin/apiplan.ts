@@ -529,6 +529,7 @@ USAGE
   apiplan voices                 every speech voice available to you, and from where
   apiplan usage [--json] [--provider anthropic|openai]  subscription 5h + weekly windows, per provider
   apiplan usage --account [--warn 90]  one line per provider: ok / WARN / CAPPED / UNKNOWN; exit 0/2/3/1
+  apiplan pool [--json]          account pools: members, active one, weekly/5h %, caps (read-only)
   apiplan composer [--codex id|--claude id|--file f] [--json]  predict your next message (Codex composer predictions)
   apiplan live-models [--json]    voice models, transports and supported capabilities
   apiplan live-check [--live-model m] [--text words]  bounded subscription audio check
@@ -837,6 +838,31 @@ switch (sub) {
       for (const [k, w] of Object.entries(u.extra)) row(k, w);
       process.stdout.write(dim(`  source: ${u.source} \u00b7 fetched ${u.fetched_at}\n\n`));
     }
+    break;
+  }
+  case "pool": {
+    // Read-only view of the account pools (src/account-pool.ts): members, active marker, the last
+    // polled weekly / 5-hour %, and caps. Never polls, never switches, never prints a token.
+    const AP = await import("../src/account-pool.ts");
+    const state = AP.loadState();
+    const now = Date.now();
+    const out: Record<string, unknown> = {};
+    for (const id of AP.POOL_PROVIDERS) {
+      const p = AP.poolFor(id);
+      out[id] = p ? { pool: true, dir: p.dir, switch_pct: AP.switchPct(), accounts: p.accounts(now, state) } : { pool: false };
+    }
+    if (has("--json")) { process.stdout.write(JSON.stringify({ state_file: AP.statePath(), ...out }, null, 2) + "\n"); break; }
+    const pctOf = (n: number | null) => (n === null ? dim("—") : n >= AP.switchPct() ? bad(`${n}%`) : n >= 70 ? warn(`${n}%`) : ok(`${n}%`));
+    for (const id of AP.POOL_PROVIDERS) {
+      const v = out[id] as any;
+      if (!v.pool) { process.stdout.write(`${head(id)} ${dim(`pool off — set ${id === "anthropic" ? "APIPLAN_ANTHROPIC_POOL_DIR" : "APIPLAN_CODEX_POOL_DIR"} to a dir of credential files`)}\n\n`); continue; }
+      process.stdout.write(`${head(id)} ${dim(`${v.dir.replace(HOME, "~")} · switch at ${v.switch_pct}% weekly`)}\n`);
+      for (const a of v.accounts as any[]) {
+        process.stdout.write(`  ${a.active ? ok("●") : dim("○")} ${pad(a.label, 18)} ${dim(a.ident)}  7d ${pad(pctOf(a.seven_day), 6)}  5h ${pad(pctOf(a.five_hour), 6)}${a.capped_until ? bad(`  capped until ${a.capped_until}`) : ""}\n`);
+      }
+      process.stdout.write("\n");
+    }
+    process.stdout.write(dim(`state: ${AP.statePath().replace(HOME, "~")}\n`));
     break;
   }
   case "talk": case "converse": {

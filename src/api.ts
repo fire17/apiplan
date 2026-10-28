@@ -18,6 +18,7 @@ import { reasoningItemOf, encodeReasoningSig, isForeignThinking, isApiplanThinki
          reasoningReplayOn, withReasoningInclude, type ReasoningItem } from "./responses-wire.ts";
 import { codexCapacityHeaders, responsesFaultAlias } from "./codex-limits.ts";
 import { subscriptionUsage, USAGE_PROVIDERS, type UsageProvider } from "./usage.ts";
+import { poolLease, poolFailover, poolAccounts, startPoolPoller, type PoolMember } from "./account-pool.ts";
 import { keyCache, appendLedger, readLedger, totalsByKey, storeLabels, parseWindow, parseGroups, breakdown, costUsd, LEGACY, ANONYMOUS, type Ident } from "./serve-keys.ts";
 import { DASHBOARD_HTML, DASHBOARD_HEADERS } from "./dashboard.ts";
 import { predictionConfig, predictFromRequest, ComposerError, type ComposerRequest } from "./composer.ts";
@@ -403,9 +404,23 @@ const anthropicId = (p: string) => `${p}_01${Array.from(crypto.getRandomValues(n
 /** A Delta plus the one thing openai.delta() (providers.ts) cannot surface: the raw Responses
  *  reasoning item, carried so the Anthropic front can mint a replayable thinking block (A4). */
 type DeltaX = Delta & { reasoningItem?: ReasoningItem & { model: string } };
+/**
+ * Which account-pool member a run() used (src/account-pool.ts). Empty when the provider is
+ * single-account. `use` pins the member for a failover retry; `meter` gets its label for the
+ * ledger.
+ */
+type PoolSlot = { member?: PoolMember; use?: PoolMember; meter?: Meter };
 
-async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal): AsyncGenerator<DeltaX> {
+async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal, slot?: PoolSlot): AsyncGenerator<DeltaX> {
   const p = providerFor(m);
+  // ── ACCOUNT POOL ── null unless this provider has ≥2 members (zero-config: always null, and
+  // everything below runs exactly as before). A NON-base member is read from its own file; its
+  // outcome is never written against the provider's base-well verdict (noteCall), because that
+  // verdict is about a different credential.
+  const lease = slot?.use ?? poolLease(m.provider);
+  if (slot) { slot.member = lease ?? undefined; if (slot.meter) slot.meter.account = lease?.label; }
+  const member = lease && !lease.base ? lease : null;
+  const note = (ok: boolean, detail: string) => { if (!member) noteCall(m.provider, ok, detail); };
   // An expired subscription token is an AUTHENTICATION fault, not a server fault. creds()
   // throws a plain Error, which used to land in the 500 bucket below — and Anthropic-shaped
   // clients retry a 500 forever instead of saying "log in again".
@@ -415,7 +430,10 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
   // would block the whole server on one vendor's latency. Never throws by contract, and a
   // provider that has nothing to prepare has no hook at all.
   try { await p.prepare?.(); } catch {}
-  try { c = p.creds(); }
+  if (member) {
+    try { c = member.creds(); }
+    catch (e: any) { throw new HttpError(401, e?.message ?? "no usable pool credential"); }
+  } else { try { c = p.creds(); }
   catch (e: any) {
     // ── U-1 (2026-08-28): a refusal is not proof until the well has been re-read ──
     // On a resident host creds() reads a SNAPSHOT (F9-2), so a credential rotated by an
@@ -438,7 +456,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
       if (fresh) noteCall(m.provider, false, e2?.message ?? "no usable provider credential");
       throw new HttpError(401, e2?.message ?? "no usable provider credential");
     }
-  }
+  } }
   // Bind the observation to the credential in hand, before an in-flight call can see a swap.
   //
   // `credFp()` reports an unreadable or missing well as a PLACEHOLDER string in this same field
@@ -447,7 +465,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
   // exhausted->open edge that fabricates a window-reset. No identity means NO capacity observation.
   let capacityAccount: string | undefined;
   try {
-    const ident = p.credFp?.().ident;
+    const ident = member ? member.fp().ident : p.credFp?.().ident;
     capacityAccount = isRealAccountIdent(ident) ? ident : undefined;
   } catch {}
   let built: Built;
@@ -516,7 +534,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
     // Only an AUTH rejection condemns the credential. A 429 is a busy account, a 400 is our
     // own request — neither means "log in again", and marking them degraded would make
     // /health cry wolf on the one signal a watchdog is meant to trust.
-    if (res.status === 401 || res.status === 403) noteCall(m.provider, false, `HTTP ${res.status}: ${detail.slice(0, 160)}`);
+    if (res.status === 401 || res.status === 403) note(false, `HTTP ${res.status}: ${detail.slice(0, 160)}`);
     // Other refusals say nothing about capacity; in particular, auth/5xx must not reopen it.
     if (capacityAccount && (res.status === 429 || res.status === 402 || errorType === "rate_limit_error" || errorType === "billing_error")) {
       try { recordCapacity({ provider: m.provider, account: capacityAccount, model: m.id, at: Date.now(), status: res.status, headers: responseHeaders ?? res.headers, errorType, scope: "unknown" }); } catch {}
@@ -534,7 +552,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
     throw new HttpError(res.status, detail, errorType);
   }
   // The vendor accepted the credential and opened a stream: that is proof, and it is free.
-  noteCall(m.provider, true, `accepted ${new Date().toISOString().slice(11, 19)}`);
+  note(true, `accepted ${new Date().toISOString().slice(11, 19)}`);
   if (capacityAccount) {
     try { recordCapacity({ provider: m.provider, account: capacityAccount, model: m.id, at: Date.now(), status: res.status, headers: res.headers, scope: "unknown" }); } catch {}
   }
@@ -595,7 +613,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal):
         if (d.error) {
           // An auth fault can also arrive INSIDE an accepted stream (a token revoked between
           // the handshake and the answer) — that condemns the credential just the same.
-          if (d.errorType === "authentication_error" || d.errorType === "permission_error") noteCall(m.provider, false, `mid-stream ${d.errorType}: ${d.error.slice(0, 160)}`);
+          if (d.errorType === "authentication_error" || d.errorType === "permission_error") note(false, `mid-stream ${d.errorType}: ${d.error.slice(0, 160)}`);
           const et = m.provider === "openai" ? responsesFaultAlias(d.errorType) : d.errorType;
           throw new HttpError(STATUS_FOR_TYPE[et ?? ""] ?? 502, et !== d.errorType && d.errorType && !d.error.includes(d.errorType) ? `${d.error} [${d.errorType}]` : d.error, et);
         }
@@ -647,13 +665,27 @@ const REPLAY_REFUSED = /invalid_encrypted_content|encrypted content .*could not 
 const hasReplay = (turns: Turn[]) => turns.some((t) => t.nativeAnthropicContent?.some(isApiplanThinking));
 const stripReplay = (turns: Turn[]) => turns.map((t) => t.nativeAnthropicContent?.some(isApiplanThinking)
   ? { ...t, nativeAnthropicContent: t.nativeAnthropicContent.filter((b) => !isApiplanThinking(b)) } : t);
-async function* runSafe(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal): AsyncGenerator<DeltaX> {
+/** A refusal that means "this ACCOUNT is out of capacity" — the one an account pool can route around. */
+const CAPACITY_REFUSED = (e: HttpError) => e.status === 429 || e.upstreamType === "rate_limit_error" || /usage_limit_reached/.test(e.message);
+async function* runSafe(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal, meter?: Meter): AsyncGenerator<DeltaX> {
   let yielded = false;
-  try { for await (const d of run(m, turns, o, signal)) { yielded = true; yield d; } }
+  const slot: PoolSlot = { meter };
+  try { for await (const d of run(m, turns, o, signal, slot)) { yielded = true; yield d; } }
   catch (e) {
-    if (yielded || !(e instanceof HttpError) || e.status !== 400 || !REPLAY_REFUSED.test(e.message) || !hasReplay(turns)) throw e;
-    console.error(`[apiplan] ${m.id}: reasoning replay refused upstream (invalid_encrypted_content) — retried once without it`);
-    yield* run(m, stripReplay(turns), o, signal);
+    if (yielded || !(e instanceof HttpError)) throw e;
+    if (e.status === 400 && REPLAY_REFUSED.test(e.message) && hasReplay(turns)) {
+      console.error(`[apiplan] ${m.id}: reasoning replay refused upstream (invalid_encrypted_content) — retried once without it`);
+      yield* run(m, stripReplay(turns), o, signal, { use: slot.member, meter });
+      return;
+    }
+    // ── ACCOUNT-POOL FAILOVER ── the active member is out of capacity and the client has seen
+    // nothing yet: cap it until its reset, move to the next member, and retry ONCE there. No
+    // pool (or no other member) → the refusal stands exactly as before.
+    if (signal?.aborted || !slot.member || !CAPACITY_REFUSED(e)) throw e;
+    const next = poolFailover(m.provider, slot.member, e.requestFailure?.resetAt);
+    if (!next) throw e;
+    console.error(`[apiplan] ${m.id}: account ${slot.member.label} refused for capacity (HTTP ${e.status}) — retrying once on ${next.label}`);
+    yield* run(m, turns, o, signal, { use: next, meter });
   }
 }
 
@@ -1267,6 +1299,8 @@ const basisMark = (n: Norm) => (n.basis === "exclusive" ? {} : { [USAGE_BASIS_MA
  */
 export type Meter = {
   model?: string; provider?: string; stream?: boolean;
+  /** The account-pool member that served (src/account-pool.ts); absent when the pool is off. */
+  account?: string;
   usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cacheWrite1h?: number; estimated: boolean; basis: Norm["basis"] };
   /** A fault that arrived inside an already-committed stream (the head said 200). */
   fault?: number;
@@ -1540,7 +1574,7 @@ async function openaiChat(body: any, signal?: AbortSignal, meter?: Meter): Promi
   Object.assign(o, toolsFrom(body, "openai"));
   if (m) clampEffort(m, o);
   const ac = linkAbort(signal);
-  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal, meter));
   const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = rid("chatcmpl"), created = now();
   let auto = 0;
@@ -1861,7 +1895,7 @@ async function openaiResponses(body: any, signal?: AbortSignal, meter?: Meter): 
   Object.assign(o, toolsFrom(chat, "openai"));
   if (m) clampEffort(m, o);
   const ac = linkAbort(signal);
-  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal, meter));
   const meta = { model: jimmy ? JIMMY_MODEL : m!.id, body, turns, system, effort: o.effort, provider: m?.provider, meter };
   if (!chat.stream) return json(await renderResponses(gen, meta).collect());
   // Commit the head only once the upstream has actually answered — see preflight().
@@ -1885,7 +1919,7 @@ async function anthropicMessages(body: any, signal?: AbortSignal, meter?: Meter)
   const emitThinking = m?.provider === "openai" && reasoningReplayOn();
   if (emitThinking && process.env.APIPLAN_OPENAI_SUMMARY !== "0" && body?.thinking && body.thinking.type !== "disabled") o.showThinking = true;
   const ac = linkAbort(signal);
-  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal));
+  const gen = () => (jimmy ? runJimmy(turns, ac.signal) : runSafe(m!, turns, o, ac.signal, meter));
   const id0 = jimmy ? JIMMY_MODEL : m!.id;
   const id = anthropicId("msg");
   let auto = 0;
@@ -2074,6 +2108,9 @@ function countTokens(body: any): Response {
  * alive, and readiness probes elsewhere use `curl -sf` on this route. The verdict lives
  * in the body, where a caller has to actually read it.
  */
+function accountsOf(id: string): { accounts?: ReturnType<typeof poolAccounts> } {
+  try { const a = poolAccounts(id); return a ? { accounts: a } : {}; } catch { return {}; }
+}
 function health(): Response {
   const ids = Object.keys(PROVIDERS) as (keyof typeof PROVIDERS)[];
   const registry = models();
@@ -2142,6 +2179,9 @@ function health(): Response {
             : v.state === "ok" && v.carried === "refreshed" ? `${p.detail} · last call ACCEPTED on this credential (bearer rotated since)`
             : p.detail,
       ...(fix ? { fix } : {}),
+      // Account pool (src/account-pool.ts): present ONLY while this provider pools ≥2 accounts.
+      // Labels, 12-hex credential hashes and percentages — never a token.
+      ...accountsOf(id),
     };
   });
   const live = providers.filter((p) => p.connected).length;
@@ -2651,13 +2691,16 @@ export function serve(opts: ServeOpts = {}) {
             stream, status: st, input_tokens: b.input, output_tokens: b.output, cache_read_tokens: b.cacheRead, cache_write_tokens: b.cacheWrite,
             cost_usd: !u || m.provider === "jimmy" || m.provider === "ollama" ? 0 : costUsd(m.model, b), latency_ms: Date.now() - t0,
             ...(u?.estimated ? { estimated: true as const } : {}), ...(u && u.basis !== "exclusive" ? { usage_basis: u.basis } : {}),
+            ...(m.account ? { account: m.account } : {}),
           });
         };
         if (settled) void settled.then(write, write); else write();
       }
       return response;
   }
+  // Account pools poll their members' usage only here, and only when a pool is configured.
+  const stopPoolPoller = startPoolPoller();
   // server.port, not the requested one: port 0 means "any free port", and only the
   // server knows which it got.
-  return { url: `http://${hostname}:${server.port}`, port: server.port, hostname, tokenRequired: !!token || keys.activeCount() > 0, keysFile: keys.file, control, stop: () => server.stop(true) };
+  return { url: `http://${hostname}:${server.port}`, port: server.port, hostname, tokenRequired: !!token || keys.activeCount() > 0, keysFile: keys.file, control, stop: () => { stopPoolPoller?.(); return server.stop(true); } };
 }
