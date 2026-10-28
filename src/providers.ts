@@ -53,7 +53,10 @@ const h12 = (s: string) => createHash("sha256").update(s).digest("hex").slice(0,
  *   exp    that bearer's expiry, ms. A rotation ADVANCES it; a swap does not have to.
  * Hash only: the token is never stored, printed, logged or returned.
  */
-export type CredFp = { cred: string; ident: string; exp: number };
+/** How a credential was obtained: a full OAuth login (refreshable), a `claude setup-token` (1-year,
+ *  inference-only, no refresh), or an access-only copy someone else refreshes. Display only. */
+export type AuthKind = "oauth" | "setup-token" | "access-only";
+export type CredFp = { cred: string; ident: string; exp: number; auth?: AuthKind };
 
 export type ImageRef = { url?: string; mediaType?: string; base64?: string };
 /**
@@ -703,12 +706,15 @@ export function credFpFromJson(provider: "anthropic" | "openai", j: any): CredFp
     const t = j?.claudeAiOauth;
     if (!t?.accessToken) return { cred: "absent", ident: "absent", exp: 0 };
     const exp = Number(t.expiresAt) || 0;
-    return { cred: `${h12(t.accessToken)}:${exp}`, ident: h12(String(t.refreshToken ?? t.accessToken)), exp };
+    const sc: string[] = Array.isArray(t.scopes) ? t.scopes : [];
+    const auth: AuthKind = t.refreshToken ? "oauth" : sc.length === 1 && sc[0] === "user:inference" ? "setup-token" : "access-only";
+    return { cred: `${h12(t.accessToken)}:${exp}`, ident: h12(String(t.refreshToken ?? t.accessToken)), exp, auth };
   }
   const tok = j?.tokens?.access_token;
   if (!tok) return { cred: "absent", ident: "absent", exp: 0 };
   const exp = jwtExp(tok) ?? 0;
-  return { cred: `${h12(tok)}:${exp}`, ident: h12(String(j.tokens.refresh_token ?? j.tokens.account_id ?? j.account_id ?? tok)), exp };
+  return { cred: `${h12(tok)}:${exp}`, ident: h12(String(j.tokens.refresh_token ?? j.tokens.account_id ?? j.account_id ?? tok)), exp,
+    auth: j.tokens.refresh_token ? "oauth" : "access-only" };
 }
 /**
  * Creds out of a pool member file (same JSON shape as the provider's base well). Throws a

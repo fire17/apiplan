@@ -346,7 +346,7 @@ describe("serve with an account pool", () => {
   test("/health accounts: labels, hashes and percentages — no secret fields", async () => {
     const h = await health(p, "anthropic");
     expect(Array.isArray(h.accounts)).toBe(true);
-    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "capped_until", "five_hour", "ident", "label", "seven_day", "tier"]);
+    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "auth", "capped_until", "five_hour", "ident", "label", "seven_day", "tier"]);
     expect(h.accounts.map((a: any) => [a.label, a.active])).toEqual([["base", false], ["b", true]]);
     expect(h.accounts[0].capped_until).toBeString();
     expect(h.accounts[0].ident).toMatch(/^[0-9a-f]{12}$/);
@@ -468,5 +468,17 @@ describe("pool tiers (.registry.json)", () => {
     reg({ x: { tier: "blocked" } });
     resetPools();
     expect(poolFor("anthropic")).toBeNull();
+  });
+});
+
+describe("auth kind (display)", () => {
+  test("credFpFromJson tells oauth, setup-token and access-only apart", async () => {
+    const { credFpFromJson } = await import("../src/providers.ts");
+    const a = (o: any) => credFpFromJson("anthropic", { claudeAiOauth: { accessToken: "AT-fake", expiresAt: Date.now() + HOUR, ...o } }).auth;
+    expect(a({ refreshToken: "RT-fake", scopes: ["user:inference", "user:profile"] })).toBe("oauth");
+    expect(a({ scopes: ["user:inference"] })).toBe("setup-token");
+    expect(a({})).toBe("access-only");
+    expect(credFpFromJson("openai", JSON.parse(codex("AT-fake", "RT-fake", "acct"))).auth).toBe("oauth");
+    expect(credFpFromJson("openai", { tokens: { access_token: "AT-fake", account_id: "acct" } }).auth).toBe("access-only");
   });
 });

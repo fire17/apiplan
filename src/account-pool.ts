@@ -31,7 +31,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
-import { PROVIDERS, credFpFromJson, credsFromJson, type CredFp, type Creds } from "./providers.ts";
+import { PROVIDERS, credFpFromJson, credsFromJson, type AuthKind, type CredFp, type Creds } from "./providers.ts";
 import { HOME, STATE_DIR, readJson, writeJson } from "./platform.ts";
 import { accountUsage, type ProviderUsage, type UsageDeps } from "./usage.ts";
 
@@ -67,7 +67,7 @@ export type ProviderPoolState = {
 };
 export type PoolState = { v: 2; providers: Partial<Record<PoolProvider, ProviderPoolState>> };
 export type PoolAccount = {
-  label: string; ident: string; active: boolean; tier: TierName;
+  label: string; ident: string; active: boolean; tier: TierName; auth: AuthKind | null;
   seven_day: number | null; five_hour: number | null; capped_until: string | null;
 };
 
@@ -181,7 +181,7 @@ export function memberFiles(dir: string): string[] {
 
 // ─────────────────────────── the selector ───────────────────────────
 
-export type Candidate = { label: string; ident: string; expired: boolean; /** 0 primary · 1 backup · 2 emergency */ tier?: number };
+export type Candidate = { label: string; ident: string; expired: boolean; /** 0 primary · 1 backup · 2 emergency */ tier?: number; auth?: AuthKind };
 /** Usable (credential present, unexpired), not capped, and weekly % below the switch pct. */
 export function isEligible(m: Candidate, capped: Record<string, number>, usage: Record<string, MemberUsage>, now: number, pct: number): boolean {
   return !m.expired && m.ident !== "absent" && !((capped[m.label] ?? 0) > now) && (usage[m.label]?.seven_day ?? 0) < pct;
@@ -263,7 +263,7 @@ export class AccountPool {
       try { f = m.fp(); } catch { f = { cred: "absent", ident: "absent", exp: 0 }; }
       const t = this.tierOf(m.label);
       return { m, c: { label: m.label, ident: f.ident, expired: f.ident === "absent" || (f.exp > 0 && f.exp < now),
-        tier: TIER_RANK[t as Exclude<TierName, "blocked">] ?? 0 } };
+        tier: TIER_RANK[t as Exclude<TierName, "blocked">] ?? 0, ...(f.auth ? { auth: f.auth } : {}) } };
     });
   }
   /** Re-run the selector, persist a change, and answer the member that serves next. */
@@ -335,7 +335,7 @@ export class AccountPool {
     return this.candidates(now).map(({ c }) => {
       const u = ps?.usage[c.label];
       const cap = ps?.capped[c.label] ?? 0;
-      return { label: c.label, ident: c.ident, active: c.label === active, tier: this.tierOf(c.label),
+      return { label: c.label, ident: c.ident, active: c.label === active, tier: this.tierOf(c.label), auth: c.auth ?? null,
         seven_day: u?.seven_day ?? null, five_hour: u?.five_hour ?? null,
         capped_until: cap > now ? new Date(cap).toISOString() : null };
     });
