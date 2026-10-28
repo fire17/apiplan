@@ -858,7 +858,7 @@ switch (sub) {
       if (!v.pool) { process.stdout.write(`${head(id)} ${dim(`pool off — set ${id === "anthropic" ? "APIPLAN_ANTHROPIC_POOL_DIR" : "APIPLAN_CODEX_POOL_DIR"} to a dir of credential files`)}\n\n`); continue; }
       process.stdout.write(`${head(id)} ${dim(`${v.dir.replace(HOME, "~")} · switch at ${v.switch_pct}% weekly`)}\n`);
       for (const a of v.accounts as any[]) {
-        process.stdout.write(`  ${a.active ? ok("●") : dim("○")} ${pad(a.label, 18)} ${dim(a.ident)}  7d ${pad(pctOf(a.seven_day), 6)}  5h ${pad(pctOf(a.five_hour), 6)}${a.capped_until ? bad(`  capped until ${a.capped_until}`) : ""}\n`);
+        process.stdout.write(`  ${a.active ? ok("●") : dim("○")} ${pad(a.label, 18)} ${dim(a.ident)}  7d ${pad(pctOf(a.seven_day), 6)}  5h ${pad(pctOf(a.five_hour), 6)}${a.tier !== "primary" ? dim(`  ${a.tier}`) : ""}${a.capped_until ? bad(`  capped until ${a.capped_until}`) : ""}\n`);
       }
       process.stdout.write("\n");
     }

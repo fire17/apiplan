@@ -17,6 +17,14 @@
 //   APIPLAN_POOL_STATE           state file (default <APIPLAN_HOME>/pool-state.json)
 //   APIPLAN_POOL_STRATEGY        headroom (default) | sticky | round-robin — see poolStrategy()
 //
+// TIERS (Tami, voice AC61B89F 2026-10-28: a managed list of which accounts the server may use; his
+// own fire17 account never in the pool; work accounts only in an emergency). Each pool dir may hold
+// a `.registry.json` (a dotfile, so never a member) keyed by member label (`base` = the well):
+//   { "<label>": { "tier": "primary" | "backup" | "emergency" | "blocked", "email"?: "…", "note"?: "…" } }
+// A label not listed is `primary`. `blocked` members are dropped entirely — never served, polled
+// or failed over to. Every strategy serves only from the BEST tier that has an eligible member,
+// and a member on a worse tier hands back as soon as a better one is eligible again (after dwell).
+//
 // apiplan NEVER refreshes these tokens: an external refresher rewrites the member files, and a
 // member re-reads its file whenever the file's mtime/size/inode changes. No token ever enters
 // the state file, a log line, /health or the CLI — only labels and 12-hex credential hashes.
@@ -59,7 +67,7 @@ export type ProviderPoolState = {
 };
 export type PoolState = { v: 2; providers: Partial<Record<PoolProvider, ProviderPoolState>> };
 export type PoolAccount = {
-  label: string; ident: string; active: boolean;
+  label: string; ident: string; active: boolean; tier: TierName;
   seven_day: number | null; five_hour: number | null; capped_until: string | null;
 };
 
@@ -92,6 +100,26 @@ export function poolStrategy(): PoolStrategy {
 /** Rendezvous (highest-random-weight) score: a member leaving the eligible set only moves the
  *  conversations that were on it; everyone else keeps their member (and their cache). */
 const hrw = (key: string, label: string) => parseInt(createHash("sha256").update(`${key}\0${label}`).digest("hex").slice(0, 12), 16);
+
+// ─────────────────────────── tiers ───────────────────────────
+
+export type TierName = "primary" | "backup" | "emergency" | "blocked";
+export const TIER_RANK: Record<Exclude<TierName, "blocked">, number> = { primary: 0, backup: 1, emergency: 2 };
+export type RegistryEntry = { tier: TierName; email?: string; note?: string };
+export const registryPath = (dir: string) => join(dir, ".registry.json");
+/** label → entry; unreadable or absent ⇒ {} (everyone primary). An unknown tier word reads as `blocked`:
+ *  a typo must fail closed, never put an account the owner meant to fence off into rotation. */
+export function readRegistry(dir: string): Record<string, RegistryEntry> {
+  const j = readJson<any>(registryPath(dir), null);
+  if (!j || typeof j !== "object") return {};
+  const out: Record<string, RegistryEntry> = {};
+  for (const [label, v] of Object.entries<any>(j)) {
+    if (!v || typeof v !== "object") continue;
+    const t = String(v.tier ?? "primary");
+    out[label] = { ...v, tier: t === "primary" || t === "backup" || t === "emergency" ? t : "blocked" };
+  }
+  return out;
+}
 
 // ─────────────────────────── state ───────────────────────────
 
@@ -153,7 +181,7 @@ export function memberFiles(dir: string): string[] {
 
 // ─────────────────────────── the selector ───────────────────────────
 
-export type Candidate = { label: string; ident: string; expired: boolean };
+export type Candidate = { label: string; ident: string; expired: boolean; /** 0 primary · 1 backup · 2 emergency */ tier?: number };
 /** Usable (credential present, unexpired), not capped, and weekly % below the switch pct. */
 export function isEligible(m: Candidate, capped: Record<string, number>, usage: Record<string, MemberUsage>, now: number, pct: number): boolean {
   return !m.expired && m.ident !== "absent" && !((capped[m.label] ?? 0) > now) && (usage[m.label]?.seven_day ?? 0) < pct;
@@ -164,12 +192,14 @@ export function isEligible(m: Candidate, capped: Record<string, number>, usage: 
  *   · otherwise (and past the minimum dwell, unless the active one is capped/unusable) move to
  *     the eligible member with the LOWEST weekly %, ties by 5-hour %, then label order. A member
  *     never polled ranks after every measured one — unknown headroom is not headroom;
+ *   · tiers come first: the next member is always from the best tier with an eligible member,
+ *     and an eligible active member on a WORSE tier than that hands back ("prefer") past dwell;
  *   · nobody eligible: keep a still-working active member, else the usable one back soonest.
  */
 export function choose(c: {
   members: Candidate[]; active?: string; switchedAt?: number; now: number;
   capped: Record<string, number>; usage: Record<string, MemberUsage>; switchPct: number; minDwellMs: number;
-}): { label: string; reason: "stay" | "dwell" | "switch" | "none-eligible" | "soonest" } {
+}): { label: string; reason: "stay" | "dwell" | "switch" | "prefer" | "none-eligible" | "soonest" } {
   const { members, now } = c;
   const isCapped = (m: Candidate) => (c.capped[m.label] ?? 0) > now;
   const usable = (m: Candidate) => !m.expired && m.ident !== "absent";
@@ -180,15 +210,17 @@ export function choose(c: {
     const ka = ua?.seven_day !== undefined ? 0 : 1, kb = ub?.seven_day !== undefined ? 0 : 1;
     return (ka - kb) || ((ua?.seven_day ?? 0) - (ub?.seven_day ?? 0)) || ((ua?.five_hour ?? 0) - (ub?.five_hour ?? 0)) || (idx(a) - idx(b));
   };
+  const tier = (m: Candidate) => m.tier ?? 0;
+  const best = Math.min(...members.filter(eligible).map(tier));   // Infinity when nobody is eligible
   const cur = members.find((m) => m.label === c.active);
-  if (cur && eligible(cur)) return { label: cur.label, reason: "stay" };
+  if (cur && eligible(cur) && tier(cur) <= best) return { label: cur.label, reason: "stay" };
   const curDown = !cur || !usable(cur) || isCapped(cur);
   if (cur && !curDown && now - (c.switchedAt ?? 0) < c.minDwellMs) return { label: cur.label, reason: "dwell" };
-  const next = members.filter((m) => m !== cur && eligible(m)).sort(rank)[0];
-  if (next) return { label: next.label, reason: "switch" };
+  const next = members.filter((m) => m !== cur && eligible(m)).sort((a, b) => (tier(a) - tier(b)) || rank(a, b))[0];
+  if (next) return { label: next.label, reason: cur && eligible(cur) ? "prefer" : "switch" };
   if (cur && !curDown) return { label: cur.label, reason: "none-eligible" };
   const back = (m: Candidate) => (isCapped(m) ? c.capped[m.label] : now);
-  const alt = members.filter(usable).sort((a, b) => (back(a) - back(b)) || rank(a, b))[0];
+  const alt = members.filter(usable).sort((a, b) => (back(a) - back(b)) || (tier(a) - tier(b)) || rank(a, b))[0];
   return { label: (alt ?? cur ?? members[0]).label, reason: "soonest" };
 }
 
@@ -198,11 +230,21 @@ export class AccountPool {
   private files: string[] = [];
   private byFile = new Map<string, PoolMember>();
   private dirSig = "";
+  private regSig = "";
+  private reg: Record<string, RegistryEntry> = {};
   private readonly base: PoolMember;
   constructor(readonly provider: PoolProvider, readonly dir: string, base?: PoolMember) {
     this.base = base ?? baseMember(provider);
   }
-  /** base + the dir's member files; the dir is re-listed whenever its mtime changes. */
+  /** The dir's `.registry.json`, re-read whenever it changes on disk. */
+  registry(): Record<string, RegistryEntry> {
+    let sig = "";
+    try { const s = statSync(registryPath(this.dir)); sig = `${s.mtimeMs}:${s.size}:${s.ino}`; } catch {}
+    if (sig !== this.regSig) { this.regSig = sig; this.reg = sig ? readRegistry(this.dir) : {}; }
+    return this.reg;
+  }
+  tierOf(label: string): TierName { return this.registry()[label]?.tier ?? "primary"; }
+  /** base + the dir's member files, minus `blocked` ones; the dir is re-listed whenever its mtime changes. */
   members(): PoolMember[] {
     let sig = "";
     try { sig = String(statSync(this.dir).mtimeMs); } catch {}
@@ -211,13 +253,17 @@ export class AccountPool {
       this.files = memberFiles(this.dir);
       for (const f of this.files) if (!this.byFile.has(f)) this.byFile.set(f, fileMember(this.provider, f));
     }
-    return [this.base, ...this.files.map((f) => this.byFile.get(f)!)];
+    return [this.base, ...this.files.map((f) => this.byFile.get(f)!)].filter((m) => this.tierOf(m.label) !== "blocked");
   }
+  /** True when the provider's own well is fenced off: then even ONE member file is a pool (it must serve instead). */
+  baseBlocked(): boolean { return this.tierOf(this.base.label) === "blocked"; }
   private candidates(now: number): { m: PoolMember; c: Candidate }[] {
     return this.members().map((m) => {
       let f: CredFp;
       try { f = m.fp(); } catch { f = { cred: "absent", ident: "absent", exp: 0 }; }
-      return { m, c: { label: m.label, ident: f.ident, expired: f.ident === "absent" || (f.exp > 0 && f.exp < now) } };
+      const t = this.tierOf(m.label);
+      return { m, c: { label: m.label, ident: f.ident, expired: f.ident === "absent" || (f.exp > 0 && f.exp < now),
+        tier: TIER_RANK[t as Exclude<TierName, "blocked">] ?? 0 } };
     });
   }
   /** Re-run the selector, persist a change, and answer the member that serves next. */
@@ -245,8 +291,10 @@ export class AccountPool {
     if (strat === "headroom" || (strat === "sticky" && !key)) return active;
     const ps = pst(this.provider);
     const pct = switchPct();
-    const elig = this.candidates(now).filter((x) => isEligible(x.c, ps.capped, ps.usage, now, pct));
-    if (!elig.length) return active;
+    const all = this.candidates(now).filter((x) => isEligible(x.c, ps.capped, ps.usage, now, pct));
+    if (!all.length) return active;
+    const best = Math.min(...all.map((x) => x.c.tier ?? 0));
+    const elig = all.filter((x) => (x.c.tier ?? 0) === best);   // spread only within the best tier
     if (strat === "sticky") return elig.reduce((a, b) => (hrw(key!, b.c.label) > hrw(key!, a.c.label) ? b : a)).m;
     return elig[this.rr++ % elig.length].m;
   }
@@ -287,7 +335,7 @@ export class AccountPool {
     return this.candidates(now).map(({ c }) => {
       const u = ps?.usage[c.label];
       const cap = ps?.capped[c.label] ?? 0;
-      return { label: c.label, ident: c.ident, active: c.label === active,
+      return { label: c.label, ident: c.ident, active: c.label === active, tier: this.tierOf(c.label),
         seven_day: u?.seven_day ?? null, five_hour: u?.five_hour ?? null,
         capped_until: cap > now ? new Date(cap).toISOString() : null };
     });
@@ -304,7 +352,8 @@ export function poolFor(provider: string): AccountPool | null {
   if (!dir) return null;
   let e = pools.get(provider);
   if (!e || e.dir !== dir) { e = { dir, pool: new AccountPool(provider, dir) }; pools.set(provider, e); }
-  return e.pool.members().length > 1 ? e.pool : null;
+  const n = e.pool.members().length;
+  return n > 1 || (n === 1 && e.pool.baseBlocked()) ? e.pool : null;
 }
 /** Tests only: forget every pool and the in-memory state. */
 export function resetPools() { pools.clear(); state = null; }

@@ -346,7 +346,7 @@ describe("serve with an account pool", () => {
   test("/health accounts: labels, hashes and percentages — no secret fields", async () => {
     const h = await health(p, "anthropic");
     expect(Array.isArray(h.accounts)).toBe(true);
-    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "capped_until", "five_hour", "ident", "label", "seven_day"]);
+    for (const a of h.accounts) expect(Object.keys(a).sort()).toEqual(["active", "capped_until", "five_hour", "ident", "label", "seven_day", "tier"]);
     expect(h.accounts.map((a: any) => [a.label, a.active])).toEqual([["base", false], ["b", true]]);
     expect(h.accounts[0].capped_until).toBeString();
     expect(h.accounts[0].ident).toMatch(/^[0-9a-f]{12}$/);
@@ -396,5 +396,77 @@ describe("serve without a pool (zero-config)", () => {
     expect(lines.length).toBeGreaterThan(0);
     for (const l of lines) expect("account" in l).toBe(false);
     expect(existsSync(join(p.home, "pool-state.json"))).toBe(false);
+  });
+});
+
+// ─────────────────────────── tiers (.registry.json) ───────────────────────────
+
+describe("pool tiers (.registry.json)", () => {
+  const now = 1_000_000_000;
+  const u = (seven_day: number) => ({ seven_day, five_hour: 0, at: now });
+  const M = (tiers: number[]): Candidate[] => tiers.map((tier, i) => ({ label: ["base", "b", "c"][i], ident: `i${i}`, expired: false, tier }));
+  const base = { now, capped: {}, switchPct: 95, minDwellMs: 600_000, switchedAt: now - 3600_000 };
+
+  test("choose(): a worse tier is used only when no better tier is eligible", () => {
+    // base primary at 99%, b backup at 1%, c emergency at 0% ⇒ b
+    expect(choose({ ...base, members: M([0, 1, 2]), active: "base", usage: { base: u(99), b: u(1), c: u(0) } }).label).toBe("b");
+    // base and b both over ⇒ c (emergency)
+    expect(choose({ ...base, members: M([0, 1, 2]), active: "base", usage: { base: u(99), b: u(96), c: u(0) } }).label).toBe("c");
+  });
+  test("choose(): an active backup hands back to an eligible primary past dwell, holds during dwell", () => {
+    const usage = { base: u(10), b: u(1) };
+    expect(choose({ ...base, members: M([0, 1]), active: "b", usage })).toEqual({ label: "base", reason: "prefer" });
+    expect(choose({ ...base, members: M([0, 1]), active: "b", usage, switchedAt: now - 60_000 })).toEqual({ label: "b", reason: "dwell" });
+  });
+
+  const saved = { st: process.env.APIPLAN_POOL_STATE, strat: process.env.APIPLAN_POOL_STRATEGY, dir: process.env.APIPLAN_ANTHROPIC_POOL_DIR };
+  let dir: string;
+  const fakeBase: PoolMember = { label: "base", base: true, creds: () => ({ token: "AT-fake-base", source: "fake" }), fp: () => ({ cred: "x", ident: "baseident01", exp: Date.now() + HOUR }) };
+  beforeEach(() => {
+    dir = mkdtempSync(join(T, "tier-"));
+    mkdirSync(join(dir, "state"));
+    process.env.APIPLAN_POOL_STATE = join(dir, "state", "pool-state.json");
+    resetPools();
+    for (const n of ["fire17", "work", "x", "y"]) writeFileSync(join(dir, `${n}.json`), anth(`AT-fake-${n}`, `RT-fake-${n}`));
+  });
+  afterEach(() => {
+    for (const [k, v] of [["APIPLAN_POOL_STATE", saved.st], ["APIPLAN_POOL_STRATEGY", saved.strat], ["APIPLAN_ANTHROPIC_POOL_DIR", saved.dir]] as const)
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    resetPools();
+  });
+  const reg = (j: any) => writeFileSync(join(dir, ".registry.json"), JSON.stringify(j));
+
+  test("blocked members are never members; a typo'd tier fails closed to blocked", () => {
+    reg({ fire17: { tier: "blocked", email: "owner" }, work: { tier: "emergancy" } });
+    const p = new AccountPool("anthropic", dir, fakeBase);
+    expect(p.members().map((m) => m.label)).toEqual(["base", "x", "y"]);
+    expect(p.accounts().map((a) => a.label)).not.toContain("fire17");
+  });
+  test("round-robin and sticky spread only within the best eligible tier", () => {
+    reg({ work: { tier: "emergency" }, y: { tier: "backup" } });
+    const p = new AccountPool("anthropic", dir, fakeBase);
+    process.env.APIPLAN_POOL_STRATEGY = "round-robin";
+    expect(new Set(Array.from({ length: 12 }, () => p.lease().label))).toEqual(new Set(["base", "fire17", "x"]));
+    process.env.APIPLAN_POOL_STRATEGY = "sticky";
+    expect(new Set(Array.from({ length: 40 }, (_, i) => p.lease(`k${i}`).label))).toEqual(new Set(["base", "fire17", "x"]));
+  });
+  test("the registry is re-read when it changes; accounts() reports each tier", () => {
+    const p = new AccountPool("anthropic", dir, fakeBase);
+    expect(p.members()).toHaveLength(5);
+    reg({ fire17: { tier: "blocked" }, work: { tier: "emergency" } });
+    const later = new Date(Date.now() + 5000);
+    utimesSync(join(dir, ".registry.json"), later, later);
+    expect(p.members().map((m) => m.label)).toEqual(["base", "work", "x", "y"]);
+    expect(Object.fromEntries(p.accounts().map((a) => [a.label, a.tier]))).toEqual({ base: "primary", work: "emergency", x: "primary", y: "primary" });
+  });
+  test("a blocked base with one member file is still a pool (the file serves, never base)", () => {
+    for (const n of ["fire17", "work", "y"]) rmSync(join(dir, `${n}.json`));
+    reg({ base: { tier: "blocked" } });
+    process.env.APIPLAN_ANTHROPIC_POOL_DIR = dir;
+    expect(poolLease("anthropic")?.label).toBe("x");
+    // and a blocked lone file means no pool at all
+    reg({ x: { tier: "blocked" } });
+    resetPools();
+    expect(poolFor("anthropic")).toBeNull();
   });
 });

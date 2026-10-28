@@ -5,6 +5,8 @@ The Mac's ~/.codex/auth.json is the ROOT of the chain. Consumers hold ACCESS-ONL
 account_id, never refresh_token or id_token, so nobody else can rotate the refresh-token family):
   · srv2 /root/.codex/auth.json — pushed over LiveMind's ciphertext-only `file-push` (the tunnel carries only
     an RSA-wrapped AES blob, never a plaintext token), then srv2 /health is read back for the new expiry
+    — or, while ~/.apiplan/codex-relay.srv2-hold exists (srv2 runs acct-b), to srv2's Codex account-pool member
+    /root/.apiplan-creds/pool/openai/acct-mac.json instead, so acct-mac backs acct-b up without replacing it
   · the LunaSight APK — rebuilt, live-proven and shipped by ~/Creations/lunasight/bin/lunasight-token-ship.py
 
 An access-only copy cannot refresh itself, and Codex 0.162.1 only refreshes its own token inside the last
@@ -47,6 +49,10 @@ RELAY_LOG = os.path.join(HOME, ".livemind/codex-relay.log")
 SRV2_HOLD = os.path.join(HOME, ".apiplan/codex-relay.srv2-hold")
 LABEL = os.environ.get("CODEX_RELAY_LABEL", "livemind-srv2")
 REMOTE = "/root/.codex/auth.json"
+# While held, the Mac's own chain (acct-mac) still reaches srv2 — as an account-pool MEMBER, never over srv2's own
+# login (2026-10-28, Tami AC001495: "acct-mac is good for acct-b backup on codex"). apiplan's Codex pool reads this
+# dir (APIPLAN_CODEX_POOL_DIR); its `.registry.json` ranks acct-mac `backup`, so acct-b serves first.
+POOL_REMOTE = os.environ.get("CODEX_RELAY_POOL_REMOTE", "/root/.apiplan-creds/pool/openai/acct-mac.json")
 CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
 # --account NAME (2026-10-27, MIND: srv2 runs on acct-b, logged in on the Mac with
 # `CODEX_HOME=~/.codex-accounts/acct-b codex login --device-auth`). None = the Mac's own ~/.codex chain.
@@ -211,7 +217,8 @@ def remote_openai():
     return r.stdout.strip().splitlines()[-1] if r.stdout.strip() else f"unreadable rc={r.returncode}"
 
 
-def push_srv2(a):
+def push_srv2(a, remote=None):
+    remote = remote or REMOTE
     t = a["tokens"]
     body = {"auth_mode": a.get("auth_mode"), "OPENAI_API_KEY": None, "last_refresh": a.get("last_refresh"),
             "tokens": {"access_token": t["access_token"], "account_id": t["account_id"]}}
@@ -222,7 +229,7 @@ def push_srv2(a):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.write(fd, json.dumps(body).encode())
         os.close(fd)
-        r = subprocess.run([os.path.join(HANDOFF, "file-push"), LABEL, path, REMOTE],
+        r = subprocess.run([os.path.join(HANDOFF, "file-push"), LABEL, path, remote],
                            capture_output=True, text=True, timeout=240)
         landed = [l for l in r.stdout.splitlines() if l.startswith("FILE-LANDED")]
         if r.returncode or not landed:
@@ -261,10 +268,19 @@ def run_lunasight():
 def relay(a, lr, exp, st):
     ok_srv2 = False
     if os.path.exists(SRV2_HOLD) and not ACCOUNT:
-        ok_srv2 = True  # nothing to retry: srv2 is deliberately on its own account
         why = open(SRV2_HOLD).read().strip()[:160]
-        log(f"srv2 push HELD ({SRV2_HOLD}: {why or 'no reason given'}) — srv2 keeps its own Codex login")
+        log(f"srv2 login HELD ({SRV2_HOLD}: {why or 'no reason given'}) — srv2 keeps its own Codex login; "
+            f"this chain goes to its pool member {POOL_REMOTE}")
         seen = "held"
+        if POOL_REMOTE:
+            try:
+                push_srv2(a, POOL_REMOTE)
+                ok_srv2 = True
+                seen = f"pool member {os.path.basename(POOL_REMOTE)}"
+            except Exception as e:
+                log(f"srv2 pool push failed: {e} — will retry next pass")
+        else:
+            ok_srv2 = True  # no pool member configured: nothing to retry
     else:
         try:
             push_srv2(a)
@@ -315,13 +331,13 @@ def main(argv):
         except Exception as e:
             log(f"   app-server probe FAILED: {e}")
         relay_due = st.get("last_refresh") != lr
-        if os.path.exists(SRV2_HOLD) and not ACCOUNT: log(f"SRV2 HOLD present ({SRV2_HOLD}) — a due relay skips srv2, ships LunaSight only")
+        if os.path.exists(SRV2_HOLD) and not ACCOUNT: log(f"SRV2 HOLD present ({SRV2_HOLD}) — a due relay leaves srv2's login alone, pushes the pool member {POOL_REMOTE}, ships LunaSight")
         if ACCOUNT and not st:
             log(f"RELAY: first pass SEEDS state from {lr} (srv2 already holds this login) — pushes nothing; "
                 f"later passes file-push {LABEL}:{REMOTE} when last_refresh moves")
         else:
             log(f"RELAY: {'due' if relay_due else 'not due'} — last relayed {st.get('last_refresh')} at {st.get('pushed_at')}; "
-                f"on due: file-push {LABEL}:{REMOTE}" + ("" if ACCOUNT else f", then {LUNASIGHT} (last rc {st.get('lunasight_rc')})"))
+                f"on due: file-push {LABEL}:{POOL_REMOTE if os.path.exists(SRV2_HOLD) and not ACCOUNT else REMOTE}" + ("" if ACCOUNT else f", then {LUNASIGHT} (last rc {st.get('lunasight_rc')})"))
         return 0
 
     if "--status" in argv:
