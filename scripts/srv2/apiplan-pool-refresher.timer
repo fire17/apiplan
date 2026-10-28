@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 15 min: refresh the APIPlan account-pool Claude credentials
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

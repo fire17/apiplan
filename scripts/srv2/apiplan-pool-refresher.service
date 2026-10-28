@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh the Claude credentials in the APIPlan account pool (srv2 is their only holder)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /usr/local/lib/apiplan/apiplan-pool-refresher.sh
