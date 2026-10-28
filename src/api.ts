@@ -417,7 +417,7 @@ async function* run(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSignal, 
   // everything below runs exactly as before). A NON-base member is read from its own file; its
   // outcome is never written against the provider's base-well verdict (noteCall), because that
   // verdict is about a different credential.
-  const lease = slot?.use ?? poolLease(m.provider);
+  const lease = slot?.use ?? poolLease(m.provider, o.promptCacheKey);
   if (slot) { slot.member = lease ?? undefined; if (slot.meter) slot.meter.account = lease?.label; }
   const member = lease && !lease.base ? lease : null;
   const note = (ok: boolean, detail: string) => { if (!member) noteCall(m.provider, ok, detail); };
@@ -682,7 +682,7 @@ async function* runSafe(m: Model, turns: Turn[], o: CallOpts, signal?: AbortSign
     // nothing yet: cap it until its reset, move to the next member, and retry ONCE there. No
     // pool (or no other member) → the refusal stands exactly as before.
     if (signal?.aborted || !slot.member || !CAPACITY_REFUSED(e)) throw e;
-    const next = poolFailover(m.provider, slot.member, e.requestFailure?.resetAt);
+    const next = poolFailover(m.provider, slot.member, e.requestFailure?.resetAt, o.promptCacheKey);
     if (!next) throw e;
     console.error(`[apiplan] ${m.id}: account ${slot.member.label} refused for capacity (HTTP ${e.status}) — retrying once on ${next.label}`);
     yield* run(m, turns, o, signal, { use: next, meter });

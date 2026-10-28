@@ -205,6 +205,70 @@ describe("pool state is keyed by member label", () => {
   });
 });
 
+describe("APIPLAN_POOL_STRATEGY", () => {
+  const saved = { st: process.env.APIPLAN_POOL_STATE, strat: process.env.APIPLAN_POOL_STRATEGY };
+  let dir: string;
+  let p: AccountPool;
+  const fakeBase: PoolMember = { label: "base", base: true, creds: () => ({ token: "AT-fake-base", source: "fake" }), fp: () => ({ cred: "x", ident: "baseident01", exp: Date.now() + HOUR }) };
+  beforeEach(() => {
+    dir = mkdtempSync(join(T, "strat-"));
+    mkdirSync(join(dir, "state"));
+    process.env.APIPLAN_POOL_STATE = join(dir, "state", "pool-state.json");
+    resetPools();
+    writeFileSync(join(dir, "b.json"), anth("AT-fake-sb", "RT-fake-sb"));
+    writeFileSync(join(dir, "c.json"), anth("AT-fake-sc", "RT-fake-sc"));
+    p = new AccountPool("anthropic", dir, fakeBase);
+  });
+  afterEach(() => {
+    if (saved.st === undefined) delete process.env.APIPLAN_POOL_STATE; else process.env.APIPLAN_POOL_STATE = saved.st;
+    if (saved.strat === undefined) delete process.env.APIPLAN_POOL_STRATEGY; else process.env.APIPLAN_POOL_STRATEGY = saved.strat;
+    resetPools();
+  });
+  const keys = Array.from({ length: 60 }, (_, i) => `conv-${i}`);
+
+  test("default (headroom) is unchanged: every request, every key, the one active member", () => {
+    delete process.env.APIPLAN_POOL_STRATEGY;
+    expect(new Set(keys.map((k) => p.lease(k).label))).toEqual(new Set(["base"]));
+    expect(p.lease().label).toBe("base");
+  });
+
+  test("sticky: the same key always maps to the same member; different keys spread", () => {
+    process.env.APIPLAN_POOL_STRATEGY = "sticky";
+    const first = keys.map((k) => p.lease(k).label);
+    expect(keys.map((k) => p.lease(k).label)).toEqual(first);
+    expect(new Set(first).size).toBe(3);
+    // No key at all ⇒ headroom's active member.
+    expect(p.lease().label).toBe("base");
+  });
+
+  test("sticky: a capped member is skipped, and only its conversations move", () => {
+    process.env.APIPLAN_POOL_STRATEGY = "sticky";
+    const before = keys.map((k) => p.lease(k).label);
+    p.markCapped("b", Date.now() + HOUR);
+    const after = keys.map((k) => p.lease(k).label);
+    expect(after).not.toContain("b");
+    keys.forEach((_, i) => { if (before[i] !== "b") expect(after[i]).toBe(before[i]); });
+  });
+
+  test("round-robin cycles over the eligible members, skipping a capped one", () => {
+    process.env.APIPLAN_POOL_STRATEGY = "round-robin";
+    expect(Array.from({ length: 6 }, () => p.lease("same-conv").label)).toEqual(["base", "b", "c", "base", "b", "c"]);
+    p.markCapped("c", Date.now() + HOUR);
+    const next = Array.from({ length: 4 }, () => p.lease("same-conv").label);
+    expect(next).not.toContain("c");
+    expect(new Set(next)).toEqual(new Set(["base", "b"]));
+  });
+
+  test("≥95% weekly is excluded under every strategy", () => {
+    const usage = (d7: number) => ({ account: null, five_hour: { used_percent: 1, resets_at: null }, seven_day: { used_percent: d7, resets_at: null }, extra: {}, source: "t", fetched_at: "" });
+    p.recordUsage("b", usage(97));
+    for (const strat of ["sticky", "round-robin"]) {
+      process.env.APIPLAN_POOL_STRATEGY = strat;
+      expect(keys.map((k) => p.lease(k).label)).not.toContain("b");
+    }
+  });
+});
+
 // ─────────────────────────── the request path, in a real server ───────────────────────────
 
 type Probe = { proc: ReturnType<typeof Bun.spawn>; api: string; fx: string; home: string };

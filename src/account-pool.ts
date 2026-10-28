@@ -15,11 +15,13 @@
 //   APIPLAN_POOL_MIN_DWELL_S     minimum seconds on a member before a non-forced switch (600)
 //   APIPLAN_POOL_POLL_S          usage poll cadence inside `serve` (default 300, floor 120)
 //   APIPLAN_POOL_STATE           state file (default <APIPLAN_HOME>/pool-state.json)
+//   APIPLAN_POOL_STRATEGY        headroom (default) | sticky | round-robin — see poolStrategy()
 //
 // apiplan NEVER refreshes these tokens: an external refresher rewrites the member files, and a
 // member re-reads its file whenever the file's mtime/size/inode changes. No token ever enters
 // the state file, a log line, /health or the CLI — only labels and 12-hex credential hashes.
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { PROVIDERS, credFpFromJson, credsFromJson, type CredFp, type Creds } from "./providers.ts";
 import { HOME, STATE_DIR, readJson, writeJson } from "./platform.ts";
@@ -67,6 +69,29 @@ export const minDwellMs = () => Math.max(0, num(process.env.APIPLAN_POOL_MIN_DWE
 export const pollMs = () => Math.max(120, num(process.env.APIPLAN_POOL_POLL_S, 300)) * 1000;
 export const statePath = () => process.env.APIPLAN_POOL_STATE || join(STATE_DIR, "pool-state.json");
 const DEFAULT_CAP_MS = 3600_000;
+
+/**
+ * How a request picks its member. Every strategy picks only among ELIGIBLE members (usable, not
+ * capped, weekly % < switch pct), falls back to the headroom member when none is, and keeps the
+ * one-retry 429 failover.
+ *   headroom     (default) one active member at a time: stay on it until it reaches the switch
+ *                pct or is capped, then move to the lowest-weekly member. Best prompt-cache reuse.
+ *   sticky       a conversation → a member by rendezvous-hashing the request's prompt-cache key
+ *                (Codex prompt_cache_key, Anthropic metadata.user_id, else the derived
+ *                model+system+first-user-turn hash). One conversation keeps its cache; distinct
+ *                conversations spread across accounts. No key ⇒ headroom.
+ *   round-robin  rotate PER REQUEST over the eligible members. Even load, but it FORFEITS
+ *                prompt-cache hits on multi-turn traffic: consecutive turns of one conversation
+ *                land on different accounts, and a prompt cache never crosses accounts.
+ */
+export type PoolStrategy = "headroom" | "sticky" | "round-robin";
+export function poolStrategy(): PoolStrategy {
+  const v = (process.env.APIPLAN_POOL_STRATEGY ?? "").trim().toLowerCase();
+  return v === "sticky" ? "sticky" : v === "round-robin" || v === "roundrobin" || v === "rr" ? "round-robin" : "headroom";
+}
+/** Rendezvous (highest-random-weight) score: a member leaving the eligible set only moves the
+ *  conversations that were on it; everyone else keeps their member (and their cache). */
+const hrw = (key: string, label: string) => parseInt(createHash("sha256").update(`${key}\0${label}`).digest("hex").slice(0, 12), 16);
 
 // ─────────────────────────── state ───────────────────────────
 
@@ -129,6 +154,10 @@ export function memberFiles(dir: string): string[] {
 // ─────────────────────────── the selector ───────────────────────────
 
 export type Candidate = { label: string; ident: string; expired: boolean };
+/** Usable (credential present, unexpired), not capped, and weekly % below the switch pct. */
+export function isEligible(m: Candidate, capped: Record<string, number>, usage: Record<string, MemberUsage>, now: number, pct: number): boolean {
+  return !m.expired && m.ident !== "absent" && !((capped[m.label] ?? 0) > now) && (usage[m.label]?.seven_day ?? 0) < pct;
+}
 /**
  * Which member serves next. Pure: every input is passed in.
  *   · stay on the active member while it is usable, not capped and its weekly % < switchPct;
@@ -144,7 +173,7 @@ export function choose(c: {
   const { members, now } = c;
   const isCapped = (m: Candidate) => (c.capped[m.label] ?? 0) > now;
   const usable = (m: Candidate) => !m.expired && m.ident !== "absent";
-  const eligible = (m: Candidate) => usable(m) && !isCapped(m) && (c.usage[m.label]?.seven_day ?? 0) < c.switchPct;
+  const eligible = (m: Candidate) => isEligible(m, c.capped, c.usage, now, c.switchPct);
   const idx = (m: Candidate) => members.indexOf(m);
   const rank = (a: Candidate, b: Candidate) => {
     const ua = c.usage[a.label], ub = c.usage[b.label];
@@ -205,6 +234,22 @@ export class AccountPool {
     }
     return all.find((x) => x.c.label === pick.label)!.m;
   }
+  private rr = 0;
+  /**
+   * The member ONE request uses under the configured strategy. select() still runs first, so the
+   * headroom `active` member (/health, `apiplan pool`) stays current whatever the strategy.
+   */
+  lease(key?: string, now = Date.now()): PoolMember {
+    const active = this.select(now);
+    const strat = poolStrategy();
+    if (strat === "headroom" || (strat === "sticky" && !key)) return active;
+    const ps = pst(this.provider);
+    const pct = switchPct();
+    const elig = this.candidates(now).filter((x) => isEligible(x.c, ps.capped, ps.usage, now, pct));
+    if (!elig.length) return active;
+    if (strat === "sticky") return elig.reduce((a, b) => (hrw(key!, b.c.label) > hrw(key!, a.c.label) ? b : a)).m;
+    return elig[this.rr++ % elig.length].m;
+  }
   /** Capped-until, by member label. */
   cappedUntil(label: string): number { return pst(this.provider).capped[label] ?? 0; }
   markCapped(label: string, until: number) {
@@ -264,10 +309,11 @@ export function poolFor(provider: string): AccountPool | null {
 /** Tests only: forget every pool and the in-memory state. */
 export function resetPools() { pools.clear(); state = null; }
 
-/** The member a serve request should use, or null when this provider is single-account. */
-export function poolLease(provider: string): PoolMember | null {
+/** The member a serve request should use, or null when this provider is single-account.
+ *  `key` is the request's prompt-cache key (used by the sticky strategy only). */
+export function poolLease(provider: string, key?: string): PoolMember | null {
   const p = poolFor(provider);
-  return p ? p.select() : null;
+  return p ? p.lease(key) : null;
 }
 
 /**
@@ -275,11 +321,11 @@ export function poolLease(provider: string): PoolMember | null {
  * `resetAt` (or +1h when the upstream did not say), re-select, and answer the new member — or
  * null when there is no OTHER uncapped member to try, so the caller surfaces the refusal as before.
  */
-export function poolFailover(provider: string, failed: PoolMember, resetAt?: number, now = Date.now()): PoolMember | null {
+export function poolFailover(provider: string, failed: PoolMember, resetAt?: number, key?: string, now = Date.now()): PoolMember | null {
   const p = poolFor(provider);
   if (!p) return null;
   p.markCapped(failed.label, resetAt && resetAt > now ? resetAt : now + DEFAULT_CAP_MS);
-  const next = p.select(now);
+  const next = p.lease(key, now);
   if (next.label === failed.label) return null;
   // A member that is itself capped would only repeat the refusal: no retry then.
   return p.cappedUntil(next.label) > now ? null : next;
